@@ -135,29 +135,29 @@ impl HealthState {
     }
 }
 
-/// Map a pipeline step name to its health area.
-pub fn area_for_step(step: &str, update_mode: bool) -> Option<&'static str> {
-    Some(match step {
+/// Every health area a pipeline step covers.
+pub fn areas_for_step(step: &str, update_mode: bool) -> Vec<&'static str> {
+    match step {
         "Extract & clean" => {
+            let mut v = vec!["Zip intake", "Extraction", "Clean-up", "Stack detection"];
             if update_mode {
-                "Update sync"
-            } else {
-                "Extraction"
+                v.push("Update sync");
             }
+            v
         }
-        "Pre-flight tests" => "Tests",
-        "Secret scan" => "Secret scan",
+        "Pre-flight tests" => vec!["Tests"],
+        "Secret scan" => vec!["Secret scan"],
         "Commit & push" => {
             if update_mode {
-                "Update sync"
+                vec!["Update sync"]
             } else {
-                "New repo push"
+                vec!["New repo push"]
             }
         }
-        "Tag & release" => "Tags & releases",
-        "Archive zip" => "Archive",
-        _ => return None,
-    })
+        "Tag & release" => vec!["Tags & releases"],
+        "Archive zip" => vec!["Zip intake", "Archive"],
+        _ => vec![],
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +174,12 @@ mod tests {
         let h = HealthState::load(&paths);
         assert_eq!(h.summary(), "1 broken");
         assert_eq!(h.get("Archive").status, Health::Working);
-        assert_eq!(area_for_step("Commit & push", true), Some("Update sync"));
+        assert_eq!(areas_for_step("Commit & push", true), vec!["Update sync"]);
+        let ex = areas_for_step("Extract & clean", true);
+        assert!(
+            ex.contains(&"Extraction")
+                && ex.contains(&"Stack detection")
+                && ex.contains(&"Update sync")
+        );
     }
 }

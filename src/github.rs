@@ -341,7 +341,7 @@ impl GitHubApi for FakeGh {
         Ok(self.bare(owner, slug).exists())
     }
     fn default_branch(&self, owner: &str, slug: &str) -> Res<String> {
-        let o = git::git(
+        let o = git::git_bare(
             &self.bare(owner, slug),
             &["symbolic-ref", "--short", "HEAD"],
         );

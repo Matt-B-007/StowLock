@@ -10,6 +10,18 @@ pub fn git(dir: &Path, args: &[&str]) -> Output {
     proc::run("git", args, &Opts::in_dir(dir))
 }
 
+/// Run git against a bare repository (the self-test's stand-in for GitHub).
+/// The repo is named with --git-dir instead of running inside it, because
+/// newer git can refuse to work inside a bare repo
+/// (safe.bareRepository = explicit).
+pub fn git_bare(bare: &Path, args: &[&str]) -> Output {
+    let gd = format!("--git-dir={}", bare.display());
+    let mut full: Vec<&str> = vec![&gd];
+    full.extend_from_slice(args);
+    let cwd = bare.parent().unwrap_or(Path::new("/"));
+    proc::run("git", &full, &Opts::in_dir(cwd))
+}
+
 /// Run git, log it, and turn failure into an error with git's message.
 pub fn git_ok(dir: &Path, args: &[&str], log: &Logger, stage: &str) -> Res<Output> {
     let o = git(dir, args);
@@ -261,6 +273,22 @@ pub fn commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_repos_work_with_strict_git() {
+        // Newer git can refuse to run inside a bare repo. git_bare must
+        // still work with that rule switched on.
+        let d = tempfile::tempdir().unwrap();
+        let bare = d.path().join("demo.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(git(&bare, &["init", "--bare", "-b", "main"]).ok());
+        let strict = ["-c", "safe.bareRepository=explicit"];
+        let inside = git(&bare, &[strict[0], strict[1], "symbolic-ref", "HEAD"]);
+        assert!(!inside.ok(), "strict git refuses to run inside a bare repo");
+        let named = git_bare(&bare, &[strict[0], strict[1], "symbolic-ref", "HEAD"]);
+        assert!(named.ok(), "{}", named.combined());
+        assert_eq!(named.stdout_trim(), "refs/heads/main");
+    }
 
     #[test]
     fn origin_matching() {

@@ -111,8 +111,15 @@ fn replace_word(text: &str, needle: &str, with: &str) -> String {
 }
 
 /// Apply every identity and secret rule to a piece of text.
+/// Words that are never redacted: the app's own name.
+const KEEP: [&str; 2] = ["StowLock", "stowlock"];
+
 pub fn redact(text: &str, rc: &RedactContext) -> String {
     let mut s = redact_secrets(text);
+    // Protect the app's own name (a user's repo may share it).
+    for (i, k) in KEEP.iter().enumerate() {
+        s = s.replace(k, &format!("\u{2}APP{i}\u{2}"));
+    }
     // Paths: workspace → project-relative, then home → ~.
     if !rc.workspace.is_empty() {
         s = s.replace(&format!("{}/", rc.workspace), "");
@@ -227,6 +234,9 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
     s = ipv6_re().replace_all(&s, "[removed]").into_owned();
     s = ip_re().replace_all(&s, "[removed]").into_owned();
     s = serial_re().replace_all(&s, "[removed]").into_owned();
+    for (i, k) in KEEP.iter().enumerate() {
+        s = s.replace(&format!("\u{2}APP{i}\u{2}"), k);
+    }
     s
 }
 
@@ -291,9 +301,13 @@ pub struct ReportInput {
     pub env: EnvInfo,
     pub session: Option<SessionInfo>,
     pub steps: Vec<Step>,
+    /// Last runs (label, started, steps), oldest first. Preferred over `steps`.
+    pub runs: Vec<crate::logbook::Run>,
     pub failing_command: Option<(String, Option<i32>)>,
     pub health: Vec<String>,
     pub selftest_summary: Option<String>,
+    /// Warnings and errors, shown before the latest lines.
+    pub problem_lines: Vec<String>,
     pub log_lines: Vec<String>,
     pub panic: Option<String>,
 }
@@ -338,17 +352,41 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
             se.owner, se.slug, se.mode, se.channel, if se.tag.is_empty() { "none" } else { &se.tag }, se.stack
         ));
     }
-    if !input.steps.is_empty() {
-        s.push_str("\n## Step timeline (last run)\n\n| Step | Result | Time | Detail |\n| --- | --- | --- | --- |\n");
-        for st in &input.steps {
-            let detail = st.detail.lines().next().unwrap_or("").replace('|', "/");
-            s.push_str(&format!(
-                "| {} | {} | {} ms | {} |\n",
-                st.name,
-                status_word(st.status),
-                st.millis,
-                detail
-            ));
+    let runs: Vec<crate::logbook::Run> = if !input.runs.is_empty() {
+        input.runs.clone()
+    } else if !input.steps.is_empty() {
+        vec![crate::logbook::Run {
+            label: "Last run".into(),
+            started: String::new(),
+            steps: input.steps.clone(),
+        }]
+    } else {
+        vec![]
+    };
+    if !runs.is_empty() {
+        s.push_str(&format!("\n## Recent runs (last {})\n", runs.len()));
+        for r in runs.iter().rev() {
+            let when = if r.started.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", r.started)
+            };
+            s.push_str(&format!("\n### {}{when}\n\n", r.label));
+            if r.steps.is_empty() {
+                s.push_str("No steps recorded.\n");
+                continue;
+            }
+            s.push_str("| Step | Result | Time | Detail |\n| --- | --- | --- | --- |\n");
+            for st in &r.steps {
+                let detail = st.detail.lines().next().unwrap_or("").replace('|', "/");
+                s.push_str(&format!(
+                    "| {} | {} | {} ms | {} |\n",
+                    st.name,
+                    status_word(st.status),
+                    st.millis,
+                    detail
+                ));
+            }
         }
     }
     if let Some((cmd, code)) = &input.failing_command {
@@ -366,15 +404,22 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
     if let Some(st) = &input.selftest_summary {
         s.push_str(&format!("\n## Latest self-test\n\n{st}\n"));
     }
+    if !input.problem_lines.is_empty() {
+        s.push_str(&format!(
+            "\n## Warnings and errors ({})\n\n```text\n{}\n```\n",
+            input.problem_lines.len(),
+            input.problem_lines.join("\n")
+        ));
+    }
     if !input.log_lines.is_empty() {
         s.push_str(&format!(
-            "\n## Log (last {} lines)\n\n```text\n{}\n```\n",
+            "\n## Latest log lines ({})\n\n```text\n{}\n```\n",
             input.log_lines.len(),
             input.log_lines.join("\n")
         ));
     }
-    let failed: Vec<&Step> = input
-        .steps
+    let all_steps: Vec<Step> = runs.iter().flat_map(|r| r.steps.clone()).collect();
+    let failed: Vec<&Step> = all_steps
         .iter()
         .filter(|s| s.status == StepStatus::Failed)
         .collect();
@@ -399,6 +444,15 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
         s.push_str("Find the cause in the StowLock source, fix it without changing behaviour elsewhere, and add a regression test.\n```\n");
     }
     redact(&s, rc)
+}
+
+/// File name for a downloaded bug report: app name, date and time the
+/// report was created. No colons, so it works on every file system.
+pub fn bug_report_file_name(created: &chrono::DateTime<chrono::Local>) -> String {
+    format!(
+        "StowLock-bug-report-{}.txt",
+        created.format("%Y-%m-%d_%H-%M-%S")
+    )
 }
 
 /// Save a report into the reports folder (0600). Returns its path.
@@ -463,9 +517,10 @@ pub fn install_panic_hook(paths: AppPaths, log: Logger, workspace: PathBuf) {
                 kernel: proc::run("uname", &["-sr"], &Opts::default_timeout()).stdout_trim(),
                 ..Default::default()
             },
-            steps: log.steps(),
+            runs: log.runs(),
             failing_command: log.failing_command(),
-            log_lines: log.last_lines(150),
+            problem_lines: log.report_lines(40, 100).0,
+            log_lines: log.report_lines(40, 100).1,
             panic: Some(format!(
                 "{msg}\n\n{}",
                 backtrace.lines().take(40).collect::<Vec<_>>().join("\n")
@@ -535,6 +590,29 @@ mod tests {
     }
 
     #[test]
+    fn download_file_name_format() {
+        use chrono::TimeZone;
+        let t = chrono::Local
+            .with_ymd_and_hms(2026, 11, 23, 7, 43, 5)
+            .unwrap();
+        let n = bug_report_file_name(&t);
+        assert_eq!(n, "StowLock-bug-report-2026-11-23_07-43-05.txt");
+        assert!(!n.contains(':') && !n.contains(' '));
+    }
+
+    #[test]
+    fn app_name_survives_a_repo_with_the_same_name() {
+        let mut c = rc();
+        c.repos.push(("stowlock".into(), false));
+        let out = redact("# StowLock bug report\n- StowLock: 0.1.0\npushed stowlock to https://github.com/Matt-B-007/stowlock", &c);
+        assert!(
+            out.contains("# StowLock bug report") && out.contains("- StowLock: 0.1.0"),
+            "{out}"
+        );
+        assert!(!out.contains("Matt-B-007"));
+    }
+
+    #[test]
     fn opt_in_keeps_public_names_only() {
         let mut c = rc();
         c.include_public_repo_names = true;
@@ -560,7 +638,7 @@ mod tests {
         };
         let text = build_report(&input, &rc());
         assert!(
-            text.contains("## Step timeline")
+            text.contains("## Recent runs")
                 && text.contains("## AI fix prompt")
                 && text.contains("Failed")
         );

@@ -23,7 +23,7 @@ pub enum TestStatus {
 pub struct TestResult {
     pub status: TestStatus,
     pub summary: String,
-    /// Last 60 lines of output.
+    /// Output with build progress collapsed and failure lines kept.
     pub tail: String,
     pub duration: Duration,
     pub hint: Option<String>,
@@ -52,9 +52,41 @@ pub struct TestEnv<'a> {
     pub log: &'a Logger,
 }
 
-fn tail(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+/// Pull the pass/fail counts out of test output (cargo, pytest, go, jest).
+pub fn result_summary(transcript: &str) -> Option<String> {
+    use regex::Regex;
+    let cargo = Regex::new(r"test result: \w+\. (\d+) passed; (\d+) failed").unwrap();
+    let (mut p, mut f, mut found) = (0u64, 0u64, false);
+    for c in cargo.captures_iter(transcript) {
+        p += c[1].parse::<u64>().unwrap_or(0);
+        f += c[2].parse::<u64>().unwrap_or(0);
+        found = true;
+    }
+    if found {
+        return Some(format!("{p} passed, {f} failed"));
+    }
+    let jest = transcript
+        .lines()
+        .find(|l| l.trim_start().starts_with("Tests:"));
+    if let Some(l) = jest {
+        return Some(l.trim().trim_start_matches("Tests:").trim().to_string());
+    }
+    let py = Regex::new(r"(?m)^=+ (.*(?:passed|failed|error).*?) (?:in [\d.]+s )?=+$").unwrap();
+    if let Some(c) = py.captures_iter(transcript).last() {
+        return Some(c[1].to_string());
+    }
+    let ok = transcript
+        .lines()
+        .filter(|l| l.starts_with("ok ") || l.starts_with("ok\t"))
+        .count();
+    let fail = transcript
+        .lines()
+        .filter(|l| l.starts_with("FAIL\t") || l.starts_with("--- FAIL"))
+        .count();
+    if ok + fail > 0 {
+        return Some(format!("{ok} package(s) passed, {fail} failed"));
+    }
+    None
 }
 
 fn run_step(dir: &Path, program: &str, args: &[&str], env: &TestEnv) -> Output {
@@ -85,7 +117,7 @@ pub fn run_tests(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
     let finish = |status: TestStatus, summary: String, transcript: &str| TestResult {
         status,
         summary,
-        tail: tail(transcript, 60),
+        tail: crate::logbook::shorten(transcript).join("\n"),
         duration: start.elapsed(),
         hint: None,
     };
@@ -201,16 +233,22 @@ pub fn run_tests(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
         }
         if !o.ok() {
             let what = if o.timed_out { "timed out" } else { "failed" };
+            let counts = result_summary(&transcript)
+                .map(|c| format!(" · {c}"))
+                .unwrap_or_default();
             return finish(
                 TestStatus::Failed,
-                format!("{} {what}", o.command_line()),
+                format!("{} {what}{counts}", o.command_line()),
                 &transcript,
             );
         }
     }
+    let counts = result_summary(&transcript)
+        .map(|c| format!(" · {c}"))
+        .unwrap_or_default();
     finish(
         TestStatus::Passed,
-        format!("Passed: {}", ran.join(", ")),
+        format!("Passed: {}{counts}", ran.join(", ")),
         &transcript,
     )
 }
@@ -241,6 +279,26 @@ mod tests {
         std::fs::write(d.path().join("broken.py"), "def oops(:\n").unwrap();
         let r2 = run_tests(d.path(), Stack::Python, &env(&log));
         assert_eq!(r2.status, TestStatus::Failed);
+    }
+
+    #[test]
+    fn extracts_result_counts() {
+        let cargo = "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored\nrunning 51\ntest result: ok. 51 passed; 0 failed; 0 ignored\n";
+        assert_eq!(
+            result_summary(cargo).as_deref(),
+            Some("54 passed, 0 failed")
+        );
+        let py = "....\n============ 4 passed, 1 failed in 0.12s ============\n";
+        assert_eq!(result_summary(py).as_deref(), Some("4 passed, 1 failed"));
+        assert_eq!(
+            result_summary("Tests:       2 failed, 10 passed, 12 total").as_deref(),
+            Some("2 failed, 10 passed, 12 total")
+        );
+        assert_eq!(
+            result_summary("ok  \tgithub.com/x/y\t0.01s\nFAIL\tgithub.com/x/z").as_deref(),
+            Some("1 package(s) passed, 1 failed")
+        );
+        assert_eq!(result_summary("nothing"), None);
     }
 
     #[test]

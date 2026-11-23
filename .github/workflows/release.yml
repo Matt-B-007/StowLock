@@ -16,6 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check the version matches the tag
+        run: |
+          WANT="${GITHUB_REF_NAME#v}"
+          HAVE="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [ "$WANT" != "$HAVE" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $HAVE"; exit 1
+          fi
       - name: Test
         run: cargo test --locked
       - name: Build

@@ -79,7 +79,7 @@ pub fn decide_mode(
     owner: &str,
     remote: Option<&[String]>,
 ) -> (Mode, bool, Option<bool>) {
-    let dir = workspace.join(slug);
+    let dir = detect::project_dir(workspace, slug);
     let local = dir.exists();
     let on_github = remote.map(|names| names.iter().any(|n| n.eq_ignore_ascii_case(slug)));
     let local_linked = local
@@ -164,11 +164,11 @@ fn license_text(kind: &str, holder: &str) -> Option<String> {
 /// except cloning in UPDATE mode when the project isn't on this computer yet.
 pub fn stage(ctx: &Ctx, req: &StageRequest) -> Res<StageResult> {
     if !detect::valid_slug(&req.slug) {
-        return Err("The repo name must use lowercase letters, numbers and hyphens only.".into());
+        return Err(detect::name_problem(&req.slug).unwrap_or_default());
     }
     let ws = ctx.workspace();
     std::fs::create_dir_all(&ws).ctx("creating the workspace folder")?;
-    let target = ws.join(&req.slug);
+    let target = detect::project_dir(&ws, &req.slug);
     let mut result = StageResult {
         dir: target.clone(),
         ..Default::default()
@@ -229,16 +229,21 @@ pub fn stage(ctx: &Ctx, req: &StageRequest) -> Res<StageResult> {
 fn stage_new(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut StageResult) -> Res<()> {
     let ws = ctx.workspace();
     if target.exists() {
-        if !req.replace_local {
+        // A folder StowLock staged earlier and never pushed (for example, the
+        // tests failed) is replaced without asking; it goes to the Trash.
+        let ours = ProjectsState::load(&ctx.paths).staged_not_pushed(&req.slug);
+        if !req.replace_local && !ours {
             return Err(format!(
                 "A folder named \"{}\" already exists in your workspace but isn't on GitHub. Tick \"Replace the existing folder\" to replace it, or pick another name.",
                 req.slug
             ));
         }
         match util::move_to_trash(target) {
-            Ok(_) => result
-                .notes
-                .push("Moved the old local folder to the Trash".into()),
+            Ok(_) => result.notes.push(if ours {
+                "Moved the earlier unpushed staging to the Trash".into()
+            } else {
+                "Moved the old local folder to the Trash".into()
+            }),
             Err(_) => {
                 let aside = ws.join(format!(
                     ".stowlock-old-{}-{}",
@@ -247,7 +252,12 @@ fn stage_new(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut StageRes
                 ));
                 std::fs::rename(target, &aside).ctx("moving the old folder aside")?;
                 result.notes.push(format!(
-                    "Moved the old local folder to {}",
+                    "Moved the {} to {}",
+                    if ours {
+                        "earlier unpushed staging"
+                    } else {
+                        "old local folder"
+                    },
                     util::tilde(&aside)
                 ));
             }
@@ -356,12 +366,42 @@ fn stage_update(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut Stage
             req.slug
         ));
     }
-    // 3. No unsaved local work.
+    // 3. No unsaved local work. Loose files left by StowLock's own earlier
+    // staging (never pushed, e.g. tests failed) are saved in a git stash
+    // so the new zip can go in and nothing is lost.
     if !git::status_lines(target).is_empty() {
-        return Err(
-            "This project has unsaved changes that aren't on GitHub. Push or discard them first."
-                .into(),
+        if !ProjectsState::load(&ctx.paths).staged_not_pushed(&req.slug) {
+            return Err(
+                "This project has unsaved changes that aren't on GitHub. Push or discard them first."
+                    .into(),
+            );
+        }
+        let label = format!(
+            "StowLock: unpushed staging saved {}",
+            util::now_stamp_secs()
         );
+        let fb = (
+            ctx.config.fallback_git_name.as_str(),
+            ctx.config.fallback_git_email.as_str(),
+        );
+        // A stash is local only, so a placeholder name is fine if git has none.
+        let mut args = git::identity_args(target, fb).unwrap_or_else(|_| {
+            vec![
+                "-c".into(),
+                "user.name=StowLock".into(),
+                "-c".into(),
+                "user.email=stowlock@localhost".into(),
+            ]
+        });
+        for a in ["stash", "push", "--include-untracked", "-m", &label] {
+            args.push(a.to_string());
+        }
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        git::git_ok(target, &refs, log, "stage")
+            .map_err(|e| format!("Couldn't set aside the earlier unpushed staging: {e}"))?;
+        result.notes.push(format!(
+            "Saved the earlier unpushed staging in git stash (\"{label}\")"
+        ));
     }
     // 4. Default branch, fetch, fast-forward.
     let branch = ctx
@@ -563,7 +603,7 @@ pub struct PushOutcome {
 }
 
 pub fn push(ctx: &Ctx, req: &PushRequest) -> Res<PushOutcome> {
-    let dir = ctx.workspace().join(&req.slug);
+    let dir = detect::project_dir(&ctx.workspace(), &req.slug);
     if !dir.is_dir() {
         return Err("The staged project folder is missing. Stage the zip again.".into());
     }
@@ -762,9 +802,7 @@ pub fn archive_only(
     move_it: bool,
 ) -> Res<PathBuf> {
     if !detect::valid_slug(slug) {
-        return Err(
-            "The project name must use lowercase letters, numbers and hyphens only.".into(),
-        );
+        return Err(detect::name_problem(slug).unwrap_or_default());
     }
     let p = ctx.timed("Archive zip", || {
         archive::archive_zip(zip, &ctx.config.archive_root(), slug, tag, move_it)
@@ -1039,7 +1077,7 @@ mod tests {
         let bare = sb.fake.bare(&sb.owner, "demo-app");
         assert!(bare.exists());
         assert_eq!(
-            git::git(&bare, &["rev-list", "--count", "main"]).stdout_trim(),
+            git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout_trim(),
             "1",
             "single initial commit"
         );
@@ -1105,7 +1143,7 @@ mod tests {
             .releases(&sb.owner, "demo-app")
             .contains(&("v0.2.0-beta.1".to_string(), true)));
         assert_eq!(
-            git::git(&bare, &["rev-list", "--count", "main"]).stdout_trim(),
+            git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout_trim(),
             "2"
         );
 
@@ -1162,18 +1200,67 @@ mod tests {
         let err2 = stage(&sb.ctx, &req(&sb, &zip3, Mode::Update)).unwrap_err();
         assert!(err2.contains("both changed"), "{err2}");
         assert_eq!(
-            git::git(&bare, &["log", "-1", "--format=%s", "main"]).stdout_trim(),
+            git::git_bare(&bare, &["log", "-1", "--format=%s", "main"]).stdout_trim(),
             "remote change"
         );
 
         // Archive Only never pushes.
-        let before = git::git(&bare, &["rev-list", "--count", "main"]).stdout_trim();
+        let before = git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout_trim();
         let p = archive_only(&sb.ctx, &zip3, "demo-app", Some("v0.0.9"), true).unwrap();
         assert!(p.exists());
         assert_eq!(
-            git::git(&bare, &["rev-list", "--count", "main"]).stdout_trim(),
+            git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout_trim(),
             before
         );
+    }
+
+    #[test]
+    fn capitalised_github_repo_routes_as_update() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        // A repo called "Sluice" already exists on (fake) GitHub, with one commit.
+        let seed = d.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("main.py"), "print(1)\n").unwrap();
+        git::git(&seed, &["init", "-b", "main"]);
+        git::git(&seed, &["add", "-A"]);
+        git::git(
+            &seed,
+            &[
+                "-c",
+                "user.name=s",
+                "-c",
+                "user.email=s@x",
+                "commit",
+                "-m",
+                "first",
+            ],
+        );
+        sb.fake
+            .create_repo(&seed, &sb.owner, "Sluice", true, "", &sb.ctx.log)
+            .unwrap();
+        let names: Vec<String> = sb
+            .ctx
+            .gh
+            .list_repos(&sb.owner)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        let slug = detect::slug_from_filename("sluice-v2.zip");
+        let (mode, _, on_gh) = decide_mode(&sb.ctx.workspace(), &slug, &sb.owner, Some(&names));
+        assert_eq!(
+            (mode, on_gh),
+            (Mode::Update, Some(true)),
+            "case doesn't matter"
+        );
+        let zip = sb.zip("sluice-v2.zip", &[("main.py", b"print(2)\n", 0o644)]);
+        let mut r = req(&sb, &zip, Mode::Update);
+        r.slug = "Sluice".into(); // the app adopts GitHub's exact name
+        let st = stage(&sb.ctx, &r).unwrap();
+        assert!(st.dir.ends_with("Sluice"));
+        // Staging again with lowercase finds the same folder, no duplicate.
+        assert_eq!(detect::project_dir(&sb.ctx.workspace(), "sluice"), st.dir);
     }
 
     #[test]
@@ -1204,8 +1291,72 @@ mod tests {
         assert!(run_checks(&sb.ctx, "leaky", &st.dir, st.stack())
             .secrets
             .is_empty());
-        // Staging again over a local-only folder needs explicit replace.
+        // A local-only folder StowLock didn't stage (here: the record says
+        // it isn't StowLock's unpushed staging) needs an explicit replace.
+        ProjectsState::update(&sb.ctx.paths, "leaky", |p| p.status = Status::Unknown).unwrap();
         let err = stage(&sb.ctx, &r).unwrap_err();
         assert!(err.contains("already exists"));
+    }
+
+    #[test]
+    fn failed_update_can_be_restaged_and_nothing_is_lost() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let z1 = sb.zip("demo-app.zip", &[("main.py", b"print(1)\n", 0o644)]);
+        stage(&sb.ctx, &req(&sb, &z1, Mode::New)).unwrap();
+        push(&sb.ctx, &preq(&sb, Mode::New, "", Channel::Stable, None)).unwrap();
+        // An update is staged but never pushed (say the tests failed).
+        let z2 = sb.zip(
+            "demo-app-v2.zip",
+            &[("main.py", b"print(2 broken\n", 0o644)],
+        );
+        let st = stage(&sb.ctx, &req(&sb, &z2, Mode::Update)).unwrap();
+        // The fixed zip stages cleanly over it.
+        let z3 = sb.zip("demo-app-v3.zip", &[("main.py", b"print(3)\n", 0o644)]);
+        let st3 = stage(&sb.ctx, &req(&sb, &z3, Mode::Update)).unwrap();
+        assert!(st3.notes.iter().any(|n| n.contains("git stash")));
+        assert_eq!(
+            std::fs::read_to_string(st.dir.join("main.py")).unwrap(),
+            "print(3)\n"
+        );
+        // The broken attempt is kept in the stash, not thrown away.
+        let stash = git::git(&st.dir, &["stash", "show", "-p", "stash@{0}"]).stdout;
+        assert!(stash.contains("print(2 broken"));
+    }
+
+    #[test]
+    fn real_local_edits_still_block_an_update() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let z1 = sb.zip("demo-app.zip", &[("main.py", b"print(1)\n", 0o644)]);
+        let st = stage(&sb.ctx, &req(&sb, &z1, Mode::New)).unwrap();
+        push(&sb.ctx, &preq(&sb, Mode::New, "", Channel::Stable, None)).unwrap();
+        // The person edits the pushed project by hand.
+        std::fs::write(st.dir.join("main.py"), "print('mine')\n").unwrap();
+        let z2 = sb.zip("demo-app-v2.zip", &[("main.py", b"print(2)\n", 0o644)]);
+        let e = stage(&sb.ctx, &req(&sb, &z2, Mode::Update)).unwrap_err();
+        assert!(e.contains("unsaved changes"));
+        assert_eq!(
+            std::fs::read_to_string(st.dir.join("main.py")).unwrap(),
+            "print('mine')\n"
+        );
+    }
+
+    #[test]
+    fn failed_new_repo_can_be_restaged() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let z1 = sb.zip("demo-app.zip", &[("main.py", b"print(1 broken\n", 0o644)]);
+        stage(&sb.ctx, &req(&sb, &z1, Mode::New)).unwrap();
+        let z2 = sb.zip("demo-app-v2.zip", &[("main.py", b"print(2)\n", 0o644)]);
+        let st = stage(&sb.ctx, &req(&sb, &z2, Mode::New)).unwrap();
+        assert!(st
+            .notes
+            .iter()
+            .any(|n| n.contains("earlier unpushed staging")));
+        assert_eq!(
+            std::fs::read_to_string(st.dir.join("main.py")).unwrap(),
+            "print(2)\n"
+        );
     }
 }

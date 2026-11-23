@@ -51,6 +51,21 @@ impl ProjectsState {
         self.projects.get(slug).cloned().unwrap_or_default()
     }
 
+    /// True when StowLock staged this project and it hasn't been pushed since,
+    /// so any loose files in its folder are StowLock's own work.
+    pub fn staged_not_pushed(&self, slug: &str) -> bool {
+        self.projects
+            .iter()
+            .find(|(k, _)| k.as_str() == slug)
+            .or_else(|| {
+                self.projects
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(slug))
+            })
+            .map(|(_, p)| p.status == Status::Staged)
+            .unwrap_or(false)
+    }
+
     /// Load, change one project, save. Safe to call from worker threads.
     pub fn update(paths: &AppPaths, slug: &str, f: impl FnOnce(&mut ProjectState)) -> Res<()> {
         let mut s = Self::load(paths);

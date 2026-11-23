@@ -325,7 +325,7 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
     rn.check(
         "T02",
         "Zip intake",
-        "Slug rules",
+        "Slug rules, name formatting and version detection",
         "detect.rs",
         "Fix slug_from_filename suffix patterns.",
         Box::new(|| {
@@ -343,6 +343,23 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
                     format!("{input} → {got}")
                 );
             }
+            let typed = detect::format_typing("My Cool App");
+            ensure!(
+                typed == "my-cool-app",
+                "\"My Cool App\" → my-cool-app",
+                typed
+            );
+            ensure!(
+                detect::valid_slug("Sluice"),
+                "existing name \"Sluice\" accepted",
+                "rejected"
+            );
+            let zp = tmp.join("sluice-v0.11.7.zip");
+            extract::write_zip(&zp, &[("a.txt", b"a", 0o644)]).map_err(|e| fail("zip", e))?;
+            let v = detect::detect_version(&zp, "v")
+                .map(|v| v.tag)
+                .unwrap_or_default();
+            ensure!(v == "v0.11.7", "version v0.11.7 read from the zip name", v);
             Ok(None)
         }),
     );
@@ -633,7 +650,7 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
             )
             .map_err(|e| fail("pushed", e))?;
             let bare = sb.fake.bare(&owner, "selftest-app");
-            let n = git::git(&bare, &["rev-list", "--count", "main"]).stdout_trim();
+            let n = git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout_trim();
             ensure!(n == "1", "1 commit", format!("{n} commits"));
             Ok(None)
         }),
@@ -732,7 +749,7 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
             );
             let e2 = pipeline::stage(&sb.ctx, &req(&z, Mode::Update));
             ensure!(e2.is_err(), "diverged history refused", "staged anyway");
-            let head = git::git(&bare, &["log", "-1", "--format=%s", "main"]).stdout_trim();
+            let head = git::git_bare(&bare, &["log", "-1", "--format=%s", "main"]).stdout_trim();
             ensure!(
                 head == "remote",
                 "remote untouched",
@@ -796,7 +813,7 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
                 "not found"
             );
             let bare = sb.fake.bare(&owner, "selftest-app");
-            let before = git::git(&bare, &["rev-list", "--count", "main"]).stdout_trim();
+            let before = git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout_trim();
             for _ in 0..2 {
                 let z = sb.zip("old.zip", &[("a.txt", b"a", 0o644)]);
                 pipeline::archive_only(&sb.ctx, &z, "selftest-app", Some("v0.0.1"), true)
@@ -809,7 +826,7 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
                 "no overwrite",
                 "file overwritten"
             );
-            let after = git::git(&bare, &["rev-list", "--count", "main"]).stdout_trim();
+            let after = git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout_trim();
             ensure!(before == after, "nothing pushed", "a commit appeared");
             Ok(None)
         }),

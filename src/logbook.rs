@@ -52,11 +52,96 @@ pub struct Step {
     pub detail: String,
 }
 
+/// One run of the pipeline (stage + push, or an Archive Only), for reports.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Run {
+    pub label: String,
+    pub started: String,
+    pub steps: Vec<Step>,
+}
+
+/// Progress lines that only add noise to the log (build tools).
+fn is_progress(line: &str) -> bool {
+    let t = line.trim_start();
+    const WORDS: [&str; 12] = [
+        "Compiling ",
+        "Downloading ",
+        "Downloaded ",
+        "Checking ",
+        "Fresh ",
+        "Installing ",
+        "Updating ",
+        "Locking ",
+        "Adding ",
+        "Blocking ",
+        "Building ",
+        "Documenting ",
+    ];
+    WORDS.iter().any(|w| t.starts_with(w))
+}
+
+/// Lines worth keeping however long the output is (results, failures).
+fn is_important(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("test result")
+        || l.contains("error")
+        || l.contains("warning:")
+        || l.contains("failed")
+        || l.contains("panicked")
+        || l.starts_with("---- ")
+        || l.starts_with("failures:")
+        || l.contains(" passed")
+        || l.starts_with("tests:")
+        || l.starts_with("ok ")
+        || l.starts_with("fail")
+}
+
+/// Shorten long command output for the log: build progress lines collapse
+/// into one summary line, then the first 10 and last 30 lines are kept,
+/// plus any result or error lines in between.
+pub fn shorten(text: &str) -> Vec<String> {
+    let mut progress = 0usize;
+    let mut rest: Vec<&str> = Vec::new();
+    for l in text.lines() {
+        if is_progress(l) {
+            progress += 1;
+        } else {
+            rest.push(l);
+        }
+    }
+    let mut out = Vec::new();
+    if progress > 0 {
+        out.push(format!(
+            "[{progress} build progress line{} hidden]",
+            if progress == 1 { "" } else { "s" }
+        ));
+    }
+    if rest.len() <= 40 {
+        out.extend(rest.iter().map(|s| s.to_string()));
+        return out;
+    }
+    out.extend(rest[..10].iter().map(|s| s.to_string()));
+    let middle = &rest[10..rest.len() - 30];
+    let kept: Vec<&&str> = middle.iter().filter(|l| is_important(l)).take(20).collect();
+    out.push(format!(
+        "[{} line{} hidden]",
+        middle.len() - kept.len(),
+        if middle.len() - kept.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ));
+    out.extend(kept.into_iter().map(|s| s.to_string()));
+    out.extend(rest[rest.len() - 30..].iter().map(|s| s.to_string()));
+    out
+}
+
 #[derive(Default)]
 struct Inner {
     entries: VecDeque<LogEntry>,
     file: Option<PathBuf>,
-    steps: Vec<Step>,
+    runs: VecDeque<Run>,
     failing_command: Option<(String, Option<i32>)>,
 }
 
@@ -132,9 +217,7 @@ impl Logger {
         );
         let text = out.combined();
         if !text.is_empty() {
-            let lines: Vec<&str> = text.lines().collect();
-            let start = lines.len().saturating_sub(200);
-            for l in &lines[start..] {
+            for l in shorten(&text) {
                 self.log(lvl, stage, &format!("  {l}"));
             }
         }
@@ -167,20 +250,43 @@ impl Logger {
 
     // ----- step timeline of the latest run -----
 
-    pub fn begin_run(&self) {
+    /// Start a new run (the last 3 are kept for bug reports).
+    pub fn begin_run(&self, label: &str) {
         let mut g = self.inner.lock().unwrap();
-        g.steps.clear();
+        g.runs.push_back(Run {
+            label: label.to_string(),
+            started: chrono::Local::now().format("%H:%M").to_string(),
+            steps: Vec::new(),
+        });
+        while g.runs.len() > 3 {
+            g.runs.pop_front();
+        }
         g.failing_command = None;
+    }
+
+    /// Rename the current run (e.g. once a push adds a version).
+    pub fn set_run_label(&self, label: &str) {
+        if let Some(r) = self.inner.lock().unwrap().runs.back_mut() {
+            r.label = label.to_string();
+        }
     }
 
     pub fn step(&self, name: &str, status: StepStatus, millis: u128, detail: &str) {
         let mut g = self.inner.lock().unwrap();
-        if let Some(s) = g.steps.iter_mut().find(|s| s.name == name) {
+        if g.runs.is_empty() {
+            g.runs.push_back(Run {
+                label: "Run".into(),
+                started: chrono::Local::now().format("%H:%M").to_string(),
+                steps: Vec::new(),
+            });
+        }
+        let run = g.runs.back_mut().unwrap();
+        if let Some(s) = run.steps.iter_mut().find(|s| s.name == name) {
             s.status = status;
             s.millis = millis;
             s.detail = redact_secrets(detail);
         } else {
-            g.steps.push(Step {
+            run.steps.push(Step {
                 name: name.into(),
                 status,
                 millis,
@@ -189,8 +295,34 @@ impl Logger {
         }
     }
 
+    /// Steps of the current run.
     pub fn steps(&self) -> Vec<Step> {
-        self.inner.lock().unwrap().steps.clone()
+        self.inner
+            .lock()
+            .unwrap()
+            .runs
+            .back()
+            .map(|r| r.steps.clone())
+            .unwrap_or_default()
+    }
+
+    /// The last (up to 3) runs, oldest first.
+    pub fn runs(&self) -> Vec<Run> {
+        self.inner.lock().unwrap().runs.iter().cloned().collect()
+    }
+
+    /// Warnings and errors among the last `n` entries, and the latest lines.
+    pub fn report_lines(&self, problems: usize, latest: usize) -> (Vec<String>, Vec<String>) {
+        let g = self.inner.lock().unwrap();
+        let p: Vec<String> = g
+            .entries
+            .iter()
+            .filter(|e| e.level != Level::Info)
+            .map(|e| e.line())
+            .collect();
+        let p = p[p.len().saturating_sub(problems)..].to_vec();
+        let start = g.entries.len().saturating_sub(latest);
+        (p, g.entries.iter().skip(start).map(|e| e.line()).collect())
     }
 
     pub fn failing_command(&self) -> Option<(String, Option<i32>)> {
@@ -201,6 +333,29 @@ impl Logger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failing_test_survives_long_build_output() {
+        // Like `cargo test`: test results on stdout, then 60 build lines on stderr.
+        let mut t = String::from("running 3 tests\n");
+        for i in 0..50 {
+            t.push_str(&format!("test filler_{i} ... ok\n"));
+        }
+        t.push_str("test pipeline::tests::demo ... FAILED\n\nfailures:\n\n");
+        t.push_str("---- pipeline::tests::demo stdout ----\n");
+        t.push_str("thread 'pipeline::tests::demo' panicked at src/pipeline.rs:9:5:\n");
+        t.push_str("test result: FAILED. 2 passed; 1 failed\n");
+        for i in 0..60 {
+            t.push_str(&format!("   Compiling crate{i} v1.0.0\n"));
+        }
+        t.push_str("error: test failed, to rerun pass `--bin stowlock`\n");
+        let out = shorten(&t).join("\n");
+        assert!(out.contains("---- pipeline::tests::demo stdout ----"));
+        assert!(out.contains("panicked at src/pipeline.rs:9:5"));
+        assert!(out.contains("test result: FAILED"));
+        assert!(out.contains("60 build progress lines hidden"));
+        assert!(!out.contains("Compiling crate"));
+    }
 
     #[test]
     fn redacts_at_write_time() {
@@ -218,10 +373,38 @@ mod tests {
     #[test]
     fn records_steps() {
         let l = Logger::new(None);
-        l.begin_run();
+        l.begin_run("Stage demo");
         l.step("Stage", StepStatus::Running, 0, "");
         l.step("Stage", StepStatus::Passed, 12, "ok");
         assert_eq!(l.steps().len(), 1);
         assert_eq!(l.steps()[0].status, StepStatus::Passed);
+        for i in 0..4 {
+            l.begin_run(&format!("run {i}"));
+        }
+        let runs = l.runs();
+        assert_eq!(runs.len(), 3, "last 3 runs kept");
+        assert_eq!(runs[2].label, "run 3");
+    }
+
+    #[test]
+    fn long_build_output_is_shortened() {
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(&format!("   Compiling crate{i} v1.0.0\n"));
+        }
+        for i in 0..100 {
+            text.push_str(&format!("line {i}\n"));
+            if i == 50 {
+                text.push_str("test result: ok. 54 passed; 0 failed\n");
+            }
+        }
+        let s = shorten(&text);
+        assert!(s.len() < 70, "{}", s.len());
+        assert!(s[0].contains("400 build progress lines hidden"));
+        assert!(
+            s.iter().any(|l| l.contains("test result: ok. 54 passed")),
+            "results kept"
+        );
+        assert_eq!(shorten("a\nb").len(), 2);
     }
 }

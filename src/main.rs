@@ -190,10 +190,12 @@ fn main() {
         std::process::exit(i32::from(r.counts().1 > 0));
     }
 
+    // The zip is the first argument that isn't an option or an option's value.
     let zip_arg: Option<PathBuf> = args
         .iter()
-        .find(|a| !a.starts_with("--"))
-        .map(PathBuf::from);
+        .enumerate()
+        .find(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--window-size"))
+        .map(|(_, a)| PathBuf::from(a));
     let guard = match instance::acquire(&paths) {
         Ok(instance::Acquire::First(g)) => Some(g),
         Ok(instance::Acquire::AlreadyRunning) => {
@@ -217,6 +219,14 @@ fn main() {
     let log = logbook::Logger::new(Some(paths.log_file()));
     report::install_panic_hook(paths.clone(), log.clone(), config.workspace());
 
+    // --window-size WIDTHxHEIGHT: open at a given size (used for layout checks).
+    let size = args
+        .iter()
+        .position(|a| a == "--window-size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.split_once('x'))
+        .and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?]))
+        .unwrap_or([680.0, 840.0]);
     let icon = eframe::egui::IconData {
         rgba: icon::rgba(128),
         width: 128,
@@ -226,7 +236,7 @@ fn main() {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("StowLock")
             .with_app_id("stowlock")
-            .with_inner_size([680.0, 840.0])
+            .with_inner_size(size)
             .with_min_inner_size([520.0, 600.0])
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(icon)),

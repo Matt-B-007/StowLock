@@ -24,12 +24,27 @@ pub fn acquire(paths: &AppPaths) -> Res<Acquire> {
         .write(true)
         .open(paths.lock_file())
         .ctx("opening the lock file")?;
-    match f.try_lock() {
-        Ok(()) => Ok(Acquire::First(InstanceGuard { _file: f })),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(Acquire::AlreadyRunning),
-        Err(std::fs::TryLockError::Error(e)) => Err(format!("checking for another StowLock: {e}")),
+    // A lock can look busy for a moment after its owner let go: any program
+    // started at that instant briefly holds a copy of the lock file. So a busy
+    // lock is retried for up to half a second before deciding another
+    // StowLock is really open.
+    for attempt in 0..LOCK_TRIES {
+        match f.try_lock() {
+            Ok(()) => return Ok(Acquire::First(InstanceGuard { _file: f })),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if attempt + 1 < LOCK_TRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("checking for another StowLock: {e}"))
+            }
+        }
     }
+    Ok(Acquire::AlreadyRunning)
 }
+
+const LOCK_TRIES: u32 = 20;
 
 /// Give a zip to the copy that's already running.
 pub fn hand_off(paths: &AppPaths, zip: &Path) -> Res<()> {
@@ -85,5 +100,36 @@ mod tests {
         assert!(take_pending(&paths).is_empty());
         drop(first);
         assert!(matches!(acquire(&paths).unwrap(), Acquire::First(_)));
+    }
+
+    #[test]
+    fn released_lock_is_free_while_other_programs_start() {
+        // Starting programs at the same moment used to make a just-released
+        // lock look busy (seen on a fast machine during the tests).
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let starters: Vec<_> = (0..4)
+            .map(|_| {
+                let s = stop.clone();
+                std::thread::spawn(move || {
+                    while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let d = tempfile::tempdir().unwrap();
+        let paths = AppPaths::under(d.path());
+        let mut busy = 0;
+        for _ in 0..200 {
+            drop(acquire(&paths).unwrap());
+            if !matches!(acquire(&paths).unwrap(), Acquire::First(_)) {
+                busy += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in starters {
+            let _ = h.join();
+        }
+        assert_eq!(busy, 0, "a released lock looked busy {busy} times");
     }
 }

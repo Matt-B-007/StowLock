@@ -34,7 +34,7 @@ pub fn archive_zip(
         return Err(format!("The zip {} is no longer there.", util::tilde(zip)));
     }
     util::ensure_private_dir(archive_root)?;
-    let dir = archive_root.join(slug);
+    let dir = archive_dir(archive_root, slug);
     util::ensure_private_dir(&dir)?;
     let dest = archive_name(&dir, slug, tag);
     if move_it {
@@ -45,8 +45,20 @@ pub fn archive_zip(
     Ok(dest)
 }
 
+/// The archive folder for a project (an existing folder in any capitalisation).
+pub fn archive_dir(archive_root: &Path, slug: &str) -> PathBuf {
+    crate::detect::project_dir(archive_root, slug)
+}
+
+/// Would this tag's archive name already be taken?
+pub fn already_archived(archive_root: &Path, slug: &str, tag: &str) -> bool {
+    archive_dir(archive_root, slug)
+        .join(format!("{slug}-{tag}.zip"))
+        .exists()
+}
+
 pub fn count_archives(archive_root: &Path, slug: &str) -> usize {
-    std::fs::read_dir(archive_root.join(slug))
+    std::fs::read_dir(archive_dir(archive_root, slug))
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.path().extension().map(|x| x == "zip").unwrap_or(false))
