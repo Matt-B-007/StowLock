@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Builds the Linux binary for every version tag and attaches it to the GitHub
+# Release, with a SHA-256 checksum. StowLock's self-update downloads these.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          cp target/release/stowlock stowlock-linux-x86_64
+          sha256sum stowlock-linux-x86_64 > stowlock-linux-x86_64.sha256
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          PRE=""
+          case "$TAG" in *-beta*|*-alpha*|*-rc*) PRE="--prerelease" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 --clobber
+          else
+            gh release create "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 --generate-notes $PRE
+          fi
