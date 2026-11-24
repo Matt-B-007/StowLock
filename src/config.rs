@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Where StowLock's own releases live. Set once by the author at build time.
-pub const UPDATE_REPO: &str = "Matt-B-007/stowlock";
+pub const UPDATE_REPO: &str = "Matt-B-007/StowLock";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// All of StowLock's own folders. Never inside the workspace.
@@ -107,6 +107,12 @@ pub struct Config {
     pub fallback_git_email: String,
     pub tag_prefix: String,
     pub check_for_updates: bool,
+    /// "stable", "beta", or "" = Beta when this build is itself a beta.
+    pub update_channel: String,
+    /// The user's own words to hide in bug reports.
+    pub report_hide_words: Vec<String>,
+    /// "light", "dark", or "" = follow the desktop.
+    pub theme: String,
     pub report_retention_days: u32,
     /// Advanced: where StowLock checks for its own updates.
     pub update_repo: String,
@@ -128,6 +134,9 @@ impl Default for Config {
             fallback_git_email: String::new(),
             tag_prefix: "v".into(),
             check_for_updates: true,
+            update_channel: String::new(),
+            report_hide_words: Vec::new(),
+            theme: String::new(),
             report_retention_days: 30,
             update_repo: UPDATE_REPO.into(),
         }
@@ -162,6 +171,16 @@ impl Config {
         self.workspace().join("_archive")
     }
 
+    /// Whether updates include betas: the chosen channel, or Beta when this
+    /// build is itself a beta and no channel was chosen.
+    pub fn beta_updates(&self) -> bool {
+        match self.update_channel.as_str() {
+            "beta" => true,
+            "stable" => false,
+            _ => APP_VERSION.contains('-'),
+        }
+    }
+
     pub fn move_archives(&self) -> bool {
         self.archive_mode != "copy"
     }
@@ -177,7 +196,7 @@ mod tests {
         assert!(c.default_private);
         assert_eq!(c.archive_mode, "move");
         assert_eq!(c.test_timeout_secs, 300);
-        assert_eq!(c.update_repo, "Matt-B-007/stowlock");
+        assert_eq!(c.update_repo, "Matt-B-007/StowLock");
     }
 
     #[test]

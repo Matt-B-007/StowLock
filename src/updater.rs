@@ -30,48 +30,191 @@ pub fn check_due(paths: &AppPaths) -> bool {
     chrono::Local::now().timestamp() - lc.at >= CHECK_EVERY_SECS
 }
 
-/// Is `tag` newer than this build? Pre-releases are never offered.
-pub fn is_newer(tag: &str, current: &str) -> bool {
+/// Is `tag` newer than `current`? Pre-releases count only when `beta` is on.
+/// Nothing older is ever offered, whichever channel is chosen.
+pub fn is_newer(tag: &str, current: &str, beta: bool) -> bool {
     let parse = |s: &str| semver::Version::parse(s.trim().trim_start_matches('v')).ok();
     match (parse(tag), parse(current)) {
-        (Some(t), Some(c)) => t.pre.is_empty() && t > c,
+        (Some(t), Some(c)) => (beta || t.pre.is_empty()) && t > c,
         _ => false,
     }
 }
 
-/// Latest stable release tag, if newer than this build.
-pub fn check(paths: &AppPaths, repo: &str) -> Res<Option<String>> {
+/// A newer release StowLock can offer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Release {
+    pub tag: String,
+    pub prerelease: bool,
+    /// The release's notes ("What's new"), plain text, shortened.
+    pub notes: String,
+}
+
+impl Release {
+    /// "Beta 0.1.0-beta.3" or "0.2.0".
+    pub fn label(&self) -> String {
+        let v = self.tag.trim_start_matches('v');
+        if self.prerelease {
+            format!("Beta {v}")
+        } else {
+            v.to_string()
+        }
+    }
+}
+
+/// Keep release notes readable and bounded.
+pub fn tidy_notes(body: &str) -> String {
+    const MAX: usize = 4000;
+    let text = body.replace("\r\n", "\n");
+    let text = text.trim();
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(MAX).collect();
+    format!("{cut}\n…(see the release page for the rest)")
+}
+
+/// From GitHub's public releases list (the REST API's JSON), the newest
+/// release this channel may offer, with its notes, if it's newer than `current`.
+pub fn pick_from_releases(json: &str, current: &str, beta: bool) -> Option<Release> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let parse = |s: &str| semver::Version::parse(s.trim().trim_start_matches('v')).ok();
+    v.as_array()?
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?.to_string();
+            let ver = parse(&tag)?;
+            is_newer(&tag, current, beta).then(|| {
+                (
+                    ver,
+                    Release {
+                        tag,
+                        prerelease: r["prerelease"].as_bool().unwrap_or(false),
+                        notes: tidy_notes(r["body"].as_str().unwrap_or("")),
+                    },
+                )
+            })
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, r)| r)
+}
+
+/// Download a public URL to a file (or to text when `out` is None) with curl.
+/// No GitHub sign-in is needed, so updates work right after installing.
+fn fetch(url: &str, out: Option<&Path>, secs: u64) -> Res<String> {
+    if proc::which("curl").is_none() {
+        return Err(
+            "curl is needed to check for updates. Install it with: sudo pacman -S curl".into(),
+        );
+    }
+    let mut args = vec!["-fsSL", "--retry", "2", "-H", "User-Agent: StowLock"];
+    let out_s;
+    if let Some(o) = out {
+        out_s = o.display().to_string();
+        args.push("-o");
+        args.push(&out_s);
+    }
+    args.push(url);
+    let o = proc::run("curl", &args, &Opts::default_timeout().with_timeout(secs));
+    if o.ok() {
+        Ok(o.stdout)
+    } else {
+        let why = o.stderr.trim();
+        Err(if why.is_empty() {
+            "couldn't reach GitHub".to_string()
+        } else {
+            why.to_string()
+        })
+    }
+}
+
+/// The newest release for this channel, if newer than this build.
+pub fn check(paths: &AppPaths, repo: &str, beta: bool) -> Res<Option<Release>> {
     let _ = util::write_json(
         &last_check_file(paths),
         &LastCheck {
             at: chrono::Local::now().timestamp(),
         },
     );
-    let o = proc::run(
-        "gh",
-        &[
-            "release",
-            "list",
-            "--repo",
-            repo,
-            "--exclude-pre-releases",
-            "--limit",
-            "1",
-            "--json",
-            "tagName",
-        ],
-        &Opts::default_timeout().with_timeout(30),
-    );
-    if !o.ok() {
-        return Err(o.combined());
+    let json = fetch(
+        &format!("https://api.github.com/repos/{repo}/releases?per_page=30"),
+        None,
+        30,
+    )?;
+    Ok(pick_from_releases(&json, APP_VERSION, beta))
+}
+
+// ---- Going back to the previous version ----
+
+fn previous_dir(paths: &AppPaths) -> PathBuf {
+    paths.state_dir.join("previous")
+}
+
+/// The version kept from before the last update, if there is one.
+pub fn previous_version(paths: &AppPaths) -> Option<String> {
+    let d = previous_dir(paths);
+    if !d.join("stowlock").is_file() {
+        return None;
     }
-    let v: serde_json::Value = serde_json::from_str(&o.stdout).ctx("reading release list")?;
-    let tag = v
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|r| r["tagName"].as_str())
-        .map(|s| s.to_string());
-    Ok(tag.filter(|t| is_newer(t, APP_VERSION)))
+    std::fs::read_to_string(d.join("version"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Copy `exe` (this version) into the previous-version slot.
+fn keep_previous(paths: &AppPaths, exe: &Path, version: &str) -> Res<()> {
+    let d = previous_dir(paths);
+    util::ensure_private_dir(&d)?;
+    let tmp = d.join("stowlock.new");
+    std::fs::copy(exe, &tmp).ctx("keeping the current version")?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::rename(&tmp, d.join("stowlock")).ctx("keeping the current version")?;
+    util::atomic_write(&d.join("version"), version.as_bytes())
+}
+
+/// Put `new_bin` in place of `exe` atomically (Linux keeps the running file open).
+fn swap_in(new_bin: &Path, exe: &Path) -> Res<()> {
+    let target_dir = exe.parent().ok_or("no folder for the program")?;
+    let staged = target_dir.join(format!(".stowlock.update-{}", std::process::id()));
+    std::fs::copy(new_bin, &staged).ctx("staging the new version")?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::rename(&staged, exe).ctx("swapping in the new version")
+}
+
+/// Go back to the kept version. The version being left is kept in its place,
+/// so the user can go forward again. Returns (program path, version now installed).
+pub fn rollback(paths: &AppPaths, exe: &Path, log: &Logger) -> Res<(PathBuf, String)> {
+    let prev = previous_version(paths).ok_or("There's no previous version to go back to.")?;
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if let Some(pkg) = pacman_owner(&exe) {
+        return Err(format!(
+            "StowLock was installed from the AUR ({pkg}). Go back with your package manager, for example: sudo downgrade {pkg}"
+        ));
+    }
+    let d = previous_dir(paths);
+    let old_bin = d.join("stowlock.restore");
+    std::fs::copy(d.join("stowlock"), &old_bin).ctx("reading the previous version")?;
+    keep_previous(paths, &exe, APP_VERSION)?;
+    swap_in(&old_bin, &exe)?;
+    let _ = std::fs::remove_file(&old_bin);
+    log.info("update", &format!("Went back to StowLock {prev}"));
+    Ok((exe, prev))
+}
+
+/// Written by the crash handler: which version crashed.
+pub fn crashed_version_file(paths: &AppPaths) -> PathBuf {
+    paths.state_dir.join("crashed-version")
+}
+
+/// If this version crashed last time and an older one is kept, offer it.
+/// Reading clears the note.
+pub fn take_rollback_offer(paths: &AppPaths) -> Option<String> {
+    let f = crashed_version_file(paths);
+    let crashed = std::fs::read_to_string(&f).ok()?;
+    let _ = std::fs::remove_file(&f);
+    let prev = previous_version(paths)?;
+    (crashed.trim() == APP_VERSION && prev != APP_VERSION).then_some(prev)
 }
 
 pub fn sha256_hex(path: &Path) -> Res<String> {
@@ -100,52 +243,34 @@ pub fn verify_checksum(file: &Path, sha_text: &str) -> Res<()> {
     }
 }
 
-/// Download, verify and install `tag`. Returns the path that was replaced.
+/// Download, verify and install `tag`. The version being replaced is kept so
+/// the user can go back. Returns the path that was replaced.
 pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathBuf> {
     let exe = std::env::current_exe().ctx("finding the running program")?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     if let Some(pkg) = pacman_owner(&exe) {
         return Err(format!(
-            "StowLock was installed by your package manager. Update with: sudo pacman -Syu {pkg}"
+            "StowLock was installed from the AUR ({pkg}). Update it with your AUR helper, for example: paru -Syu"
         ));
     }
     let dir = paths.update_dir();
     let _ = std::fs::remove_dir_all(&dir);
     util::ensure_private_dir(&dir)?;
-    let d = dir.display().to_string();
-    let pattern = format!("{ASSET}*");
-    let o = proc::run(
-        "gh",
-        &[
-            "release",
-            "download",
-            tag,
-            "--repo",
-            repo,
-            "--pattern",
-            &pattern,
-            "--dir",
-            &d,
-            "--clobber",
-        ],
-        &Opts::default_timeout().with_timeout(300),
-    );
-    log.command("update", &o);
-    if !o.ok() {
-        return Err(o.combined());
-    }
+    let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let bin = dir.join(ASSET);
-    let sha = std::fs::read_to_string(dir.join(format!("{ASSET}.sha256")))
+    let sha_file = dir.join(format!("{ASSET}.sha256"));
+    fetch(&format!("{base}/{ASSET}"), Some(&bin), 300)
+        .map_err(|e| format!("The download failed: {e}"))?;
+    fetch(&format!("{base}/{ASSET}.sha256"), Some(&sha_file), 60)
+        .map_err(|_| "The release has no checksum file, so it wasn't installed.".to_string())?;
+    log.info("update", &format!("Downloaded StowLock {tag}"));
+    let sha = std::fs::read_to_string(&sha_file)
         .map_err(|_| "The release has no checksum file, so it wasn't installed.".to_string())?;
     verify_checksum(&bin, &sha)?;
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
         .ctx("making it executable")?;
-    let target_dir = exe.parent().ok_or("no folder for the program")?;
-    let staged = target_dir.join(format!(".stowlock.update-{}", std::process::id()));
-    std::fs::copy(&bin, &staged).ctx("staging the new version")?;
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).ok();
-    // Linux keeps the running program's file open; new launches get the new one.
-    std::fs::rename(&staged, &exe).ctx("swapping in the new version")?;
+    keep_previous(paths, &exe, APP_VERSION)?;
+    swap_in(&bin, &exe)?;
     let _ = std::fs::remove_dir_all(&dir);
     log.info("update", &format!("Installed StowLock {tag}"));
     Ok(exe)
@@ -164,11 +289,92 @@ mod tests {
 
     #[test]
     fn version_comparison() {
-        assert!(is_newer("v0.2.0", "0.1.0"));
-        assert!(!is_newer("v0.1.0", "0.1.0"));
-        assert!(!is_newer("v0.0.9", "0.1.0"));
-        assert!(!is_newer("v0.2.0-beta.1", "0.1.0"), "betas never offered");
-        assert!(!is_newer("junk", "0.1.0"));
+        assert!(is_newer("v0.2.0", "0.1.0", false));
+        assert!(!is_newer("v0.1.0", "0.1.0", false));
+        assert!(
+            !is_newer("v0.0.9", "0.1.0", true),
+            "never older, even on Beta"
+        );
+        assert!(
+            !is_newer("v0.2.0-beta.1", "0.1.0", false),
+            "Stable skips betas"
+        );
+        assert!(
+            is_newer("v0.2.0-beta.1", "0.1.0", true),
+            "Beta offers betas"
+        );
+        assert!(is_newer("v0.1.0-beta.3", "0.1.0-beta.2", true));
+        assert!(
+            is_newer("v0.1.0", "0.1.0-beta.3", false),
+            "stable beats its betas"
+        );
+        assert!(!is_newer("junk", "0.1.0", true));
+    }
+
+    #[test]
+    fn reads_githubs_public_release_list() {
+        let json = r#"[
+            {"tag_name":"v0.1.0-beta.5","prerelease":true,"draft":true,"body":"unfinished"},
+            {"tag_name":"v0.1.0-beta.4","prerelease":true,"draft":false,"body":"Faster checks\r\n- one"},
+            {"tag_name":"v0.1.0-beta.3","prerelease":true,"draft":false,"body":""}
+        ]"#;
+        let r = pick_from_releases(json, "0.1.0-beta.3", true).unwrap();
+        assert_eq!(r.tag, "v0.1.0-beta.4", "drafts are never offered");
+        assert!(r.prerelease);
+        assert_eq!(r.notes, "Faster checks\n- one");
+        assert_eq!(r.label(), "Beta 0.1.0-beta.4");
+        assert_eq!(pick_from_releases(json, "0.1.0-beta.3", false), None);
+        assert_eq!(pick_from_releases(json, "0.1.0-beta.4", true), None);
+        assert_eq!(
+            pick_from_releases("<html>rate limited</html>", "0.1.0", true),
+            None
+        );
+    }
+
+    #[test]
+    fn notes_are_bounded() {
+        assert_eq!(tidy_notes("  Fixes\r\n- one  "), "Fixes\n- one");
+        let long = "x".repeat(10_000);
+        let t = tidy_notes(&long);
+        assert!(t.chars().count() < 4100 && t.ends_with("the rest)"));
+    }
+
+    #[test]
+    fn rollback_swaps_versions_both_ways() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = AppPaths::under(&d.path().join("app"));
+        paths.ensure().unwrap();
+        let exe = d.path().join("bin").join("stowlock");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"old build").unwrap();
+        keep_previous(&paths, &exe, "0.0.1").unwrap();
+        std::fs::write(&exe, b"new build").unwrap();
+        assert_eq!(previous_version(&paths).as_deref(), Some("0.0.1"));
+        let log = Logger::new(None);
+        let (_, now) = rollback(&paths, &exe, &log).unwrap();
+        assert_eq!(now, "0.0.1");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old build");
+        // The version we left is kept, so going forward again works.
+        assert_eq!(previous_version(&paths).as_deref(), Some(APP_VERSION));
+        assert_eq!(
+            std::fs::read(paths.state_dir.join("previous/stowlock")).unwrap(),
+            b"new build"
+        );
+    }
+
+    #[test]
+    fn crash_offer_only_for_this_version() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = AppPaths::under(d.path());
+        paths.ensure().unwrap();
+        let exe = d.path().join("stowlock");
+        std::fs::write(&exe, b"x").unwrap();
+        keep_previous(&paths, &exe, "0.0.1").unwrap();
+        std::fs::write(crashed_version_file(&paths), "9.9.9").unwrap();
+        assert_eq!(take_rollback_offer(&paths), None, "another version crashed");
+        std::fs::write(crashed_version_file(&paths), APP_VERSION).unwrap();
+        assert_eq!(take_rollback_offer(&paths).as_deref(), Some("0.0.1"));
+        assert_eq!(take_rollback_offer(&paths), None, "offered once");
     }
 
     #[test]

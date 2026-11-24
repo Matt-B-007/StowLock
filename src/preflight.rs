@@ -6,7 +6,7 @@
 use crate::detect::Stack;
 use crate::logbook::Logger;
 use crate::proc::{self, Opts, Output};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +50,49 @@ pub struct TestEnv<'a> {
     pub cancel: Arc<AtomicBool>,
     pub pass_env: bool,
     pub log: &'a Logger,
+    /// Where build files are kept between checks of the same project, so a
+    /// second check doesn't rebuild everything. None = the project's own folder.
+    pub build_cache: Option<PathBuf>,
+}
+
+/// The names of failed tests (cargo, pytest, go, jest), shortest form,
+/// in the order they appear, without repeats.
+pub fn failed_tests(transcript: &str) -> Vec<String> {
+    use regex::Regex;
+    let pats = [
+        Regex::new(r"(?m)^test (\S+) \.\.\. FAILED").unwrap(),
+        Regex::new(r"(?m)^FAILED (\S+)").unwrap(),
+        Regex::new(r"(?m)^\s*--- FAIL: (\S+)").unwrap(),
+        Regex::new(r"(?m)^\s*[✕×] (.+?)(?: \(\d+ ?m?s\))?$").unwrap(),
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for re in &pats {
+        for c in re.captures_iter(transcript) {
+            let full = c[1].trim();
+            // pipeline::tests::demo -> demo; tests/test_x.py::test_y -> test_y
+            let short = full.rsplit("::").next().unwrap_or(full).to_string();
+            if !out.contains(&short) {
+                out.push(short);
+            }
+        }
+    }
+    out
+}
+
+/// "65 passed, 2 failed" plus the failed tests' names (up to 5).
+pub fn with_failed_names(counts: String, transcript: &str) -> String {
+    let names = failed_tests(transcript);
+    if names.is_empty() {
+        return counts;
+    }
+    let shown: Vec<&str> = names.iter().take(5).map(|s| s.as_str()).collect();
+    let more = names.len().saturating_sub(5);
+    let tail = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    format!("{counts}: {}{tail}", shown.join(", "))
 }
 
 /// Pull the pass/fail counts out of test output (cargo, pytest, go, jest).
@@ -95,7 +138,13 @@ fn run_step(dir: &Path, program: &str, args: &[&str], env: &TestEnv) -> Output {
         timeout: Some(Duration::from_secs(env.timeout_secs)),
         cancel: Some(env.cancel.clone()),
         scrub_env: !env.pass_env,
-        env: vec![("CI".into(), "true".into())],
+        env: {
+            let mut e = vec![("CI".into(), "true".into())];
+            if let Some(c) = &env.build_cache {
+                e.push(("CARGO_TARGET_DIR".into(), c.display().to_string()));
+            }
+            e
+        },
         stdin: None,
     };
     let o = proc::run(program, args, &opts);
@@ -234,7 +283,7 @@ pub fn run_tests(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
         if !o.ok() {
             let what = if o.timed_out { "timed out" } else { "failed" };
             let counts = result_summary(&transcript)
-                .map(|c| format!(" · {c}"))
+                .map(|c| format!(" · {}", with_failed_names(c, &transcript)))
                 .unwrap_or_default();
             return finish(
                 TestStatus::Failed,
@@ -263,6 +312,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             pass_env: false,
             log,
+            build_cache: None,
         }
     }
 
@@ -299,6 +349,25 @@ mod tests {
             Some("1 package(s) passed, 1 failed")
         );
         assert_eq!(result_summary("nothing"), None);
+    }
+
+    #[test]
+    fn names_failed_tests() {
+        let cargo = "test a::ok_one ... ok\ntest instance::tests::lock_and_hand_off ... FAILED\ntest pipeline::tests::restage ... FAILED\n\nfailures:\n";
+        assert_eq!(failed_tests(cargo), ["lock_and_hand_off", "restage"]);
+        assert_eq!(
+            with_failed_names("65 passed, 2 failed".into(), cargo),
+            "65 passed, 2 failed: lock_and_hand_off, restage"
+        );
+        let py = "FAILED tests/test_x.py::test_parse - AssertionError\n";
+        assert_eq!(failed_tests(py), ["test_parse"]);
+        assert_eq!(failed_tests("--- FAIL: TestRoute (0.00s)\n"), ["TestRoute"]);
+        let many: String = (0..8).map(|i| format!("test t{i} ... FAILED\n")).collect();
+        assert!(with_failed_names("0 passed, 8 failed".into(), &many).ends_with("t4 (+3 more)"));
+        assert_eq!(
+            with_failed_names("3 passed, 0 failed".into(), "ok"),
+            "3 passed, 0 failed"
+        );
     }
 
     #[test]

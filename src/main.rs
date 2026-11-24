@@ -5,6 +5,7 @@
 
 mod app;
 mod archive;
+mod attempts;
 mod auth;
 mod cleanup;
 mod config;
@@ -53,6 +54,8 @@ Usage:
       --yes-delete-projects      Confirm --everything without typing (scripts)
   stowlock --self-test [--online]
                                  Check every feature in a sandbox; exits 1 on failure
+  stowlock --update              Check for a newer version and install it
+  stowlock --rollback            Go back to the version kept from before the last update
   stowlock --version             Print the version
 ";
 
@@ -153,6 +156,13 @@ fn main() {
                 for w in r.warnings {
                     println!("note: {w}");
                 }
+                if let Some(v) = instance::running_pid(&paths).and_then(instance::running_version) {
+                    if v != APP_VERSION {
+                        println!(
+                            "note: StowLock {v} is still open. Close it, then open StowLock again to use {APP_VERSION}."
+                        );
+                    }
+                }
                 return;
             }
             Err(e) => {
@@ -164,6 +174,52 @@ fn main() {
     if let Err(e) = paths.ensure() {
         eprintln!("StowLock couldn't create its folders: {e}");
         std::process::exit(1);
+    }
+    if has("--update") {
+        let config = config::Config::load(&paths);
+        let beta = config.beta_updates();
+        let log = logbook::Logger::new(None);
+        match updater::check(&paths, &config.update_repo, beta) {
+            Ok(None) => println!(
+                "You have the newest {} version ({APP_VERSION}).",
+                if beta { "beta or stable" } else { "stable" }
+            ),
+            Ok(Some(rel)) => {
+                println!("Updating StowLock {APP_VERSION} to {}…", rel.label());
+                match updater::apply(&paths, &config.update_repo, &rel.tag, &log) {
+                    Ok(p) => {
+                        println!("Installed {} at {}.", rel.label(), util::tilde(&p));
+                        println!("Close StowLock if it's open, then open it again. If anything's wrong: stowlock --rollback");
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Couldn't check for updates: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if has("--rollback") {
+        let log = logbook::Logger::new(None);
+        let r = std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| updater::rollback(&paths, &exe, &log));
+        match r {
+            Ok((_, v)) => {
+                println!("Went back to StowLock {v}. Open StowLock again to use it.");
+                println!("The version you left ({APP_VERSION}) is kept; run --rollback again to return to it.");
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
     }
     if has("--self-test") {
         println!("StowLock {APP_VERSION} self-test (sandboxed; never touches your projects or GitHub)…\n");
@@ -194,20 +250,46 @@ fn main() {
     let zip_arg: Option<PathBuf> = args
         .iter()
         .enumerate()
-        .find(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--window-size"))
+        .find(|(i, a)| {
+            !a.starts_with("--")
+                && (*i == 0 || (args[i - 1] != "--window-size" && args[i - 1] != "--open-screen"))
+        })
         .map(|(_, a)| PathBuf::from(a));
     let guard = match instance::acquire(&paths) {
         Ok(instance::Acquire::First(g)) => Some(g),
         Ok(instance::Acquire::AlreadyRunning) => {
-            if let Some(z) = &zip_arg {
-                match instance::hand_off(&paths, z) {
-                    Ok(_) => println!("StowLock is already open; the zip was sent to it."),
-                    Err(e) => eprintln!("{e}"),
+            // An older copy is open: offer to switch to this newer one.
+            let older = instance::running_pid(&paths).and_then(|pid| {
+                instance::running_version(pid)
+                    .filter(|v| instance::is_older(v, APP_VERSION))
+                    .map(|v| (pid, v))
+            });
+            let mut switched = None;
+            if let Some((pid, v)) = older {
+                let q = format!(
+                    "An older StowLock ({v}) is open. Close it and switch to {APP_VERSION}?"
+                );
+                if proc::ask_yes_no("StowLock", &q) {
+                    switched = instance::take_over(&paths, pid, 8);
+                    if switched.is_none() {
+                        eprintln!("The older StowLock didn't close. Close it yourself, then open StowLock again.");
+                        std::process::exit(1);
+                    }
                 }
-            } else {
-                println!("StowLock is already open.");
             }
-            return;
+            if switched.is_some() {
+                switched
+            } else {
+                if let Some(z) = &zip_arg {
+                    match instance::hand_off(&paths, z) {
+                        Ok(_) => println!("StowLock is already open; the zip was sent to it."),
+                        Err(e) => eprintln!("{e}"),
+                    }
+                } else {
+                    println!("StowLock is already open.");
+                }
+                return;
+            }
         }
         Err(e) => {
             eprintln!("{e}");

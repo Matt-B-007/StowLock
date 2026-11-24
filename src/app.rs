@@ -32,6 +32,16 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// What each step tile says before it runs.
+const WAITING: [&str; 6] = [
+    "Waiting",
+    "Waiting",
+    "Waiting",
+    "After checks pass",
+    "After push",
+    "After release",
+];
+
 const STEPS: [&str; 6] = [
     "Extract & clean",
     "Pre-flight tests",
@@ -77,8 +87,9 @@ enum Msg {
     Archived(Result<PathBuf, String>),
     Projects(Vec<ProjectInfo>),
     SelfTest(Box<SelfTestReport>, Option<PathBuf>),
-    UpdateChecked(Result<Option<String>, String>),
+    UpdateChecked(Result<Option<updater::Release>, String>),
     UpdateApplied(Result<PathBuf, String>),
+    RolledBack(Result<(PathBuf, String), String>),
     SignIn(SignInEvent),
     Tools(Output),
     Toast(String),
@@ -90,11 +101,15 @@ enum Msg {
 enum Tab {
     Stage,
     Projects,
+    History,
+    Health,
+    Report,
+    Settings,
 }
 
 enum UpdateState {
     None,
-    Available(String),
+    Available(updater::Release),
     Working(String),
     Ready(String, PathBuf),
     Failed(String),
@@ -199,6 +214,10 @@ struct BugForm {
     /// Where the last download went.
     saved_to: Option<PathBuf>,
     saving: bool,
+    /// Report sections the user unticked.
+    excluded: Vec<String>,
+    /// The "Also hide these words" box.
+    hide_input: String,
 }
 
 struct UninstallUi {
@@ -224,6 +243,10 @@ pub struct App {
     env: EnvStatus,
     session: Session,
     projects: Vec<ProjectInfo>,
+    /// Earlier attempts StowLock set aside (Projects > Saved earlier attempts).
+    attempts: Vec<crate::attempts::Attempt>,
+    confirm_delete_attempt: Option<usize>,
+    logo: Option<egui::TextureHandle>,
     history: History,
     health: HealthState,
     error: Option<(Friendly, String)>,
@@ -234,10 +257,6 @@ pub struct App {
     tools_result: Option<String>,
     identity_name: String,
     identity_email: String,
-    show_settings: bool,
-    show_health: bool,
-    show_bug: bool,
-    show_today: bool,
     show_uninstall: bool,
     show_log: bool,
     bug: BugForm,
@@ -246,7 +265,17 @@ pub struct App {
     last_selftest: Option<(SelfTestReport, Option<PathBuf>)>,
     run_child: Option<std::process::Child>,
     crash_report: Option<PathBuf>,
+    /// A version to go back to, offered after this one crashed.
+    rollback_offer: Option<String>,
     installed: bool,
+    /// Version of the installed copy when the running copy isn't it.
+    installed_version: Option<String>,
+    /// Set when pacman installed StowLock (the AUR package): updates go through paru/yay.
+    pacman_pkg: Option<String>,
+    /// The last update check's result, shown in Settings.
+    update_note: Option<String>,
+    /// The running check was started with Check now (so say the result).
+    update_manual: bool,
     install_inst: InstallPaths,
     last_pending_poll: Instant,
     archive_note_seen: bool,
@@ -261,13 +290,16 @@ impl App {
         guard: Option<instance::InstanceGuard>,
         zip_arg: Option<PathBuf>,
     ) -> Self {
-        ui::apply_theme(&cc.egui_ctx);
+        ui::install_fonts(&cc.egui_ctx);
         let config = Config::load(&paths);
+        let light = wants_light(&config.theme, cc.egui_ctx.system_theme());
+        ui::apply_theme(&cc.egui_ctx, light);
         let (tx, rx) = channel();
         let crash_report = std::fs::read_to_string(paths.crash_marker())
             .ok()
             .map(|s| PathBuf::from(s.trim()));
         let _ = std::fs::remove_file(paths.crash_marker());
+        let rollback_offer = updater::take_rollback_offer(&paths);
         if crash_report.is_some() {
             HealthState::record(
                 &paths,
@@ -279,7 +311,19 @@ impl App {
         report::apply_retention(&paths, config.report_retention_days);
         pipeline::clean_stale_temp(&config);
         let inst = InstallPaths::detect();
-        let installed = install::is_installed(&inst);
+        let pacman_pkg = std::env::current_exe()
+            .ok()
+            .and_then(|e| std::fs::canonicalize(e).ok())
+            .and_then(|e| crate::uninstall::pacman_owner(&e));
+        let mut installed = install::is_installed(&inst) || pacman_pkg.is_some();
+        let installed_version = if installed {
+            None
+        } else {
+            install::program_version(&inst.bin)
+        };
+        if installed_version.as_deref() == Some(APP_VERSION) {
+            installed = true;
+        }
         let mut app = App {
             history: History::load(&paths),
             health: HealthState::load(&paths),
@@ -296,6 +340,9 @@ impl App {
             tab: Tab::Stage,
             env: EnvStatus::default(),
             projects: Vec::new(),
+            attempts: Vec::new(),
+            confirm_delete_attempt: None,
+            logo: None,
             error: None,
             toast: None,
             update: UpdateState::None,
@@ -304,10 +351,6 @@ impl App {
             tools_result: None,
             identity_name: String::new(),
             identity_email: String::new(),
-            show_settings: false,
-            show_health: false,
-            show_bug: false,
-            show_today: false,
             show_uninstall: false,
             show_log: false,
             bug: BugForm {
@@ -320,6 +363,8 @@ impl App {
                 created: chrono::Local::now(),
                 saved_to: None,
                 saving: false,
+                excluded: Vec::new(),
+                hide_input: String::new(),
             },
             uninstall: UninstallUi {
                 level: UninstallLevel::AppOnly,
@@ -332,7 +377,12 @@ impl App {
             last_selftest: None,
             run_child: None,
             crash_report,
+            rollback_offer,
             installed,
+            installed_version,
+            pacman_pkg,
+            update_note: None,
+            update_manual: false,
             install_inst: inst,
             last_pending_poll: Instant::now(),
             archive_note_seen: false,
@@ -346,6 +396,28 @@ impl App {
         if let Some(z) = zip_arg {
             app.load_zip(z);
         }
+        // --open-screen NAME: open on a given screen (used for layout checks).
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(name) = args
+            .iter()
+            .position(|a| a == "--open-screen")
+            .and_then(|i| args.get(i + 1))
+        {
+            app.tab = match name.as_str() {
+                "projects" => Tab::Projects,
+                "history" => Tab::History,
+                "health" => Tab::Health,
+                "report" => {
+                    app.open_bug_report();
+                    Tab::Report
+                }
+                "settings" => Tab::Settings,
+                _ => Tab::Stage,
+            };
+            if app.tab == Tab::Projects {
+                app.refresh_attempts();
+            }
+        }
         app
     }
 
@@ -358,6 +430,7 @@ impl App {
             gh: self.gh.clone(),
             log: self.log.clone(),
             cancel: self.cancel.clone(),
+            trash_dir: None,
         }
     }
 
@@ -456,12 +529,16 @@ impl App {
                     crate::logbook::StepStatus::Passed => {
                         HealthState::record(&self.paths, area, true, "")
                     }
-                    crate::logbook::StepStatus::Failed => HealthState::record(
-                        &self.paths,
-                        area,
-                        false,
-                        s.detail.lines().next().unwrap_or(""),
-                    ),
+                    crate::logbook::StepStatus::Failed => {
+                        let why = s.detail.lines().next().unwrap_or("");
+                        let broken = health::counts_against_stowlock(&s.name, why);
+                        HealthState::record(
+                            &self.paths,
+                            area,
+                            !broken,
+                            if broken { why } else { "" },
+                        )
+                    }
                     _ => {}
                 }
             }
@@ -701,18 +778,18 @@ impl App {
     }
 
     fn check_updates(&mut self, manual: bool) {
-        if !self.env.gh {
-            if manual {
-                self.toast("GitHub's gh tool is needed to check for updates.");
-            }
-            return;
+        self.update_manual = manual;
+        if manual {
+            self.update_note = Some("Checking for updates…".into());
         }
+
         let paths = self.paths.clone();
         let repo = self.config.update_repo.clone();
+        let beta = self.config.beta_updates();
         let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
-            let r = updater::check(&paths, &repo);
+            let r = updater::check(&paths, &repo, beta);
             if manual {
                 if let Ok(None) = &r {
                     Self::send(
@@ -732,6 +809,18 @@ impl App {
         let repo = self.config.update_repo.clone();
         let log = self.log.clone();
         self.spawn_bg(move || Msg::UpdateApplied(updater::apply(&paths, &repo, &tag, &log)));
+    }
+
+    fn start_rollback(&mut self) {
+        let paths = self.paths.clone();
+        let log = self.log.clone();
+        self.spawn_bg(move || {
+            Msg::RolledBack(
+                std::env::current_exe()
+                    .map_err(|e| e.to_string())
+                    .and_then(|exe| updater::rollback(&paths, &exe, &log)),
+            )
+        });
     }
 
     fn start_sign_in(&mut self) {
@@ -799,11 +888,12 @@ impl App {
         rc.repos = repos;
         rc.include_public_repo_names = self.bug.include_public;
         rc.include_username = self.bug.include_username;
+        rc.extra_words = self.config.report_hide_words.clone();
         rc
     }
 
     fn open_bug_report(&mut self) {
-        self.show_bug = true;
+        self.tab = Tab::Report;
         self.bug.created = chrono::Local::now();
         self.bug.saved_to = None;
         self.bug.confirm_issue = false;
@@ -819,12 +909,20 @@ impl App {
         self.spawn_bg(move || {
             let r = match save_file_dialog(&start, &name) {
                 None => Ok(None),
-                Some(path) => std::fs::write(&path, text.as_bytes())
+                Some(path) => util::atomic_write(&path, text.as_bytes())
                     .map(|_| Some(path.clone()))
                     .map_err(|e| format!("Couldn't save {}: {e}", util::tilde(&path))),
             };
             Msg::BugDownloaded(r)
         });
+    }
+
+    fn excluded(&self, section: &str) -> bool {
+        self.bug.excluded.iter().any(|x| x == section)
+    }
+
+    fn refresh_attempts(&mut self) {
+        self.attempts = crate::attempts::list(&self.config.workspace());
     }
 
     fn build_bug_report(&self) -> String {
@@ -834,7 +932,9 @@ impl App {
             what_doing: self.bug.what.clone(),
             expected: self.bug.expected.clone(),
             env: report::collect_env(Some(self.env.login.is_some()), self.env.secure()),
-            session: if s.slug.is_empty() {
+            session: if s.slug.is_empty()
+                || self.bug.excluded.iter().any(|x| x == "Current project")
+            {
                 None
             } else {
                 Some(SessionInfo {
@@ -851,12 +951,28 @@ impl App {
                 })
             },
             steps: Vec::new(),
-            runs: self.log.runs(),
+            runs: if self.excluded("Recent runs") {
+                vec![]
+            } else {
+                self.log.runs()
+            },
             failing_command: self.log.failing_command(),
-            health: self.health.lines(),
+            health: if self.excluded("Health") {
+                vec![]
+            } else {
+                self.health.lines()
+            },
             selftest_summary: self.last_selftest.as_ref().map(|(r, _)| r.summary_line()),
-            problem_lines: self.log.report_lines(40, 100).0,
-            log_lines: self.log.report_lines(40, 100).1,
+            problem_lines: if self.excluded("Warnings and errors") {
+                vec![]
+            } else {
+                self.log.report_lines(40, 100).0
+            },
+            log_lines: if self.excluded("Latest log lines") {
+                vec![]
+            } else {
+                self.log.report_lines(40, 100).1
+            },
             panic: None,
         };
         let text = report::build_report(&input, &self.redact_ctx());
@@ -876,6 +992,7 @@ impl App {
         match m {
             Msg::Env(e) => {
                 let first = !self.env.checked;
+                let rebuild_report = self.tab == Tab::Report;
                 self.env = *e;
                 if self.identity_name.is_empty() {
                     self.identity_name = self.env.name.clone().unwrap_or_default();
@@ -891,7 +1008,7 @@ impl App {
                 }
                 if first && !self.env.ready() {
                     // First-run screen: the GitHub account panel.
-                    self.show_settings = true;
+                    self.tab = Tab::Settings;
                 }
                 if self.env.ready() {
                     HealthState::record(&self.paths, "Tools & sign-in", true, "");
@@ -903,11 +1020,11 @@ impl App {
                     );
                 }
                 self.health = HealthState::load(&self.paths);
-                if first
-                    && self.config.check_for_updates
-                    && self.env.gh
-                    && updater::check_due(&self.paths)
-                {
+                if rebuild_report {
+                    // Sign-in details and account names arrived: refresh the preview.
+                    self.bug.preview = self.build_bug_report();
+                }
+                if first && self.config.check_for_updates && updater::check_due(&self.paths) {
                     self.check_updates(false);
                 }
             }
@@ -987,21 +1104,44 @@ impl App {
                 self.health = HealthState::load(&self.paths);
                 self.refresh_projects();
             }
-            Msg::Projects(p) => self.projects = p,
+            Msg::Projects(p) => {
+                self.projects = p;
+                self.refresh_attempts();
+            }
             Msg::SelfTest(r, path) => {
                 self.health = HealthState::load(&self.paths);
                 self.toast(&format!("Self-test: {}", r.summary_line()));
                 self.last_selftest = Some((*r, path));
             }
             Msg::UpdateChecked(r) => match r {
-                Ok(Some(tag)) => {
+                Ok(Some(rel)) => {
                     HealthState::record(&self.paths, "Self-update", true, "");
-                    self.update = UpdateState::Available(tag);
+                    self.update = UpdateState::Available(rel);
                 }
-                Ok(None) => HealthState::record(&self.paths, "Self-update", true, ""),
-                Err(e) => self
-                    .log
-                    .warn("update", &format!("Update check failed: {e}")),
+                Ok(None) => {
+                    HealthState::record(&self.paths, "Self-update", true, "");
+                    self.update_note = Some(format!(
+                        "You have the newest {} version ({APP_VERSION}). Checked {}.",
+                        if self.config.beta_updates() {
+                            "beta or stable"
+                        } else {
+                            "stable"
+                        },
+                        chrono::Local::now().format("%H:%M")
+                    ));
+                    if self.update_manual {
+                        self.toast(&format!("You have the newest version ({APP_VERSION})."));
+                    }
+                }
+                Err(e) => {
+                    self.log
+                        .warn("update", &format!("Update check failed: {e}"));
+                    let first = e.lines().next().unwrap_or("").trim().to_string();
+                    self.update_note = Some(format!("Couldn't check for updates: {first}"));
+                    if self.update_manual {
+                        self.toast(&format!("Couldn't check for updates: {first}"));
+                    }
+                }
             },
             Msg::UpdateApplied(r) => match r {
                 Ok(p) => {
@@ -1015,6 +1155,13 @@ impl App {
                     HealthState::record(&self.paths, "Self-update", false, &e);
                     self.update = UpdateState::Failed(e);
                 }
+            },
+            Msg::RolledBack(r) => match r {
+                Ok((p, v)) => {
+                    self.rollback_offer = None;
+                    self.update = UpdateState::Ready(format!("v{v}"), p);
+                }
+                Err(e) => self.toast(&format!("Couldn't go back: {e}")),
             },
             Msg::SignIn(ev) => match ev {
                 SignInEvent::Code(c) => {
@@ -1090,6 +1237,37 @@ fn ui_window(ctx: &egui::Context, title: &str, width: f32) -> egui::Window<'stat
 
 /// Save dialog: KDE's dialog, then zenity, then the desktop portal. Each asks
 /// before replacing an existing file. None = cancelled.
+/// Light theme? "light"/"dark" in Settings, otherwise follow the desktop.
+fn wants_light(choice: &str, system: Option<egui::Theme>) -> bool {
+    match choice {
+        "light" => true,
+        "dark" => false,
+        _ => system == Some(egui::Theme::Light),
+    }
+}
+
+/// How many details were hidden in a report (placeholders and removals).
+fn count_hidden(text: &str) -> usize {
+    let re = regex::Regex::new(r"<(account|repo|org|user|host|email|hidden|workspace)(-\d+)?>|\[removed\]|\[REDACTED[^\]]*\]|left out\]").unwrap();
+    re.find_iter(text).count()
+}
+
+/// "2026-11-23-111459" -> "Nov 23, 11:14".
+fn nice_stamp(stamp: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d-%H%M%S")
+        .map(|t| t.format("%b %-d, %H:%M").to_string())
+        .unwrap_or_else(|_| stamp.to_string())
+}
+
+/// Report sections the user can leave out.
+const REPORT_SECTIONS: [&str; 5] = [
+    "Current project",
+    "Recent runs",
+    "Health",
+    "Warnings and errors",
+    "Latest log lines",
+];
+
 fn save_file_dialog(start: &Path, default_name: &str) -> Option<PathBuf> {
     let suggested = start.join(default_name).display().to_string();
     if proc::which("kdialog").is_some() {
@@ -1221,48 +1399,68 @@ impl eframe::App for App {
             self.pick_zip();
         }
 
-        self.top_bar(ctx);
+        // Light or dark, following the desktop unless chosen in Settings.
+        let light = wants_light(&self.config.theme, ctx.system_theme());
+        if light != ui::is_light() {
+            ui::apply_theme(ctx, light);
+        }
+
+        self.sidebar(ctx);
         if self.tab == Tab::Stage {
             self.action_bar(ctx);
         }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(ui::BG)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
+                    .fill(ui::BG())
+                    .inner_margin(egui::Margin {
+                        left: 28,
+                        right: 28,
+                        top: 22,
+                        bottom: 8,
+                    }),
             )
             .show(ctx, |ui| {
                 self.banners(ui);
-                ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(
-                        &mut self.tab,
-                        Tab::Stage,
-                        RichText::new("  Stage & Push  ").strong(),
-                    );
-                    ui.selectable_value(
-                        &mut self.tab,
-                        Tab::Projects,
-                        RichText::new(format!("  Projects ({})  ", self.projects.len())).strong(),
-                    );
-                });
-                ui.add_space(4.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| match self.tab {
-                        Tab::Stage => self.stage_tab(ui, hovering),
-                        Tab::Projects => self.projects_tab(ui),
+                    .show(ui, |ui| {
+                        let w = ui.available_width().min(1100.0);
+                        ui.set_max_width(w);
+                        match self.tab {
+                            Tab::Stage => {
+                                ui::title(
+                                    ui,
+                                    "Stage",
+                                    "Turn a project zip into a tested GitHub release.",
+                                );
+                                ui.add_space(8.0);
+                                self.stage_tab(ui, hovering)
+                            }
+                            Tab::Projects => {
+                                ui::title(
+                                    ui,
+                                    "Projects",
+                                    &format!(
+                                        "Everything in {} and on GitHub.",
+                                        util::tilde(&self.config.workspace())
+                                    ),
+                                );
+                                ui.add_space(8.0);
+                                self.projects_tab(ui)
+                            }
+                            Tab::History => self.history_screen(ui),
+                            Tab::Health => self.health_screen(ui),
+                            Tab::Report => self.report_screen(ui),
+                            Tab::Settings => self.settings_screen(ui),
+                        }
+                        ui.add_space(16.0);
                     });
             });
         self.windows(ctx);
         if let Some((t, at)) = &self.toast {
-            if at.elapsed() < Duration::from_secs(4) {
-                let t = t.clone();
-                egui::Area::new(egui::Id::new("toast"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -90.0])
-                    .show(ctx, |ui| {
-                        ui::banner(ui, ACCENT, |ui| ui.label(t));
-                    });
-            } else {
+            let gap = if self.tab == Tab::Stage { 88.0 } else { 24.0 };
+            if !ui::toast(ctx, t, at.elapsed().as_secs_f32(), gap) {
                 self.toast = None;
             }
         }
@@ -1271,120 +1469,542 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn top_buttons(&mut self, ui: &mut egui::Ui, right_to_left: bool) {
-        let n = self.history.today().len();
-        let (broken, attn) = self.health.counts();
-        let (htxt, hcol) = if broken > 0 {
-            (format!("⏺ {broken} broken"), ERROR)
-        } else if attn > 0 {
-            (format!("⏺ {attn} need attention"), WARNING)
-        } else {
-            ("⏺ All working".to_string(), SUCCESS)
-        };
-        let mut order: Vec<u8> = vec![0, 1, 2, 3];
-        if right_to_left {
-            order.reverse();
+    // ------------------------------------------------------------ sidebar
+
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        let compact = ctx.screen_rect().width() < 820.0;
+        let logo = self
+            .logo
+            .get_or_insert_with(|| {
+                ctx.load_texture(
+                    "stowlock-logo",
+                    egui::ColorImage::from_rgba_unmultiplied([64, 64], &crate::icon::rgba(64)),
+                    egui::TextureOptions::LINEAR,
+                )
+            })
+            .clone();
+        egui::SidePanel::left("nav")
+            .resizable(false)
+            .exact_width(if compact { 68.0 } else { 236.0 })
+            .frame(
+                egui::Frame::new()
+                    .fill(ui::SIDE())
+                    .inner_margin(egui::Margin::symmetric(12, 18))
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER())),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::vec2(30.0, 30.0)));
+                    if !compact {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(ui::semibold("StowLock", 16.0));
+                            ui.label(ui::muted(format!("v{APP_VERSION}")).size(12.0));
+                        });
+                    }
+                });
+                ui.add_space(18.0);
+                let today = self.history.today().len();
+                let (broken, attn) = self.health.counts();
+                let saved = self.attempts.len();
+                let update = matches!(self.update, UpdateState::Available(_));
+                let items: [(Tab, &str, &str, Option<String>); 6] = [
+                    (Tab::Stage, ui::icon::UPLOAD, "Stage", None),
+                    (
+                        Tab::Projects,
+                        ui::icon::LAYERS,
+                        "Projects",
+                        (saved > 0).then(|| format!("{saved} saved")),
+                    ),
+                    (
+                        Tab::History,
+                        ui::icon::HISTORY,
+                        "History",
+                        (today > 0).then(|| format!("{today} today")),
+                    ),
+                    (
+                        Tab::Health,
+                        ui::icon::ACTIVITY,
+                        "Health",
+                        (broken + attn > 0).then(|| format!("{}", broken + attn)),
+                    ),
+                    (Tab::Report, ui::icon::BUG, "Bug report", None),
+                    (
+                        Tab::Settings,
+                        ui::icon::SLIDERS,
+                        "Settings",
+                        update.then(|| "Update".to_string()),
+                    ),
+                ];
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for (tab, icon, label, badge) in items {
+                    if ui::nav_item(ui, icon, label, self.tab == tab, badge.as_deref(), compact)
+                        .clicked()
+                    {
+                        if tab == Tab::Report {
+                            self.open_bug_report();
+                        } else if tab == Tab::Projects {
+                            self.refresh_attempts();
+                        }
+                        self.tab = tab;
+                    }
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    let signed_in = self.env.login.clone();
+                    let dot = if signed_in.is_some() {
+                        ui::SUCCESS()
+                    } else {
+                        WARNING()
+                    };
+                    if compact {
+                        let label = signed_in.clone().unwrap_or_else(|| "Not signed in".into());
+                        if ui::nav_item(ui, ui::icon::USER, &label, false, None, true).clicked() {
+                            self.tab = Tab::Settings;
+                        }
+                        return;
+                    }
+                    let resp = egui::Frame::new()
+                        .fill(ui::CARD())
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER()))
+                        .corner_radius(egui::CornerRadius::same(12))
+                        .inner_margin(egui::Margin::same(if compact { 8 } else { 12 }))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if compact {
+                                ui.vertical_centered(|ui| {
+                                    ui.label(RichText::new(ui::icon::USER).size(18.0).color(dot));
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(10.0, 10.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(r.center(), 4.0, dot);
+                                    ui.add(
+                                        egui::Label::new(ui::semibold(
+                                            signed_in
+                                                .clone()
+                                                .unwrap_or_else(|| "Not signed in".into()),
+                                            13.0,
+                                        ))
+                                        .truncate(),
+                                    );
+                                });
+                                ui.label(
+                                    ui::muted(if self.config.beta_updates() {
+                                        "Beta updates"
+                                    } else {
+                                        "Stable updates"
+                                    })
+                                    .size(12.0),
+                                );
+                            }
+                        })
+                        .response
+                        .interact(egui::Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Account and updates");
+                    if resp.clicked() {
+                        self.tab = Tab::Settings;
+                    }
+                });
+            });
+    }
+
+    // ------------------------------------------------------------ history
+
+    fn history_screen(&mut self, ui: &mut egui::Ui) {
+        ui::title(ui, "History", "Every push and archive, newest first.");
+        ui.add_space(8.0);
+        let mut pushes = self.history.pushes.clone();
+        pushes.reverse();
+        if pushes.is_empty() {
+            ui::card(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(ui::icon::HISTORY).size(30.0).color(MUTED()));
+                    ui.label(ui::semibold("Nothing pushed yet", 16.0));
+                    ui.label(ui::muted(
+                        "Pushes and archives show up here, so you can see what went where.",
+                    ));
+                    ui.add_space(16.0);
+                });
+            });
+            return;
         }
-        for i in order {
-            match i {
-                0 => {
-                    if ui
-                        .button(RichText::new(format!("Pushed today: {n}")).color(if n > 0 {
-                            SUCCESS
-                        } else {
-                            MUTED
-                        }))
-                        .clicked()
-                    {
-                        self.show_today = !self.show_today;
+        let mut last_date = String::new();
+        ui::card(ui, |ui| {
+            for r in pushes.iter().take(200) {
+                if r.date() != last_date {
+                    last_date = r.date().to_string();
+                    if ui.cursor().top() > ui.min_rect().top() + 30.0 {
+                        ui.add_space(6.0);
+                    }
+                    ui::section_title(ui, &last_date);
+                }
+                self.today_row(ui, r);
+            }
+        });
+    }
+
+    // ------------------------------------------------------------ settings parts
+
+    fn appearance_and_updates(&mut self, ui: &mut egui::Ui) {
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "Updates");
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width() - 250.0).max(220.0));
+                    ui.label(ui::semibold("Update channel", 14.5));
+                    ui.add(egui::Label::new(ui::muted(if self.config.beta_updates() {
+                        "Beta: every newer version, betas included. Never offers an older one."
+                    } else {
+                        "Stable: full releases only. Betas are skipped."
+                    }).size(13.0)).wrap());
+                });
+                let sel = usize::from(self.config.beta_updates());
+                if let Some(i) = ui::segmented(ui, &["Stable", "Beta"], sel, 220.0) {
+                    self.config.update_channel = if i == 1 {
+                        "beta".into()
+                    } else {
+                        "stable".into()
+                    };
+                    if matches!(self.update, UpdateState::Available(_)) {
+                        self.update = UpdateState::None;
                     }
                 }
-                1 => {
-                    if ui
-                        .button(RichText::new(&htxt).color(hcol))
-                        .on_hover_text("Health")
-                        .clicked()
-                    {
-                        self.show_health = !self.show_health;
-                    }
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(
+                    &mut self.config.check_for_updates,
+                    "Check for updates when StowLock opens",
+                );
+                if ui::button_enabled(
+                    ui,
+                    self.pacman_pkg.is_none(),
+                    ui::icon::REFRESH,
+                    "Check now",
+                )
+                .clicked()
+                {
+                    self.check_updates(true);
                 }
-                2 => {
-                    if ui.button("Bug Report").clicked() {
-                        self.open_bug_report();
-                    }
+            });
+            match &self.update {
+                UpdateState::Available(rel) => {
+                    let label = rel.label();
+                    let tag = rel.tag.clone();
+                    ui::banner(ui, ACCENT(), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("StowLock {label} is available."));
+                            if self.pacman_pkg.is_none()
+                                && ui::primary(ui, &format!("Update to {label}"), true).clicked()
+                            {
+                                self.apply_update(tag.clone());
+                            }
+                        });
+                    });
                 }
                 _ => {
-                    if ui.button("⚙").on_hover_text("Settings").clicked() {
-                        self.show_settings = !self.show_settings;
+                    if let Some(n) = &self.update_note {
+                        ui.label(ui::muted(n).size(13.0));
                     }
                 }
             }
-        }
+            if let Some(pkg) = &self.pacman_pkg {
+                ui::inset(ui, |ui| {
+                    ui.add(egui::Label::new(format!("Installed from the AUR ({pkg}). Updates come through your AUR helper, for example paru or yay.")).wrap());
+                });
+            } else if let Some(prev) = updater::previous_version(&self.paths) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(ui::muted(format!(
+                        "Version {prev} is kept from before the last update."
+                    )));
+                    if ui::button(ui, ui::icon::UNDO, &format!("Go back to {prev}")).clicked() {
+                        self.start_rollback();
+                    }
+                });
+            }
+        });
+        ui.add_space(8.0);
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "Appearance");
+            let sel = match self.config.theme.as_str() {
+                "light" => 1,
+                "dark" => 2,
+                _ => 0,
+            };
+            if let Some(i) = ui::segmented(ui, &["Follow system", "Light", "Dark"], sel, 340.0) {
+                self.config.theme = ["", "light", "dark"][i].to_string();
+            }
+        });
     }
 
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        let resp = egui::TopBottomPanel::top("top")
-            .frame(
-                egui::Frame::new()
-                    .fill(ui::CARD)
-                    .inner_margin(egui::Margin::symmetric(16, 10))
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER)),
-            )
-            .show(ctx, |ui| {
-                let title = |ui: &mut egui::Ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(RichText::new("Stow").strong().size(19.0).color(TEXT));
-                    ui.label(RichText::new("Lock").strong().size(19.0).color(ACCENT));
-                    ui.add_space(8.0);
-                    ui.label(ui::muted(format!("v{APP_VERSION}")).size(11.5));
-                };
-                let ws = util::tilde(&self.config.workspace());
-                // Wide: title, path (shortened with …), buttons on the right.
-                // Narrow: buttons wrap onto a second line. Nothing overlaps.
-                if ui.available_width() >= 640.0 {
-                    ui.horizontal(|ui| {
-                        title(ui);
-                        ui.add_space(12.0);
-                        let path_w = ui.available_width() - 440.0;
-                        if path_w > 60.0 {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(path_w, 20.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.add(
-                                        egui::Label::new(ui::mono(&ws).color(MUTED).size(12.0))
-                                            .truncate(),
-                                    )
-                                    .on_hover_text(format!("Workspace: {ws}"));
-                                },
-                            );
+    // ------------------------------------------------------------ bug report
+
+    fn report_screen(&mut self, ui: &mut egui::Ui) {
+        let mut rebuild = false;
+        let mut download = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
+                ui::title(
+                    ui,
+                    "Bug report",
+                    "Everything needed to fix a problem, with your personal details hidden.",
+                );
+            });
+        });
+        ui.add_space(8.0);
+        let wide = ui.available_width() > 860.0;
+        let left_w = if wide { 340.0 } else { ui.available_width() };
+        let mut left = |this: &mut Self, ui: &mut egui::Ui| {
+            ui::card(ui, |ui| {
+                ui::section_title(ui, "What happened?");
+                ui.label(ui::muted("Optional. A sentence or two helps a lot.").size(13.0));
+                rebuild |= ui
+                    .add(
+                        egui::TextEdit::multiline(&mut this.bug.what)
+                            .hint_text("What were you doing?")
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed();
+                rebuild |= ui
+                    .add(
+                        egui::TextEdit::multiline(&mut this.bug.expected)
+                            .hint_text("What did you expect to happen?")
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed();
+            });
+            ui.add_space(8.0);
+            ui::card(ui, |ui| {
+                ui::section_title(ui, "Include");
+                for sec in REPORT_SECTIONS {
+                    let mut on = !this.excluded(sec);
+                    if ui.checkbox(&mut on, sec).changed() {
+                        if on {
+                            this.bug.excluded.retain(|x| x != sec);
+                        } else {
+                            this.bug.excluded.push(sec.to_string());
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            self.top_buttons(ui, true);
-                        });
+                        rebuild = true;
+                    }
+                }
+                ui.label(
+                    ui::muted("System details and StowLock's version are always included.")
+                        .size(12.5),
+                );
+            });
+            ui.add_space(8.0);
+            ui::card(ui, |ui| {
+                ui::section_title(ui, "Hidden before it leaves your computer");
+                let hidden = count_hidden(&this.bug.preview);
+                ui.horizontal(|ui| {
+                    ui.label(ui::semibold(hidden.to_string(), 28.0).color(ACCENT()));
+                    ui.label(ui::muted(if hidden == 1 {
+                        "detail hidden"
+                    } else {
+                        "details hidden"
+                    }));
+                });
+                for line in [
+                    "Your username, home folder and computer name",
+                    "GitHub account, organisations and repo names",
+                    "Project names and file names, emails, IP and MAC addresses",
+                    "Tokens, keys and anything that looks like a secret",
+                ] {
+                    ui.label(ui::muted(format!("•  {line}")).size(13.0));
+                }
+                ui.add_space(6.0);
+                ui.label(ui::semibold("Also hide these words", 13.5));
+                let mut remove: Option<usize> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, w) in this.config.report_hide_words.iter().enumerate() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("{w}  {}", ui::icon::X)).size(12.5),
+                                )
+                                .corner_radius(egui::CornerRadius::same(255)),
+                            )
+                            .on_hover_text("Stop hiding this word")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                    }
+                });
+                if let Some(i) = remove {
+                    this.config.report_hide_words.remove(i);
+                    rebuild = true;
+                }
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut this.bug.hide_input)
+                        .hint_text("Type a word and press Enter")
+                        .desired_width(f32::INFINITY),
+                );
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let w = this.bug.hide_input.trim().to_string();
+                    if !w.is_empty() && !this.config.report_hide_words.contains(&w) {
+                        this.config.report_hide_words.push(w);
+                        rebuild = true;
+                    }
+                    this.bug.hide_input.clear();
+                    r.request_focus();
+                }
+                ui.horizontal_wrapped(|ui| {
+                    rebuild |= ui
+                        .checkbox(&mut this.bug.include_public, "Show public repo names")
+                        .changed();
+                    rebuild |= ui
+                        .checkbox(&mut this.bug.include_username, "Show my GitHub username")
+                        .changed();
+                });
+                ui.add(egui::Label::new(ui::muted("Nothing is ever sent automatically. The report only leaves your computer when you copy, save or download it. Your typed note is hidden the same way.").size(12.5)).wrap());
+            });
+        };
+        let mut right = |this: &mut Self, ui: &mut egui::Ui| {
+            ui::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            ui::mono(report::bug_report_file_name(&this.bug.created))
+                                .color(MUTED()),
+                        )
+                        .truncate(),
+                    );
+                });
+                ui.label(ui::muted("Preview: exactly what gets shared.").size(12.5));
+                egui::Frame::new()
+                    .fill(ui::BG())
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::both()
+                            .max_height(440.0)
+                            .id_salt("bugprev")
+                            .show(ui, |ui| {
+                                let mut p = this.bug.preview.clone();
+                                let w = ui.available_width();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut p)
+                                        .code_editor()
+                                        .frame(false)
+                                        .desired_width(w),
+                                );
+                            });
                     });
-                } else {
-                    ui.horizontal(|ui| title(ui));
-                    ui.horizontal_wrapped(|ui| self.top_buttons(ui, false));
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui::primary(
+                        ui,
+                        &ui::with_icon(ui::icon::DOWNLOAD, "Download as .txt…"),
+                        !this.bug.saving,
+                    )
+                    .clicked()
+                    {
+                        download = true;
+                    }
+                    if ui::button(ui, ui::icon::COPY, "Copy").clicked() {
+                        ui.ctx().copy_text(this.bug.preview.clone());
+                        this.toast("Copied. Paste it into a GitHub issue or an AI chat.");
+                    }
+                    if ui::button(ui, ui::icon::SAVE, "Save copy")
+                        .on_hover_text("Keep a copy in StowLock's reports folder")
+                        .clicked()
+                    {
+                        match report::save_report(&this.paths, "bugreport", &this.bug.preview) {
+                            Ok(p) => this.toast(&format!("Saved {}", util::tilde(&p))),
+                            Err(e) => this.fail(&e, "report"),
+                        }
+                    }
+                    if ui::button(ui, ui::icon::EXTERNAL, "Open GitHub issue…").clicked() {
+                        this.bug.confirm_issue = true;
+                    }
+                    if this.bug.saving {
+                        ui.spinner();
+                    }
+                });
+                if let Some(p) = this.bug.saved_to.clone() {
+                    ui::banner(ui, ui::SUCCESS(), |ui| {
+                        ui.add(
+                            egui::Label::new(format!("Downloaded to {}", util::tilde(&p))).wrap(),
+                        );
+                        if ui::button(ui, ui::icon::FOLDER_OPEN, "Open folder").clicked() {
+                            let folder = p
+                                .parent()
+                                .map(|f| f.display().to_string())
+                                .unwrap_or_default();
+                            let _ = proc::xdg_open(&folder);
+                        }
+                    });
+                }
+                if this.bug.confirm_issue {
+                    this.confirm_issue_banner(ui);
                 }
             });
-        // Remember where the top bar ends so pop-ups open below it.
-        let bottom = resp.response.rect.bottom();
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("top_bar_bottom"), bottom));
+            ui.add_space(8.0);
+            ui::card(ui, |ui| {
+                let crashes = std::fs::read_dir(this.paths.reports_dir())
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                ui.label(ui::semibold("Crash reports", 14.5));
+                ui.add(egui::Label::new(ui::muted(if crashes == 0 {
+                    "No crashes recorded. If StowLock ever closes unexpectedly, a report with your details hidden is kept here for you to send.".to_string()
+                } else {
+                    format!("{crashes} crash report(s) kept, with your details hidden.")
+                }).size(13.0)).wrap());
+                if crashes > 0 && ui::button(ui, ui::icon::FOLDER_OPEN, "Open folder").clicked() {
+                    let _ = proc::xdg_open(&this.paths.reports_dir().display().to_string());
+                }
+            });
+        };
+        if wide {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(left_w);
+                    left(self, ui);
+                });
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    right(self, ui);
+                });
+            });
+        } else {
+            right(self, ui);
+            ui.add_space(8.0);
+            left(self, ui);
+        }
+        if rebuild {
+            self.bug.preview = self.build_bug_report();
+        }
+        if download {
+            self.download_bug_report();
+        }
     }
 
     fn banners(&mut self, ui: &mut egui::Ui) {
         if self.env.checked && !self.env.ready() {
-            ui::banner(ui, WARNING, |ui| {
+            ui::banner(ui, WARNING(), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let what = if !self.env.git || !self.env.gh {
                         "Git and GitHub's gh tool need to be installed."
                     } else {
                         "Sign in to GitHub to push projects."
                     };
-                    ui.label(RichText::new(format!("Finish setup: {what}")).color(WARNING));
+                    ui.label(RichText::new(format!("Finish setup: {what}")).color(WARNING()));
                     if ui.button("Finish setup").clicked() {
-                        self.show_settings = true;
+                        self.tab = Tab::Settings;
                     }
                 });
             });
@@ -1393,11 +2013,11 @@ impl App {
             ui.label(ui::muted("Offline: using local projects only.").size(12.0));
         }
         if self.env.secure() == Some(false) {
-            ui::banner(ui, WARNING, |ui| {
+            ui::banner(ui, WARNING(), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Your GitHub sign-in is stored in a plain file instead of the system keyring.");
                     if ui.button("Move to secure storage").clicked() {
-                        self.show_settings = true;
+                        self.tab = Tab::Settings;
                         self.start_sign_in();
                     }
                 });
@@ -1408,26 +2028,42 @@ impl App {
         let mut restart: Option<PathBuf> = None;
         match &self.update {
             UpdateState::None => {}
-            UpdateState::Available(t) => {
-                ui::banner(ui, ACCENT, |ui| {
+            UpdateState::Available(rel) => {
+                ui::banner(ui, ACCENT(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
-                            "StowLock {t} is available (you have v{APP_VERSION})."
+                            "StowLock {} is available (you have {APP_VERSION}).",
+                            rel.label()
                         ));
-                        if ui
-                            .button(RichText::new(format!("Update to {t}")).strong())
+                        if let Some(pkg) = &self.pacman_pkg {
+                            ui.label(format!(
+                                "Update it with your AUR helper ({pkg}), for example: paru -Syu"
+                            ));
+                        } else if ui
+                            .button(RichText::new(format!("Update to {}", rel.label())).strong())
                             .clicked()
                         {
-                            do_update = Some(t.clone());
+                            do_update = Some(rel.tag.clone());
                         }
                         if ui.small_button("✖").clicked() {
                             dismiss_update = true;
                         }
                     });
+                    if !rel.notes.is_empty() {
+                        egui::CollapsingHeader::new("What's new")
+                            .id_salt("whats_new")
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(200.0)
+                                    .show(ui, |ui| {
+                                        ui.add(egui::Label::new(rel.notes.as_str()).wrap());
+                                    });
+                            });
+                    }
                 });
             }
             UpdateState::Working(t) => {
-                ui::banner(ui, ACCENT, |ui| {
+                ui::banner(ui, ACCENT(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spinner();
                         ui.label(format!("Downloading and checking StowLock {t}…"));
@@ -1435,7 +2071,7 @@ impl App {
                 });
             }
             UpdateState::Ready(t, p) => {
-                ui::banner(ui, SUCCESS, |ui| {
+                ui::banner(ui, SUCCESS(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("StowLock {t} is installed."));
                         if ui.button(RichText::new("Restart now").strong()).clicked() {
@@ -1446,7 +2082,7 @@ impl App {
             }
             UpdateState::Failed(e) => {
                 let e = e.clone();
-                ui::banner(ui, WARNING, |ui| {
+                ui::banner(ui, WARNING(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
                             "The update didn't install: {}. Your current version keeps working.",
@@ -1470,8 +2106,30 @@ impl App {
                 std::process::exit(0);
             }
         }
+        if let Some(prev) = self.rollback_offer.clone() {
+            let mut go_back = false;
+            ui::banner(ui, ERROR(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "StowLock {APP_VERSION} closed unexpectedly last time. Go back to {prev}?"
+                    ));
+                    if ui
+                        .button(RichText::new(format!("Go back to {prev}")).strong())
+                        .clicked()
+                    {
+                        go_back = true;
+                    }
+                    if ui.small_button("✖").clicked() {
+                        self.rollback_offer = None;
+                    }
+                });
+            });
+            if go_back {
+                self.start_rollback();
+            }
+        }
         if let Some(p) = self.crash_report.clone() {
-            ui::banner(ui, ERROR, |ui| {
+            ui::banner(ui, ERROR(), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("StowLock closed unexpectedly last time.");
                     if ui.button("View report").clicked() {
@@ -1484,19 +2142,32 @@ impl App {
             });
         }
         if !self.installed {
-            ui::banner(ui, ACCENT, |ui| {
+            let older_installed = self
+                .installed_version
+                .clone()
+                .filter(|v| instance::is_older(v, APP_VERSION));
+            let newer_installed = self
+                .installed_version
+                .clone()
+                .filter(|v| instance::is_older(APP_VERSION, v));
+            let mut do_install = false;
+            ui::banner(ui, ACCENT(), |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("StowLock isn't installed yet, so it won't appear in your app menu.");
-                    if ui.button("Install StowLock").clicked() {
-                        match install::install(&self.install_inst) {
-                            Ok(r) => {
-                                for l in r.lines.iter().chain(r.warnings.iter()) {
-                                    self.log.info("install", l);
-                                }
-                                self.toast("Installed. StowLock is now in your app menu.");
-                                self.installed = true;
-                            }
-                            Err(e) => self.fail(&e, "install"),
+                    if let Some(v) = &newer_installed {
+                        ui.label(format!(
+                            "This is an older copy ({APP_VERSION}). The installed StowLock is {v}: open StowLock from your app menu to use it."
+                        ));
+                    } else if let Some(v) = &older_installed {
+                        ui.label(format!(
+                            "The installed StowLock is older ({v}). This copy is {APP_VERSION}."
+                        ));
+                        if ui.button("Replace the installed version").clicked() {
+                            do_install = true;
+                        }
+                    } else {
+                        ui.label("StowLock isn't installed yet, so it won't appear in your app menu.");
+                        if ui.button("Install StowLock").clicked() {
+                            do_install = true;
                         }
                     }
                     if ui.small_button("✖").clicked() {
@@ -1504,6 +2175,23 @@ impl App {
                     }
                 });
             });
+            if do_install {
+                match install::install(&self.install_inst) {
+                    Ok(r) => {
+                        for l in r.lines.iter().chain(r.warnings.iter()) {
+                            self.log.info("install", l);
+                        }
+                        self.toast(
+                            &r.lines
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "Installed.".into()),
+                        );
+                        self.installed = true;
+                    }
+                    Err(e) => self.fail(&e, "install"),
+                }
+            }
         }
     }
 
@@ -1511,19 +2199,19 @@ impl App {
         let Some((f, raw)) = self.error.clone() else {
             return;
         };
-        ui::banner(ui, ERROR, |ui| {
-            ui.add(egui::Label::new(RichText::new(&f.message).color(ERROR).strong()).wrap());
+        ui::banner(ui, ERROR(), |ui| {
+            ui.add(egui::Label::new(RichText::new(&f.message).color(ERROR()).strong()).wrap());
             ui.horizontal_wrapped(|ui| {
                 match f.action {
                     Some(Action::SignIn) => {
                         if ui.button("Sign in").clicked() {
-                            self.show_settings = true;
+                            self.tab = Tab::Settings;
                             self.start_sign_in();
                         }
                     }
                     Some(Action::SetIdentity) => {
                         if ui.button("Set name and email").clicked() {
-                            self.show_settings = true;
+                            self.tab = Tab::Settings;
                         }
                     }
                     Some(Action::SwitchToUpdate) => {
@@ -1554,99 +2242,124 @@ impl App {
         // ---- drop zone
         let has_zip = self.session.zip.is_some() || self.session.stage.is_some();
         let (fill, stroke) = if hovering {
-            (ACCENT.linear_multiply(0.12), ACCENT)
+            (ACCENT().linear_multiply(0.12), ACCENT())
         } else {
-            (ui::CARD, BORDER)
+            (ui::CARD(), BORDER())
         };
+        let mut pick = false;
         egui::Frame::new()
             .fill(fill)
             .stroke(egui::Stroke::new(
                 if hovering { 2.0_f32 } else { 1.0 },
                 stroke,
             ))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(egui::Margin::same(16))
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin::same(if has_zip { 16 } else { 28 }))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.vertical_centered(|ui| {
-                    if let Some(z) = &self.session.zip {
-                        ui.label(RichText::new("📦").size(26.0));
-                        ui.add(
-                            egui::Label::new(
-                                ui::mono(
-                                    z.file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default(),
-                                )
-                                .size(15.0)
-                                .strong(),
-                            )
-                            .truncate(),
+                if has_zip {
+                    ui.horizontal(|ui| {
+                        let (r, _) =
+                            ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            r,
+                            egui::CornerRadius::same(12),
+                            ui::ACCENT_SOFT(),
                         );
-                        ui.add(egui::Label::new(ui::muted(util::tilde(z)).size(11.5)).truncate())
-                            .on_hover_text(util::tilde(z));
-                    } else if let Some(st) = &self.session.stage {
-                        ui.label(RichText::new("📁").size(26.0));
-                        ui.add(
-                            egui::Label::new(ui::mono(util::tilde(&st.dir)).size(14.0).strong())
-                                .truncate(),
-                        );
-                        ui.label(ui::muted("Loaded from your workspace"));
-                    } else {
-                        ui.label(RichText::new("⬇").size(30.0).color(if hovering {
-                            ACCENT
+                        let glyph = if self.session.zip.is_some() {
+                            ui::icon::PACKAGE
                         } else {
-                            MUTED
-                        }));
-                        ui.label(
-                            RichText::new(if hovering {
+                            ui::icon::FOLDER
+                        };
+                        ui.painter().text(
+                            r.center(),
+                            egui::Align2::CENTER_CENTER,
+                            glyph,
+                            egui::FontId::proportional(22.0),
+                            ACCENT(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            pick |=
+                                ui::button_enabled(ui, self.busy.is_none(), "", "Choose another…")
+                                    .clicked();
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                let (name, sub) = if let Some(z) = &self.session.zip {
+                                    (
+                                        z.file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default(),
+                                        util::tilde(z),
+                                    )
+                                } else if let Some(st) = &self.session.stage {
+                                    (
+                                        util::tilde(&st.dir),
+                                        "Loaded from your workspace".to_string(),
+                                    )
+                                } else {
+                                    (String::new(), String::new())
+                                };
+                                ui.add(egui::Label::new(ui::semibold(&name, 15.0)).truncate())
+                                    .on_hover_text(&name);
+                                let meta = if let Some(st) = &self.session.stage {
+                                    let n = crate::archive::count_archives(
+                                        &self.config.archive_root(),
+                                        &self.session.slug,
+                                    );
+                                    let mut m = format!(
+                                        "{} · {} files · {}",
+                                        st.stack().name(),
+                                        st.files,
+                                        util::human_size(st.size)
+                                    );
+                                    if n > 0 {
+                                        m.push_str(&format!(
+                                            " · {n} archived version{}",
+                                            if n == 1 { "" } else { "s" }
+                                        ));
+                                    }
+                                    m
+                                } else {
+                                    format!("{sub} · drop another zip here to replace it")
+                                };
+                                ui.add(egui::Label::new(ui::muted(meta).size(13.0)).truncate());
+                            });
+                        });
+                    });
+                } else {
+                    ui.vertical_centered(|ui| {
+                        let (r, _) =
+                            ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            r,
+                            egui::CornerRadius::same(14),
+                            ui::ACCENT_SOFT(),
+                        );
+                        ui.painter().text(
+                            r.center(),
+                            egui::Align2::CENTER_CENTER,
+                            ui::icon::UPLOAD,
+                            egui::FontId::proportional(26.0),
+                            ACCENT(),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(ui::semibold(
+                            if hovering {
                                 "Drop the zip to load it"
                             } else {
                                 "Choose a project .zip to get started"
-                            })
-                            .size(15.0),
-                        );
-                        ui.label(ui::muted("or drag it onto this window · Ctrl+O").size(12.0));
-                    }
-                    ui.add_space(4.0);
-                    if ui
-                        .add_enabled(
-                            self.busy.is_none(),
-                            egui::Button::new(
-                                RichText::new(if has_zip {
-                                    "Choose another .zip…"
-                                } else {
-                                    "Choose .zip…"
-                                })
-                                .strong(),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.pick_zip();
-                    }
-                    if let Some(st) = &self.session.stage {
-                        ui.horizontal_wrapped(|ui| {
-                            ui::badge(ui, st.stack().name(), ACCENT);
-                            ui.label(ui::muted(format!(
-                                "{} files · {}",
-                                st.files,
-                                util::human_size(st.size)
-                            )));
-                            let n = crate::archive::count_archives(
-                                &self.config.archive_root(),
-                                &self.session.slug,
-                            );
-                            if n > 0 {
-                                ui.label(ui::muted(format!(
-                                    "· {n} archived version{}",
-                                    if n == 1 { "" } else { "s" }
-                                )));
-                            }
-                        });
-                    }
-                });
+                            },
+                            17.0,
+                        ));
+                        ui.label(ui::muted("or drag it onto this window · Ctrl+O").size(13.0));
+                        ui.add_space(6.0);
+                        pick |= ui::primary(ui, "Choose a .zip…", self.busy.is_none()).clicked();
+                    });
+                }
             });
+        if pick {
+            self.pick_zip();
+        }
         if !has_zip {
             ui.add_space(8.0);
             ui.label(ui::muted("StowLock unpacks your zip into its own project folder, checks it, lets you try it, then pushes it to the right GitHub repo and files the zip away."));
@@ -1695,7 +2408,7 @@ impl App {
                         &tag,
                     )
                 {
-                    ui.add(egui::Label::new(RichText::new(format!("{tag} is already archived for this project. The new copy is kept alongside it (nothing is overwritten).")).color(WARNING).size(12.5)).wrap());
+                    ui.add(egui::Label::new(RichText::new(format!("{tag} is already archived for this project. The new copy is kept alongside it (nothing is overwritten).")).color(WARNING()).size(12.5)).wrap());
                 }
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
@@ -1728,13 +2441,13 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let m = self.session.effective_mode();
                     let col = match m {
-                        Mode::New => ACCENT,
-                        Mode::Update => SUCCESS,
-                        Mode::ArchiveOnly => MUTED,
+                        Mode::New => ACCENT(),
+                        Mode::Update => SUCCESS(),
+                        Mode::ArchiveOnly => MUTED(),
                     };
                     ui::badge(ui, m.badge(), col);
                     if self.session.channel == Channel::Beta && m != Mode::ArchiveOnly {
-                        ui::badge(ui, "BETA", WARNING);
+                        ui::badge(ui, "BETA", WARNING());
                     }
                 });
             });
@@ -1770,17 +2483,18 @@ impl App {
             // One line per hop so long names shorten with … instead of
             // breaking mid-word.
             let remote_color = if self.session.archive_only {
-                MUTED
+                MUTED()
             } else {
-                ACCENT
+                ACCENT()
             };
             egui::Grid::new("route_grid")
+                .max_col_width((ui.available_width() - 130.0).max(160.0))
                 .num_columns(2)
                 .spacing([10.0, 4.0])
                 .show(ui, |ui| {
                     for (label, text, color) in [
-                        ("Zip", &src, TEXT),
-                        ("Folder", &dest, TEXT),
+                        ("Zip", &src, TEXT()),
+                        ("Folder", &dest, TEXT()),
                         ("GitHub", &remote, remote_color),
                     ] {
                         ui.label(ui::muted(label));
@@ -1791,6 +2505,7 @@ impl App {
                 });
             ui.add_space(4.0);
             egui::Grid::new("routing")
+                .max_col_width((ui.available_width() - 130.0).max(160.0))
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
@@ -1875,7 +2590,7 @@ impl App {
                     }
                 });
             if let Some(problem) = detect::name_problem(&self.session.slug) {
-                ui.add(egui::Label::new(RichText::new(problem).color(ERROR).size(12.5)).wrap());
+                ui.add(egui::Label::new(RichText::new(problem).color(ERROR()).size(12.5)).wrap());
             }
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!staged, |ui| {
@@ -1912,7 +2627,7 @@ impl App {
                 && !staged
             {
                 ui.colored_label(
-                    WARNING,
+                    WARNING(),
                     "A folder with this name already exists in your workspace but isn't on GitHub.",
                 );
                 ui.checkbox(
@@ -1930,7 +2645,7 @@ impl App {
                 if let Some(l) = last {
                     txt.push_str(&format!(" Last pushed {} {}.", l.date(), l.time()));
                 }
-                ui.colored_label(SUCCESS, txt);
+                ui.colored_label(SUCCESS(), txt);
             }
         });
         if slug_changed || owner_changed {
@@ -1955,6 +2670,7 @@ impl App {
         ui::card(ui, |ui| {
             ui::section_title(ui, "DETAILS");
             egui::Grid::new("details")
+                .max_col_width((ui.available_width() - 130.0).max(160.0))
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
@@ -2056,20 +2772,31 @@ impl App {
                     });
                     ui.end_row();
                 });
-            if let Err(e) = version::validate(
+            if self.session.outcome.is_some() {
+                // Pushed: the tag exists because this push just made it.
+                let next = version::suggest(&tags, self.session.channel, &self.config.tag_prefix);
+                ui.label(
+                    RichText::new(format!(
+                        "Pushed as {}. The next update would be {next}.",
+                        self.session.tag
+                    ))
+                    .color(MUTED())
+                    .size(12.5),
+                );
+            } else if let Err(e) = version::validate(
                 &self.session.tag,
                 self.session.channel,
                 &self.config.tag_prefix,
                 &tags,
             ) {
-                ui.label(RichText::new(e).color(ERROR).size(12.5));
+                ui.label(RichText::new(e).color(ERROR()).size(12.5));
             }
             if mode == Mode::New && !self.session.private {
                 ui.label(
                     RichText::new(
                         "Public: anyone can see this repo. Secret-scan hits can't be overridden.",
                     )
-                    .color(WARNING)
+                    .color(WARNING())
                     .size(12.5),
                 );
             }
@@ -2081,7 +2808,7 @@ impl App {
         let Some(st) = self.session.stage.clone() else {
             ui::card(ui, |ui| {
                 ui::section_title(ui, "PIPELINE");
-                ui::stepper(ui, &STEPS, &steps);
+                ui::stepper(ui, &STEPS, &steps, &WAITING);
                 if self.busy.is_some() {
                     ui.horizontal_wrapped(|ui| {
                         ui.spinner();
@@ -2095,9 +2822,9 @@ impl App {
         };
         ui::card(ui, |ui| {
             ui::section_title(ui, "PIPELINE");
-            ui::stepper(ui, &STEPS, &steps);
+            ui::stepper(ui, &STEPS, &steps, &WAITING);
             for n in st.notes.iter().chain(st.cleanup.lines().iter()) {
-                ui.label(RichText::new(format!("✔ {n}")).color(SUCCESS).size(13.0));
+                ui.label(RichText::new(format!("✔ {n}")).color(SUCCESS()).size(13.0));
             }
             if let Some(ch) = &st.changes {
                 ui.horizontal_wrapped(|ui| {
@@ -2116,25 +2843,25 @@ impl App {
                 });
                 if self.session.show_changes {
                     for f in &ch.added {
-                        ui.label(ui::mono(format!("+ {f}")).color(SUCCESS));
+                        ui.label(ui::mono(format!("+ {f}")).color(SUCCESS()));
                     }
                     for f in &ch.changed {
-                        ui.label(ui::mono(format!("~ {f}")).color(WARNING));
+                        ui.label(ui::mono(format!("~ {f}")).color(WARNING()));
                     }
                     for f in &ch.removed {
-                        ui.label(ui::mono(format!("− {f}")).color(ERROR));
+                        ui.label(ui::mono(format!("− {f}")).color(ERROR()));
                     }
                 }
             }
             for (f, n) in &st.warn_files {
                 ui.colored_label(
-                    WARNING,
+                    WARNING(),
                     format!("Large file: {f} ({})", util::human_size(*n)),
                 );
             }
             for (f, n) in &st.block_files {
                 ui.colored_label(
-                    ERROR,
+                    ERROR(),
                     format!(
                         "Over GitHub's 100 MB limit: {f} ({}). Remove it or add it to .gitignore.",
                         util::human_size(*n)
@@ -2162,10 +2889,10 @@ impl App {
                 }
                 Some(c) => {
                     let (txt, col) = match c.tests.status {
-                        TestStatus::Passed => ("Tests passed", SUCCESS),
-                        TestStatus::Failed => ("Tests failed", ERROR),
-                        TestStatus::Skipped => ("Tests skipped", MUTED),
-                        TestStatus::Cancelled => ("Tests cancelled", WARNING),
+                        TestStatus::Passed => ("Tests passed", SUCCESS()),
+                        TestStatus::Failed => ("Tests failed", ERROR()),
+                        TestStatus::Skipped => ("Tests skipped", MUTED()),
+                        TestStatus::Cancelled => ("Tests cancelled", WARNING()),
                     };
                     ui.horizontal_wrapped(|ui| {
                         ui::badge(ui, txt, col);
@@ -2199,15 +2926,59 @@ impl App {
                     if c.tests.status == TestStatus::Failed
                         || c.tests.status == TestStatus::Cancelled
                     {
-                        ui.checkbox(
-                            &mut self.session.override_tests,
-                            "Push anyway (tests failed)",
-                        );
+                        // Safer choices first; pushing anyway comes last.
+                        let mut pick = false;
+                        let mut recheck = false;
+                        let mut report = false;
+                        let mut open = false;
+                        ui::banner(ui, WARNING(), |ui| {
+                            ui.label(ui::semibold("What to do next", 14.5));
+                            ui.add(egui::Label::new(
+                                "1. Get a fixed zip (for example, give the test output to your AI) and load it. The failed attempt is kept, never lost.",
+                            ).wrap());
+                            ui.add(
+                                egui::Label::new(
+                                    "2. Or fix it in the project folder yourself, then Re-check.",
+                                )
+                                .wrap(),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    "3. If it looks like StowLock's fault, send a bug report.",
+                                )
+                                .wrap(),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                pick |=
+                                    ui::button(ui, ui::icon::UPLOAD, "Load a fixed zip…").clicked();
+                                open |=
+                                    ui::button(ui, ui::icon::FOLDER_OPEN, "Open folder").clicked();
+                                recheck |= ui::button(ui, ui::icon::REFRESH, "Re-check").clicked();
+                                report |= ui::button(ui, ui::icon::BUG, "Bug report").clicked();
+                            });
+                            ui.add_space(2.0);
+                            ui.checkbox(
+                                &mut self.session.override_tests,
+                                "Push anyway: I know why the tests fail and it's safe",
+                            );
+                        });
+                        if pick {
+                            self.pick_zip();
+                        }
+                        if open {
+                            let _ = proc::xdg_open(&st.dir.display().to_string());
+                        }
+                        if recheck {
+                            self.recheck();
+                        }
+                        if report {
+                            self.open_bug_report();
+                        }
                     }
                     ui.add_space(4.0);
                     if c.secrets.is_empty() {
                         ui.horizontal_wrapped(|ui| {
-                            ui::badge(ui, "0 secrets found", SUCCESS);
+                            ui::badge(ui, "0 secrets found", SUCCESS());
                             if c.ignored_secrets > 0 {
                                 ui.label(ui::muted(format!(
                                     "({} marked not a secret)",
@@ -2223,7 +2994,7 @@ impl App {
                                 c.secrets.len(),
                                 if c.secrets.len() == 1 { "" } else { "s" }
                             ),
-                            ERROR,
+                            ERROR(),
                         );
                         let mut mark: Option<String> = None;
                         for h in &c.secrets {
@@ -2235,7 +3006,7 @@ impl App {
                                 }
                             });
                         }
-                        ui.label(RichText::new("If this key was ever pushed before, removing it isn't enough. Revoke it and make a new one.").color(WARNING).size(12.5));
+                        ui.label(RichText::new("If this key was ever pushed before, removing it isn't enough. Revoke it and make a new one.").color(WARNING()).size(12.5));
                         if let Some(id) = mark {
                             let slug = self.session.slug.clone();
                             let _ = ProjectsState::update(&self.paths, &slug, |p| {
@@ -2323,7 +3094,11 @@ impl App {
     }
 
     fn completion_card(&mut self, ui: &mut egui::Ui, out: &PushOutcome) {
-        let color = if out.nothing_to_push { MUTED } else { SUCCESS };
+        let color = if out.nothing_to_push {
+            MUTED()
+        } else {
+            SUCCESS()
+        };
         ui::banner(ui, color, |ui| {
             if out.nothing_to_push {
                 ui.label(
@@ -2340,7 +3115,7 @@ impl App {
                         "Pushed {}/{}{t}",
                         self.session.owner, self.session.slug
                     ))
-                    .color(SUCCESS)
+                    .color(SUCCESS())
                     .strong()
                     .size(15.0),
                 );
@@ -2349,7 +3124,7 @@ impl App {
                 ui.label(ui::muted(format!("Zip archived to {}", util::tilde(a))));
             }
             for w in &out.warnings {
-                ui.colored_label(WARNING, w);
+                ui.colored_label(WARNING(), w);
             }
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -2405,9 +3180,9 @@ impl App {
                             .rev()
                         {
                             let col = match e.level {
-                                Level::Info => MUTED,
-                                Level::Warn => WARNING,
-                                Level::Error => ERROR,
+                                Level::Info => MUTED(),
+                                Level::Warn => WARNING(),
+                                Level::Error => ERROR(),
                             };
                             ui.label(ui::mono(e.line()).size(11.5).color(col));
                         }
@@ -2433,9 +3208,9 @@ impl App {
         egui::TopBottomPanel::bottom("actions")
             .frame(
                 egui::Frame::new()
-                    .fill(ui::CARD)
+                    .fill(ui::CARD())
                     .inner_margin(egui::Margin::symmetric(16, 12))
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER)),
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER())),
             )
             .show(ctx, |ui| {
                 let s = self.session.clone();
@@ -2510,9 +3285,12 @@ impl App {
                 if !self.env.ready() {
                     blockers.push("Finish setup (sign in to GitHub)".into());
                 }
-                if let Err(e) = version::validate(&s.tag, s.channel, &self.config.tag_prefix, &tags)
-                {
-                    blockers.push(e);
+                if s.outcome.is_none() {
+                    if let Err(e) =
+                        version::validate(&s.tag, s.channel, &self.config.tag_prefix, &tags)
+                    {
+                        blockers.push(e);
+                    }
                 }
                 if s.outcome
                     .as_ref()
@@ -2593,7 +3371,7 @@ impl App {
                             for b in blockers.iter().take(3) {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(format!("• {b}")).color(WARNING).size(12.5),
+                                        RichText::new(format!("• {b}")).color(WARNING()).size(12.5),
                                     )
                                     .wrap(),
                                 );
@@ -2638,9 +3416,9 @@ impl App {
                         if ui
                             .button(RichText::new(r.chip()).monospace().color(
                                 if r.channel == "beta" {
-                                    WARNING
+                                    WARNING()
                                 } else {
-                                    SUCCESS
+                                    SUCCESS()
                                 },
                             ))
                             .clicked()
@@ -2665,19 +3443,19 @@ impl App {
             ui::card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.add(
-                        egui::Label::new(ui::mono(&p.slug).strong().size(15.0).color(TEXT))
+                        egui::Label::new(ui::mono(&p.slug).strong().size(15.0).color(TEXT()))
                             .truncate(),
                     )
                     .on_hover_text(&p.slug);
-                    ui::badge(ui, p.stack.name(), ACCENT);
+                    ui::badge(ui, p.stack.name(), ACCENT());
                     let col = if p.badge.starts_with("Beta") {
-                        WARNING
+                        WARNING()
                     } else if p.badge.starts_with("Pushed") || p.badge == "On GitHub" {
-                        SUCCESS
+                        SUCCESS()
                     } else if p.badge == "Local changes" {
-                        ERROR
+                        ERROR()
                     } else {
-                        MUTED
+                        MUTED()
                     };
                     ui::badge(ui, &p.badge, col);
                 });
@@ -2732,35 +3510,90 @@ impl App {
         if let Some(p) = load {
             self.load_project(&p);
         }
+        self.attempts_card(ui);
+    }
+
+    /// Projects > Saved earlier attempts: stagings that were never pushed,
+    /// with Restore and Delete (Delete asks first).
+    fn attempts_card(&mut self, ui: &mut egui::Ui) {
+        if self.attempts.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        let mut action: Option<(usize, bool)> = None;
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "Saved earlier attempts");
+            ui.label(
+                ui::muted("Stagings that never got pushed. Nothing is lost until you delete it.")
+                    .size(13.0),
+            );
+            ui.add_space(4.0);
+            for (i, a) in self.attempts.iter().enumerate() {
+                ui::inset(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_max_width((ui.available_width() - 260.0).max(200.0));
+                            ui.add(egui::Label::new(ui::semibold(&a.project, 14.0)).truncate());
+                            ui.label(
+                                ui::muted(format!("{} · {}", nice_stamp(&a.when), a.where_kept()))
+                                    .size(12.5),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let confirming = self.confirm_delete_attempt == Some(i);
+                            if confirming {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            ui::semibold("Delete it", 13.5).color(ui::CARD()),
+                                        )
+                                        .fill(ERROR()),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some((i, false));
+                                }
+                                if ui::button(ui, "", "Keep").clicked() {
+                                    self.confirm_delete_attempt = None;
+                                }
+                            } else {
+                                if ui::button(ui, ui::icon::TRASH, "Delete…").clicked() {
+                                    self.confirm_delete_attempt = Some(i);
+                                }
+                                if ui::button(ui, ui::icon::ROTATE_CCW, "Restore").clicked() {
+                                    action = Some((i, true));
+                                }
+                            }
+                        });
+                    });
+                });
+            }
+        });
+        if let Some((i, restore)) = action {
+            self.confirm_delete_attempt = None;
+            let a = self.attempts[i].clone();
+            let ws = self.config.workspace();
+            let r = if restore {
+                crate::attempts::restore(&a, &ws)
+            } else {
+                let ctx = self.pctx();
+                crate::attempts::delete(&a, |p| ctx.trash(p))
+            };
+            match r {
+                Ok(msg) => {
+                    self.log.info("attempts", &msg);
+                    self.toast(&msg);
+                }
+                Err(e) => self.fail(&e, "attempts"),
+            }
+            self.refresh_attempts();
+            self.refresh_projects();
+        }
     }
 
     // ------------------------------------------------------------ windows
 
     fn windows(&mut self, ctx: &egui::Context) {
-        if self.show_today {
-            let mut open = true;
-            let today = self.history.today();
-            ui_window(ctx, "Pushed today", 360.0)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    if today.is_empty() {
-                        ui.label(ui::muted("Nothing pushed yet today."));
-                    }
-                    for r in &today {
-                        self.today_row(ui, r);
-                    }
-                });
-            self.show_today = open;
-        }
-        if self.show_health {
-            self.health_window(ctx);
-        }
-        if self.show_settings {
-            self.settings_window(ctx);
-        }
-        if self.show_bug {
-            self.bug_window(ctx);
-        }
         if self.show_uninstall {
             self.uninstall_window(ctx);
         }
@@ -2768,7 +3601,7 @@ impl App {
 
     fn today_row(&self, ui: &mut egui::Ui, r: &PushRecord) {
         ui.horizontal_wrapped(|ui| {
-            ui.label(ui::mono(r.time()).color(MUTED));
+            ui.label(ui::mono(r.time()).color(MUTED()));
             if ui.link(RichText::new(&r.slug).monospace()).clicked() {
                 let _ = proc::xdg_open(&r.github_url);
             }
@@ -2777,9 +3610,9 @@ impl App {
                     ui,
                     t,
                     if r.channel == "beta" {
-                        WARNING
+                        WARNING()
                     } else {
-                        SUCCESS
+                        SUCCESS()
                     },
                 );
             }
@@ -2787,29 +3620,68 @@ impl App {
         });
     }
 
-    fn health_window(&mut self, ctx: &egui::Context) {
-        let mut open = true;
+    fn health_screen(&mut self, ui: &mut egui::Ui) {
         let mut run = false;
-        ui_window(ctx, "Health", 560.0).open(&mut open).show(ctx, |ui| {
-            ui.label(RichText::new(self.health.summary()).strong().size(16.0));
-            egui::Grid::new("health").num_columns(3).max_col_width(240.0).striped(true).spacing([14.0, 6.0]).show(ui, |ui| {
-                for a in health::AREAS {
-                    let s = self.health.get(a);
-                    let col = match s.status {
-                        Health::Working => SUCCESS,
-                        Health::NeedsAttention => WARNING,
-                        Health::Broken => ERROR,
-                        Health::NotUsed => MUTED,
-                    };
-                    ui.label(a);
-                    ui.label(RichText::new(format!("⏺ {}", s.status.label())).color(col));
-                    ui.label(ui::muted(if s.status == Health::NotUsed { String::new() } else { format!("{} · {}{}", s.source, s.checked_at, if s.hint.is_empty() { String::new() } else { format!(" · {}", s.hint) }) }).size(12.0));
-                    ui.end_row();
-                }
-            });
-            ui.separator();
+        {
+            ui::title(ui, "Health", &self.health.summary());
+            ui.add_space(8.0);
+            let cols = if ui.available_width() > 900.0 {
+                4
+            } else if ui.available_width() > 560.0 {
+                3
+            } else {
+                2
+            };
+            let cw = (ui.available_width() - 10.0 * (cols as f32 - 1.0)) / cols as f32;
+            egui::Grid::new("health")
+                .num_columns(cols)
+                .spacing([10.0, 10.0])
+                .min_col_width(cw)
+                .max_col_width(cw)
+                .show(ui, |ui| {
+                    for (i, a) in health::AREAS.iter().enumerate() {
+                        let s = self.health.get(a);
+                        let col = match s.status {
+                            Health::Working => SUCCESS(),
+                            Health::NeedsAttention => WARNING(),
+                            Health::Broken => ERROR(),
+                            Health::NotUsed => BORDER(),
+                        };
+                        ui::card(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(10.0, 10.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(r.center(), 4.0, col);
+                                    ui.add(egui::Label::new(ui::semibold(*a, 14.0)).truncate());
+                                });
+                                let note = if s.status == Health::NotUsed {
+                                    "Not used yet".to_string()
+                                } else if s.hint.is_empty() {
+                                    format!("{} · {}", s.status.label(), s.checked_at)
+                                } else {
+                                    format!("{} · {}", s.status.label(), s.hint)
+                                };
+                                ui.add(egui::Label::new(ui::muted(note).size(12.5)).truncate())
+                                    .on_hover_text(format!("{} · {}", s.source, s.checked_at));
+                            })
+                        });
+                        if (i + 1) % cols == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                if ui.add_enabled(self.busy.is_none(), egui::Button::new(RichText::new("Run self-test").strong())).clicked() {
+                if ui
+                    .add_enabled(
+                        self.busy.is_none(),
+                        egui::Button::new(RichText::new("Run self-test").strong()),
+                    )
+                    .clicked()
+                {
                     run = true;
                 }
                 ui.checkbox(&mut self.selftest_online, "Include read-only GitHub checks");
@@ -2820,9 +3692,21 @@ impl App {
             ui.label(ui::muted("The self-test runs in a sandbox. It never touches your projects and never writes to GitHub.").size(12.0));
             if let Some((r, path)) = &self.last_selftest {
                 ui.label(RichText::new(r.summary_line()).strong());
-                for c in r.checks.iter().filter(|c| c.outcome != selftest::Outcome::Pass) {
-                    let col = if c.outcome == selftest::Outcome::Fail { ERROR } else { MUTED };
-                    ui.label(RichText::new(format!("{} {} — {}", c.id, c.name, c.detail)).color(col).size(12.5));
+                for c in r
+                    .checks
+                    .iter()
+                    .filter(|c| c.outcome != selftest::Outcome::Pass)
+                {
+                    let col = if c.outcome == selftest::Outcome::Fail {
+                        ERROR()
+                    } else {
+                        MUTED()
+                    };
+                    ui.label(
+                        RichText::new(format!("{} {} — {}", c.id, c.name, c.detail))
+                            .color(col)
+                            .size(12.5),
+                    );
                 }
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy summary").clicked() {
@@ -2830,7 +3714,8 @@ impl App {
                         ui.ctx().copy_text(text);
                     }
                     if r.counts().1 > 0 && ui.button("Copy AI fix prompt").clicked() {
-                        ui.ctx().copy_text(report::redact(&r.ai_prompts(), &self.redact_ctx()));
+                        ui.ctx()
+                            .copy_text(report::redact(&r.ai_prompts(), &self.redact_ctx()));
                     }
                     if let Some(p) = path {
                         if ui.button("Open report").clicked() {
@@ -2839,107 +3724,176 @@ impl App {
                     }
                 });
             }
-        });
+        }
         if run {
             self.run_selftest();
         }
-        self.show_health = open;
     }
 
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        let mut open = true;
-        ui_window(ctx, "Settings", 560.0).open(&mut open).show(ctx, |ui| {
-            self.account_panel(ui);
-            ui.separator();
-            ui::section_title(ui, "GENERAL");
-            egui::Grid::new("general").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Workspace folder");
-                ui.add(egui::TextEdit::singleline(&mut self.config.workspace_dir).font(egui::TextStyle::Monospace).desired_width(300.0));
-                ui.end_row();
-                ui.label("New repos");
-                ui.checkbox(&mut self.config.default_private, "Private by default");
-                ui.end_row();
-                ui.label("Default license");
-                egui::ComboBox::from_id_salt("deflic").selected_text(self.config.default_license.clone()).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.config.default_license, "none".to_string(), "none");
-                    ui.selectable_value(&mut self.config.default_license, "MIT".to_string(), "MIT");
-                    ui.selectable_value(&mut self.config.default_license, "GPL-3.0".to_string(), "GPL-3.0");
-                });
-                ui.end_row();
-                ui.label("License holder");
-                ui.add(egui::TextEdit::singleline(&mut self.config.license_holder).hint_text("Your name").desired_width(300.0));
-                ui.end_row();
-                ui.label("After push");
+    fn settings_screen(&mut self, ui: &mut egui::Ui) {
+        {
+            ui::title(ui, "Settings", "");
+            ui.add_space(8.0);
+            self.appearance_and_updates(ui);
+            ui.add_space(8.0);
+            ui::card(ui, |ui| self.account_panel(ui));
+            ui.add_space(8.0);
+            ui::card(ui, |ui| {
+                ui::section_title(ui, "GENERAL");
+                egui::Grid::new("general")
+                    .max_col_width((ui.available_width() - 130.0).max(160.0))
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Workspace folder");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.workspace_dir)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(300.0),
+                        );
+                        ui.end_row();
+                        ui.label("New repos");
+                        ui.checkbox(&mut self.config.default_private, "Private by default");
+                        ui.end_row();
+                        ui.label("Default license");
+                        egui::ComboBox::from_id_salt("deflic")
+                            .selected_text(self.config.default_license.clone())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.config.default_license,
+                                    "none".to_string(),
+                                    "none",
+                                );
+                                ui.selectable_value(
+                                    &mut self.config.default_license,
+                                    "MIT".to_string(),
+                                    "MIT",
+                                );
+                                ui.selectable_value(
+                                    &mut self.config.default_license,
+                                    "GPL-3.0".to_string(),
+                                    "GPL-3.0",
+                                );
+                            });
+                        ui.end_row();
+                        ui.label("License holder");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.license_holder)
+                                .hint_text("Your name")
+                                .desired_width(300.0),
+                        );
+                        ui.end_row();
+                        ui.label("After push");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.config.archive_after_push, "Archive the zip");
+                            ui.radio_value(
+                                &mut self.config.archive_mode,
+                                "move".to_string(),
+                                "Move",
+                            );
+                            ui.radio_value(
+                                &mut self.config.archive_mode,
+                                "copy".to_string(),
+                                "Copy",
+                            );
+                        });
+                        ui.end_row();
+                        ui.label("Tag prefix");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.tag_prefix)
+                                .desired_width(60.0),
+                        );
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui::section_title(ui, "CHECKS");
+                ui.checkbox(
+                    &mut self.config.run_tests_before_push,
+                    "Run tests before pushing",
+                );
                 ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.config.archive_after_push, "Archive the zip");
-                    ui.radio_value(&mut self.config.archive_mode, "move".to_string(), "Move");
-                    ui.radio_value(&mut self.config.archive_mode, "copy".to_string(), "Copy");
+                    ui.label("Test time limit");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.test_timeout_secs)
+                            .range(30..=3600)
+                            .suffix(" s"),
+                    );
                 });
-                ui.end_row();
-                ui.label("Tag prefix");
-                ui.add(egui::TextEdit::singleline(&mut self.config.tag_prefix).desired_width(60.0));
-                ui.end_row();
-            });
-            ui.separator();
-            ui::section_title(ui, "CHECKS");
-            ui.checkbox(&mut self.config.run_tests_before_push, "Run tests before pushing");
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Test time limit");
-                ui.add(egui::DragValue::new(&mut self.config.test_timeout_secs).range(30..=3600).suffix(" s"));
-            });
-            ui.checkbox(&mut self.config.block_on_secrets, "Block pushes when possible secrets are found");
-            ui.separator();
-            ui::section_title(ui, "PRIVACY");
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Delete logs and reports after");
-                ui.add(egui::DragValue::new(&mut self.config.report_retention_days).range(1..=365).suffix(" days"));
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Clear logs and reports").clicked() {
-                    match report::clear_logs_and_reports(&self.paths, &self.log) {
-                        Ok(n) => self.toast(&format!("Removed {n} file(s).")),
-                        Err(e) => self.fail(&e, "privacy"),
+                ui.checkbox(
+                    &mut self.config.block_on_secrets,
+                    "Block pushes when possible secrets are found",
+                );
+                ui.separator();
+                ui::section_title(ui, "PRIVACY");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Delete logs and reports after");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.report_retention_days)
+                            .range(1..=365)
+                            .suffix(" days"),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Clear logs and reports").clicked() {
+                        match report::clear_logs_and_reports(&self.paths, &self.log) {
+                            Ok(n) => self.toast(&format!("Removed {n} file(s).")),
+                            Err(e) => self.fail(&e, "privacy"),
+                        }
                     }
-                }
-                if ui.button("Clear push history").clicked() {
-                    let _ = History::clear(&self.paths);
-                    self.history = History::default();
-                    self.toast("Push history cleared.");
-                }
-            });
-            egui::CollapsingHeader::new("What StowLock stores and sends").id_salt("privacy").show(ui, |ui| {
+                    if ui.button("Clear push history").clicked() {
+                        let _ = History::clear(&self.paths);
+                        self.history = History::default();
+                        self.toast("Push history cleared.");
+                    }
+                });
+                egui::CollapsingHeader::new("What StowLock stores and sends").id_salt("privacy").show(ui, |ui| {
                 ui.label("Sends to GitHub (through gh and git): the repos you choose to push, sign-in, your repo list.");
                 ui.label(format!("Checks {} for new versions at most every 6 hours (no personal data sent).", self.config.update_repo));
                 ui.label("Bug reports leave your computer only when you copy them or open an issue, after a preview.");
                 ui.label("No tracking, analytics or automatic crash uploads.");
                 ui.label(format!("Stores settings in {} and history, logs and reports in {} (only your account can read them).", util::tilde(&self.paths.config_dir), util::tilde(&self.paths.state_dir)));
             });
-            ui.separator();
-            ui::section_title(ui, "UPDATES");
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.config.check_for_updates, "Check for updates automatically");
-                if ui.button("Check now").clicked() {
-                    self.check_updates(true);
+                ui.separator();
+                ui::section_title(ui, "UPDATES");
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(
+                        &mut self.config.check_for_updates,
+                        "Check for updates automatically",
+                    );
+                    if ui.button("Check now").clicked() {
+                        self.check_updates(true);
+                    }
+                });
+                egui::CollapsingHeader::new(ui::muted("Advanced"))
+                    .id_salt("adv")
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Update source");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.update_repo)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(240.0),
+                            );
+                        });
+                    });
+                ui.separator();
+                ui::section_title(ui, "ABOUT");
+                ui.label(format!(
+                    "StowLock {APP_VERSION} · Free software under the GNU GPL v3 · github.com/{}",
+                    crate::config::UPDATE_REPO
+                ));
+                ui.add_space(8.0);
+                if ui
+                    .button(RichText::new("Uninstall StowLock…").color(ERROR()))
+                    .clicked()
+                {
+                    self.show_uninstall = true;
+                    self.uninstall.result = None;
+                    self.uninstall.plan = None;
+                    self.uninstall.typed.clear();
                 }
             });
-            egui::CollapsingHeader::new(ui::muted("Advanced")).id_salt("adv").show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Update source");
-                    ui.add(egui::TextEdit::singleline(&mut self.config.update_repo).font(egui::TextStyle::Monospace).desired_width(240.0));
-                });
-            });
-            ui.separator();
-            ui::section_title(ui, "ABOUT");
-            ui.label(format!("StowLock {APP_VERSION} · Free software under the GNU GPL v3 · github.com/{}", crate::config::UPDATE_REPO));
-            ui.add_space(8.0);
-            if ui.button(RichText::new("Uninstall StowLock…").color(ERROR)).clicked() {
-                self.show_uninstall = true;
-                self.uninstall.result = None;
-                self.uninstall.plan = None;
-                self.uninstall.typed.clear();
-            }
-        });
-        self.show_settings = open;
+        }
     }
 
     fn account_panel(&mut self, ui: &mut egui::Ui) {
@@ -2953,7 +3907,7 @@ impl App {
         }
         // 1. tools
         if !self.env.git || !self.env.gh {
-            ui::banner(ui, WARNING, |ui| {
+            ui::banner(ui, WARNING(), |ui| {
                 ui.label(format!(
                     "Missing: {}",
                     [
@@ -2990,7 +3944,7 @@ impl App {
         }
         // 2. sign in
         if self.signin.active || self.signin.code.is_some() && self.env.login.is_none() {
-            ui::banner(ui, ACCENT, |ui| {
+            ui::banner(ui, ACCENT(), |ui| {
                 if let Some(code) = &self.signin.code {
                     ui.label("Your one-time code (already copied):");
                     ui.label(
@@ -2998,7 +3952,7 @@ impl App {
                             .monospace()
                             .size(28.0)
                             .strong()
-                            .color(ACCENT),
+                            .color(ACCENT()),
                     );
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Copy").clicked() {
@@ -3036,7 +3990,7 @@ impl App {
             });
         }
         if let Some(Err(e)) = &self.signin.result {
-            ui.colored_label(WARNING, e);
+            ui.colored_label(WARNING(), e);
         }
         if self.env.accounts.is_empty() && self.env.login.is_none() {
             if !self.signin.active
@@ -3053,9 +4007,9 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(if a.active { "⏺" } else { "○" }).color(if a.active {
-                            SUCCESS
+                            SUCCESS()
                         } else {
-                            MUTED
+                            MUTED()
                         }),
                     );
                     ui.label(ui::mono(&a.login).strong());
@@ -3065,7 +4019,7 @@ impl App {
                         switch = Some(a.login.clone());
                     }
                     if !a.secure {
-                        ui::badge(ui, "plain-file token", WARNING);
+                        ui::badge(ui, "plain-file token", WARNING());
                         if ui.small_button("Move to secure storage").clicked() {
                             self.start_sign_in();
                         }
@@ -3104,6 +4058,7 @@ impl App {
         ui.add_space(8.0);
         ui.label(RichText::new("Name and email for commits").strong());
         egui::Grid::new("ident")
+            .max_col_width((ui.available_width() - 130.0).max(160.0))
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
@@ -3147,98 +4102,56 @@ impl App {
         });
     }
 
-    fn bug_window(&mut self, ctx: &egui::Context) {
-        let mut open = true;
-        let mut rebuild = false;
-        let mut download = false;
-        ui_window(ctx, "Bug report", 620.0).open(&mut open).show(ctx, |ui| {
-            ui.add(egui::Label::new(ui::muted("Nothing is sent anywhere unless you copy, download or share this. Personal details are removed below.")).wrap());
-            ui.add_space(4.0);
-            ui.label("What were you doing? (optional)");
-            rebuild |= ui.add(egui::TextEdit::multiline(&mut self.bug.what).desired_rows(2).desired_width(f32::INFINITY)).changed();
-            ui.label("What did you expect? (optional)");
-            rebuild |= ui.add(egui::TextEdit::multiline(&mut self.bug.expected).desired_rows(2).desired_width(f32::INFINITY)).changed();
+    fn confirm_issue_banner(&mut self, ui: &mut egui::Ui) {
+        let who = self
+            .env
+            .login
+            .clone()
+            .unwrap_or_else(|| "your account".into());
+        ui::banner(ui, WARNING(), |ui| {
+            ui.add(
+                egui::Label::new(format!(
+                    "This will be public on GitHub under the account {who}, on {}.",
+                    self.config.update_repo
+                ))
+                .wrap(),
+            );
             ui.horizontal_wrapped(|ui| {
-                rebuild |= ui.checkbox(&mut self.bug.include_public, "Include public repo names").changed();
-                rebuild |= ui.checkbox(&mut self.bug.include_username, "Include my GitHub username").changed();
-            });
-            ui.add_space(4.0);
-            ui.label(RichText::new("Preview (exactly what will be shared)").strong());
-            egui::ScrollArea::vertical().max_height(260.0).id_salt("bugprev").show(ui, |ui| {
-                let mut p = self.bug.preview.clone();
-                ui.add(egui::TextEdit::multiline(&mut p).code_editor().desired_width(f32::INFINITY).interactive(true));
-            });
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button(RichText::new("Copy to clipboard").strong()).clicked() {
-                    ui.ctx().copy_text(self.bug.preview.clone());
-                    self.toast("Bug report copied.");
-                }
-                if ui.add_enabled(!self.bug.saving, egui::Button::new("Download as .txt…")).on_hover_text(report::bug_report_file_name(&self.bug.created)).clicked() {
-                    download = true;
-                }
-                if ui.button("Save").on_hover_text("Keep a copy in StowLock's reports folder").clicked() {
+                if ui.button("Open issue").clicked() {
                     match report::save_report(&self.paths, "bugreport", &self.bug.preview) {
-                        Ok(p) => self.toast(&format!("Saved {}", util::tilde(&p))),
+                        Ok(p) => {
+                            let o = proc::run(
+                                "gh",
+                                &[
+                                    "issue",
+                                    "create",
+                                    "--repo",
+                                    &self.config.update_repo,
+                                    "--title",
+                                    "Bug report",
+                                    "--body-file",
+                                    &p.display().to_string(),
+                                ],
+                                &proc::Opts::default_timeout(),
+                            );
+                            self.log.command("report", &o);
+                            if o.ok() {
+                                let url = o.stdout_trim();
+                                self.toast("Issue opened.");
+                                let _ = proc::xdg_open(&url);
+                            } else {
+                                self.fail(&o.combined(), "report");
+                            }
+                        }
                         Err(e) => self.fail(&e, "report"),
                     }
+                    self.bug.confirm_issue = false;
                 }
-                if ui.button("Open GitHub issue…").clicked() {
-                    self.bug.confirm_issue = true;
-                }
-                if self.bug.saving {
-                    ui.spinner();
+                if ui.button("Cancel").clicked() {
+                    self.bug.confirm_issue = false;
                 }
             });
-            if let Some(p) = self.bug.saved_to.clone() {
-                ui::banner(ui, SUCCESS, |ui| {
-                    ui.add(egui::Label::new(format!("Downloaded to {}", util::tilde(&p))).wrap());
-                    if ui.button("Open folder").clicked() {
-                        let folder = p.parent().map(|f| f.display().to_string()).unwrap_or_default();
-                        let _ = proc::xdg_open(&folder);
-                    }
-                });
-            }
-            if self.bug.confirm_issue {
-                let who = self.env.login.clone().unwrap_or_else(|| "your account".into());
-                ui::banner(ui, WARNING, |ui| {
-                    ui.add(egui::Label::new(format!("This will be public on GitHub under the account {who}, on {}.", self.config.update_repo)).wrap());
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Open issue").clicked() {
-                            match report::save_report(&self.paths, "bugreport", &self.bug.preview) {
-                                Ok(p) => {
-                                    let o = proc::run(
-                                        "gh",
-                                        &["issue", "create", "--repo", &self.config.update_repo, "--title", "Bug report", "--body-file", &p.display().to_string()],
-                                        &proc::Opts::default_timeout(),
-                                    );
-                                    self.log.command("report", &o);
-                                    if o.ok() {
-                                        let url = o.stdout_trim();
-                                        self.toast("Issue opened.");
-                                        let _ = proc::xdg_open(&url);
-                                    } else {
-                                        self.fail(&o.combined(), "report");
-                                    }
-                                }
-                                Err(e) => self.fail(&e, "report"),
-                            }
-                            self.bug.confirm_issue = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.bug.confirm_issue = false;
-                        }
-                    });
-                });
-            }
         });
-        if rebuild {
-            self.bug.preview = self.build_bug_report();
-        }
-        if download {
-            self.download_bug_report();
-        }
-        self.show_bug = open;
     }
 
     fn uninstall_window(&mut self, ctx: &egui::Context) {
@@ -3254,7 +4167,7 @@ impl App {
                             ui.label(
                                 RichText::new("StowLock was uninstalled.")
                                     .strong()
-                                    .color(SUCCESS),
+                                    .color(SUCCESS()),
                             );
                             for r in &out.removed {
                                 ui.label(ui::mono(format!("removed {r}")).size(12.0));
@@ -3263,7 +4176,7 @@ impl App {
                                 ui.label(ui::mono(format!("moved to Trash: {t}")).size(12.0));
                             }
                             for p in &out.problems {
-                                ui.colored_label(WARNING, p);
+                                ui.colored_label(WARNING(), p);
                             }
                             if !out.trashed.is_empty() {
                                 ui.horizontal_wrapped(|ui| {
@@ -3278,7 +4191,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            ui.colored_label(ERROR, e);
+                            ui.colored_label(ERROR(), e);
                         }
                     }
                     return;
@@ -3298,7 +4211,7 @@ impl App {
                     &mut self.uninstall.level,
                     UninstallLevel::Everything,
                     RichText::new("Everything: also your projects folder and archived zips")
-                        .color(ERROR),
+                        .color(ERROR()),
                 );
                 if before != self.uninstall.level || self.uninstall.plan.is_none() {
                     self.uninstall.plan = Some(uninstall::plan(
@@ -3325,7 +4238,7 @@ impl App {
                         if !plan.unpushed.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.colored_label(
-                                    WARNING,
+                                    WARNING(),
                                     "Some projects have work that isn't on GitHub.",
                                 );
                                 if ui.button("Open Folder").clicked() {
@@ -3354,7 +4267,7 @@ impl App {
                             allowed,
                             egui::Button::new(
                                 RichText::new(format!("Uninstall ({})", plan.level.label()))
-                                    .color(ERROR)
+                                    .color(ERROR())
                                     .strong(),
                             ),
                         )

@@ -135,6 +135,41 @@ impl HealthState {
     }
 }
 
+/// Does a failed step mean StowLock itself is broken? A project's failing
+/// tests, a safety refusal ("unsaved changes", "tag already exists") or a
+/// possible secret is StowLock doing its job, so the area stays Working.
+pub fn counts_against_stowlock(step: &str, detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    const REFUSALS: &[&str] = &[
+        "unsaved changes",
+        "already exists",
+        "pick a new version",
+        "pick another name",
+        "isn't on github",
+        "not a fast-forward",
+        "diverged",
+        "aren't on github",
+        "too large",
+        "too many files",
+        "isn't a zip",
+        "not a valid zip",
+        "possible secret",
+        "replace the existing folder",
+        "not signed in",
+        "sign in",
+        "could not resolve host",
+        "network",
+    ];
+    if REFUSALS.iter().any(|r| d.contains(r)) {
+        return false;
+    }
+    if step == "Pre-flight tests" {
+        // Only a test tool that couldn't start at all is StowLock's problem.
+        return d.contains("command not found") || d.contains("couldn't start");
+    }
+    true
+}
+
 /// Every health area a pipeline step covers.
 pub fn areas_for_step(step: &str, update_mode: bool) -> Vec<&'static str> {
     match step {
@@ -163,6 +198,30 @@ pub fn areas_for_step(step: &str, update_mode: bool) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_problems_dont_break_stowlock() {
+        assert!(!counts_against_stowlock(
+            "Pre-flight tests",
+            "cargo test --no-fail-fast failed · 65 passed, 2 failed"
+        ));
+        assert!(counts_against_stowlock(
+            "Pre-flight tests",
+            "cargo: command not found"
+        ));
+        assert!(!counts_against_stowlock(
+            "Extract & clean",
+            "This project has unsaved changes that aren't on GitHub."
+        ));
+        assert!(!counts_against_stowlock(
+            "Commit & push",
+            "The tag v1.0.0 already exists on GitHub."
+        ));
+        assert!(counts_against_stowlock(
+            "Extract & clean",
+            "Couldn't write the folder: permission denied"
+        ));
+    }
 
     #[test]
     fn records_and_summarises() {

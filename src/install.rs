@@ -56,6 +56,65 @@ pub fn bin_dir_on_path(inst: &InstallPaths) -> bool {
         .unwrap_or(false)
 }
 
+/// Ask a StowLock program file for its version (`--version`). Only ever run
+/// on StowLock's own installed or running program.
+pub fn program_version(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let o = proc::run(
+        &path.display().to_string(),
+        &["--version"],
+        &Opts::default_timeout().with_timeout(5),
+    );
+    o.stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("StowLock "))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Other StowLock downloads in the same folder as `exe`, e.g.
+/// `stowlock-linux-x86_64(1)`, so the user knows which one they're installing.
+pub fn other_downloads(exe: &Path) -> Vec<(String, String)> {
+    let (Some(dir), Some(me)) = (exe.parent(), exe.file_name()) else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = rd
+        .flatten()
+        .filter(|e| e.file_name() != me)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("stowlock-linux-x86_64") || name.ends_with(".sha256") {
+                return None;
+            }
+            let when = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    chrono::DateTime::<chrono::Local>::from(t)
+                        .format("%b %-d, %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            Some((name, when))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A downloaded copy whose name shows the browser renamed it, e.g. "(1)".
+pub fn looks_like_duplicate(name: &str) -> bool {
+    let n = name.trim_end_matches(".AppImage");
+    n.ends_with(')') && n.contains('(')
+        || n.rsplit_once('.')
+            .is_some_and(|(_, tail)| tail.chars().all(|c| c.is_ascii_digit()))
+}
+
 #[derive(Debug, Default)]
 pub struct InstallReport {
     pub lines: Vec<String>,
@@ -86,20 +145,41 @@ pub fn write_desktop_files(inst: &InstallPaths) -> Res<()> {
 pub fn install(inst: &InstallPaths) -> Res<InstallReport> {
     let mut r = InstallReport::default();
     let exe = std::env::current_exe().ctx("finding the running program")?;
+    let here = crate::config::APP_VERSION;
+    let name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if looks_like_duplicate(&name) {
+        r.warnings.push(format!(
+            "You're installing from \"{name}\". Your browser renamed it because another download had the same name. This file is StowLock {here}."
+        ));
+    }
+    for (other, when) in other_downloads(&exe) {
+        r.warnings.push(format!(
+            "There's another StowLock download next to it: \"{other}\" ({when}). Delete the one you don't need so the wrong one isn't installed later."
+        ));
+    }
     let bin_dir = inst.bin.parent().unwrap();
     std::fs::create_dir_all(bin_dir).ctx("creating ~/.local/bin")?;
     if !is_installed(inst) {
+        let replaced = program_version(&inst.bin);
         let tmp = bin_dir.join(format!(".stowlock.new-{}", std::process::id()));
         std::fs::copy(&exe, &tmp).ctx("copying StowLock")?;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
             .ctx("making it executable")?;
         std::fs::rename(&tmp, &inst.bin).ctx("installing StowLock")?;
-        r.lines.push(format!(
-            "Installed the program to {}",
-            util::tilde(&inst.bin)
-        ));
+        r.lines.push(match replaced {
+            Some(old) if old != here => format!(
+                "Installed StowLock {here} to {} (replaced {old})",
+                util::tilde(&inst.bin)
+            ),
+            Some(_) => format!("Reinstalled StowLock {here} to {}", util::tilde(&inst.bin)),
+            None => format!("Installed StowLock {here} to {}", util::tilde(&inst.bin)),
+        });
     } else {
-        r.lines.push("Program already installed".into());
+        r.lines
+            .push(format!("StowLock {here} is already installed"));
     }
     write_desktop_files(inst)?;
     r.lines.push(format!(
@@ -120,6 +200,41 @@ pub fn install(inst: &InstallPaths) -> Res<InstallReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_renamed_downloads() {
+        assert!(looks_like_duplicate("stowlock-linux-x86_64(1)"));
+        assert!(looks_like_duplicate("stowlock-linux-x86_64 (2)"));
+        assert!(looks_like_duplicate("stowlock-linux-x86_64.1"));
+        assert!(!looks_like_duplicate("stowlock-linux-x86_64"));
+        assert!(!looks_like_duplicate("stowlock"));
+    }
+
+    #[test]
+    fn lists_other_downloads_but_not_checksums() {
+        let d = tempfile::tempdir().unwrap();
+        for n in [
+            "stowlock-linux-x86_64",
+            "stowlock-linux-x86_64(1)",
+            "stowlock-linux-x86_64.sha256",
+            "notes.txt",
+        ] {
+            std::fs::write(d.path().join(n), b"x").unwrap();
+        }
+        let others = other_downloads(&d.path().join("stowlock-linux-x86_64(1)"));
+        let names: Vec<_> = others.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["stowlock-linux-x86_64"]);
+    }
+
+    #[test]
+    fn reads_a_programs_version() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("fake-stowlock");
+        std::fs::write(&f, "#!/bin/sh\necho 'StowLock 9.8.7-beta.1'\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(program_version(&f).as_deref(), Some("9.8.7-beta.1"));
+        assert_eq!(program_version(&d.path().join("missing")), None);
+    }
 
     #[test]
     fn desktop_files_written() {

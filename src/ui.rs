@@ -1,75 +1,342 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Look and feel: the dark slate theme, cards, badges, pills and the
-//! pipeline stepper.
+//! Look and feel: light and dark palettes (emerald accent), the Inter font,
+//! Lucide icons, cards, badges, buttons, segmented switches, the step
+//! tracker and toasts.
+#![allow(non_snake_case)]
 
 use crate::logbook::{Step, StepStatus};
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Ui, Vec2};
+use eframe::egui::{
+    self, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Stroke, Ui, Vec2,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const BG: Color32 = Color32::from_rgb(0x11, 0x13, 0x18);
-pub const CARD: Color32 = Color32::from_rgb(0x18, 0x1C, 0x24);
-pub const CONTROL: Color32 = Color32::from_rgb(0x1F, 0x25, 0x30);
-pub const BORDER: Color32 = Color32::from_rgb(0x2B, 0x32, 0x40);
-pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xED, 0xF3);
-pub const MUTED: Color32 = Color32::from_rgb(0x8B, 0x94, 0x9E);
-pub const ACCENT: Color32 = Color32::from_rgb(0x38, 0xBD, 0xF8);
-pub const SUCCESS: Color32 = Color32::from_rgb(0x34, 0xD3, 0x99);
-pub const WARNING: Color32 = Color32::from_rgb(0xFB, 0xBF, 0x24);
-pub const ERROR: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71);
+// ------------------------------------------------------------------ palette
 
-pub fn apply_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = BG;
-    v.window_fill = CARD;
-    v.window_stroke = Stroke::new(1.0_f32, BORDER);
-    v.extreme_bg_color = Color32::from_rgb(0x0C, 0x0E, 0x12);
-    v.faint_bg_color = CONTROL;
-    v.override_text_color = Some(TEXT);
-    v.hyperlink_color = ACCENT;
-    v.selection.bg_fill = ACCENT.linear_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
-    v.window_corner_radius = CornerRadius::same(12);
+struct Pal {
+    bg: Color32,
+    side: Color32,
+    card: Color32,
+    control: Color32,
+    hover: Color32,
+    border: Color32,
+    text: Color32,
+    muted: Color32,
+    accent: Color32,
+    accent_btn: Color32,
+    on_accent: Color32,
+    accent_soft: Color32,
+    success: Color32,
+    warning: Color32,
+    error: Color32,
+}
+
+const fn rgb(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+const DARK: Pal = Pal {
+    bg: rgb(0x0E1311),
+    side: rgb(0x0A0E0C),
+    card: rgb(0x151C19),
+    control: rgb(0x1B2420),
+    hover: rgb(0x212C27),
+    border: rgb(0x25302B),
+    text: rgb(0xE8EDEA),
+    muted: rgb(0x93A29B),
+    accent: rgb(0x5EE0AE),
+    accent_btn: rgb(0x10B981),
+    on_accent: rgb(0x04251A),
+    accent_soft: rgb(0x11372A),
+    success: rgb(0x34D399),
+    warning: rgb(0xFBBF24),
+    error: rgb(0xF87171),
+};
+
+const LIGHT: Pal = Pal {
+    bg: rgb(0xF4F7F5),
+    side: rgb(0xEDF2EF),
+    card: rgb(0xFFFFFF),
+    control: rgb(0xF0F4F2),
+    hover: rgb(0xE3EAE6),
+    border: rgb(0xDCE4DF),
+    text: rgb(0x0F1714),
+    muted: rgb(0x56665E),
+    accent: rgb(0x046C4E),
+    accent_btn: rgb(0x047857),
+    on_accent: rgb(0xFFFFFF),
+    accent_soft: rgb(0xD9F3E7),
+    success: rgb(0x047857),
+    warning: rgb(0xA16207),
+    error: rgb(0xB91C1C),
+};
+
+static IS_LIGHT: AtomicBool = AtomicBool::new(false);
+
+fn pal() -> &'static Pal {
+    if IS_LIGHT.load(Ordering::Relaxed) {
+        &LIGHT
+    } else {
+        &DARK
+    }
+}
+
+pub fn is_light() -> bool {
+    IS_LIGHT.load(Ordering::Relaxed)
+}
+
+pub fn BG() -> Color32 {
+    pal().bg
+}
+pub fn SIDE() -> Color32 {
+    pal().side
+}
+pub fn CARD() -> Color32 {
+    pal().card
+}
+pub fn CONTROL() -> Color32 {
+    pal().control
+}
+pub fn BORDER() -> Color32 {
+    pal().border
+}
+pub fn TEXT() -> Color32 {
+    pal().text
+}
+pub fn MUTED() -> Color32 {
+    pal().muted
+}
+pub fn ACCENT() -> Color32 {
+    pal().accent
+}
+pub fn ACCENT_BTN() -> Color32 {
+    pal().accent_btn
+}
+pub fn ON_ACCENT() -> Color32 {
+    pal().on_accent
+}
+pub fn ACCENT_SOFT() -> Color32 {
+    pal().accent_soft
+}
+pub fn SUCCESS() -> Color32 {
+    pal().success
+}
+pub fn WARNING() -> Color32 {
+    pal().warning
+}
+pub fn ERROR() -> Color32 {
+    pal().error
+}
+
+// ------------------------------------------------------------------ icons
+
+/// Lucide icon glyphs (from the bundled, trimmed icon font). Not every
+/// glyph in the font is used on screen yet.
+#[allow(dead_code)]
+pub mod icon {
+    pub const UPLOAD: &str = "\u{e19e}";
+    pub const LAYERS: &str = "\u{e529}";
+    pub const HISTORY: &str = "\u{e1f5}";
+    pub const ACTIVITY: &str = "\u{e038}";
+    pub const BUG: &str = "\u{e20c}";
+    pub const SLIDERS: &str = "\u{e29a}";
+    pub const CHECK: &str = "\u{e06c}";
+    pub const PACKAGE: &str = "\u{e129}";
+    pub const FOLDER: &str = "\u{e0d7}";
+    pub const X: &str = "\u{e1b2}";
+    pub const CIRCLE_CHECK: &str = "\u{e226}";
+    pub const CIRCLE_ALERT: &str = "\u{e077}";
+    pub const TRIANGLE_ALERT: &str = "\u{e193}";
+    pub const REFRESH: &str = "\u{e145}";
+    pub const EXTERNAL: &str = "\u{e0b9}";
+    pub const COPY: &str = "\u{e09e}";
+    pub const DOWNLOAD: &str = "\u{e0b2}";
+    pub const SAVE: &str = "\u{e14d}";
+    pub const TRASH: &str = "\u{e18e}";
+    pub const ROTATE_CCW: &str = "\u{e148}";
+    pub const FOLDER_OPEN: &str = "\u{e247}";
+    pub const PLAY: &str = "\u{e13c}";
+    pub const TERMINAL: &str = "\u{e181}";
+    pub const INFO: &str = "\u{e0f9}";
+    pub const ARROW_UP: &str = "\u{e07b}";
+    pub const SHIELD: &str = "\u{e1ff}";
+    pub const TAG: &str = "\u{e17f}";
+    pub const BRANCH: &str = "\u{e0e2}";
+    pub const ARCHIVE: &str = "\u{e041}";
+    pub const USER: &str = "\u{e19f}";
+    pub const CHEVRON: &str = "\u{e06f}";
+    pub const PLUS: &str = "\u{e13d}";
+    pub const UNDO: &str = "\u{e2a1}";
+    pub const SUN: &str = "\u{e178}";
+    pub const MOON: &str = "\u{e11e}";
+    pub const MONITOR: &str = "\u{e11d}";
+    pub const FILE_TEXT: &str = "\u{e0cc}";
+    pub const CIRCLE: &str = "\u{e076}";
+    pub const CIRCLE_X: &str = "\u{e084}";
+    pub const PEN: &str = "\u{e172}";
+    pub const EYE_OFF: &str = "\u{e0bb}";
+    pub const LOG_OUT: &str = "\u{e10e}";
+}
+
+// ------------------------------------------------------------------ fonts
+
+/// Inter for text (with egui's own fonts as fallback) and the Lucide icon
+/// font as a fallback in every family, so an icon can sit inside any text.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut f = egui::FontDefinitions::default();
+    f.font_data.insert(
+        "inter".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Inter-Regular.ttf"
+        ))),
+    );
+    f.font_data.insert(
+        "inter-semibold".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Inter-SemiBold.ttf"
+        ))),
+    );
+    f.font_data.insert(
+        "lucide".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/lucide.ttf"
+        ))),
+    );
+    let prop = f.families.entry(FontFamily::Proportional).or_default();
+    prop.insert(0, "inter".into());
+    prop.push("lucide".into());
+    f.families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("lucide".into());
+    let mut semi = vec!["inter-semibold".to_string()];
+    semi.extend(
+        f.families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n != "inter"),
+    );
+    f.families.insert(FontFamily::Name("semibold".into()), semi);
+    ctx.set_fonts(f);
+}
+
+/// Text in Inter SemiBold.
+pub fn semibold(text: impl Into<String>, size: f32) -> RichText {
+    RichText::new(text.into())
+        .family(FontFamily::Name("semibold".into()))
+        .size(size)
+}
+
+/// A screen's title.
+pub fn title(ui: &mut Ui, text: &str, subtitle: &str) {
+    ui.label(semibold(text, 24.0).color(TEXT()));
+    if !subtitle.is_empty() {
+        ui.add_space(-4.0);
+        ui.label(RichText::new(subtitle).size(14.0).color(MUTED()));
+    }
+}
+
+// ------------------------------------------------------------------ theme
+
+/// Apply the light or dark palette. Cheap; call when the theme changes.
+pub fn apply_theme(ctx: &egui::Context, light: bool) {
+    IS_LIGHT.store(light, Ordering::Relaxed);
+    let p = pal();
+    let mut v = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    v.panel_fill = p.bg;
+    v.window_fill = p.card;
+    v.window_stroke = Stroke::new(1.0_f32, p.border);
+    v.window_shadow = egui::epaint::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(if light { 30 } else { 90 }),
+    };
+    v.extreme_bg_color = p.control;
+    v.faint_bg_color = p.control;
+    v.code_bg_color = p.control;
+    v.override_text_color = Some(p.text);
+    v.hyperlink_color = p.accent;
+    v.selection.bg_fill = p.accent_btn.linear_multiply(0.35);
+    v.selection.stroke = Stroke::new(1.0_f32, p.accent);
+    v.window_corner_radius = CornerRadius::same(14);
+    v.menu_corner_radius = CornerRadius::same(10);
     for w in [
+        &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
         &mut v.widgets.hovered,
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(8);
+        w.corner_radius = CornerRadius::same(10);
     }
-    v.widgets.noninteractive.bg_fill = CARD;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    v.widgets.inactive.bg_fill = CONTROL;
-    v.widgets.inactive.weak_bg_fill = CONTROL;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(0x27, 0x2F, 0x3D);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x27, 0x2F, 0x3D);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT.linear_multiply(0.6));
-    v.widgets.active.bg_fill = Color32::from_rgb(0x2D, 0x37, 0x48);
-    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    v.widgets.noninteractive.bg_fill = p.card;
+    v.widgets.noninteractive.weak_bg_fill = p.card;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
+    v.widgets.inactive.bg_fill = p.control;
+    v.widgets.inactive.weak_bg_fill = p.control;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
+    v.widgets.hovered.bg_fill = p.hover;
+    v.widgets.hovered.weak_bg_fill = p.hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.muted);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, p.text);
+    v.widgets.active.bg_fill = p.hover;
+    v.widgets.active.weak_bg_fill = p.hover;
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, p.accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, p.text);
+    v.widgets.open.bg_fill = p.hover;
+    v.widgets.open.weak_bg_fill = p.hover;
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
         s.spacing.item_spacing = Vec2::new(8.0, 8.0);
-        s.spacing.button_padding = Vec2::new(12.0, 6.0);
-        s.spacing.interact_size.y = 30.0;
+        s.spacing.button_padding = Vec2::new(14.0, 7.0);
+        s.spacing.interact_size.y = 34.0;
+        s.spacing.window_margin = Margin::same(20);
+        s.text_styles.insert(
+            egui::TextStyle::Heading,
+            FontId::new(20.0, FontFamily::Name("semibold".into())),
+        );
         s.text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
+            .insert(egui::TextStyle::Body, FontId::proportional(14.5));
         s.text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(14.5));
+            .insert(egui::TextStyle::Button, FontId::proportional(14.5));
         s.text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.5));
+            .insert(egui::TextStyle::Small, FontId::proportional(12.5));
         s.text_styles
-            .insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
+            .insert(egui::TextStyle::Monospace, FontId::monospace(13.0));
     });
 }
+
+// ------------------------------------------------------------------ pieces
 
 /// A rounded card with generous padding.
 pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(CARD())
+        .stroke(Stroke::new(1.0_f32, BORDER()))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::same(20))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
+/// A quieter inset panel inside a card.
+pub fn inset<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(BG())
+        .stroke(Stroke::new(1.0_f32, BORDER()))
         .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::same(16))
+        .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
@@ -80,10 +347,10 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// A tinted banner (info / warning / error / success).
 pub fn banner<R>(ui: &mut Ui, color: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
-        .fill(color.linear_multiply(0.10))
-        .stroke(Stroke::new(1.0_f32, color.linear_multiply(0.6)))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(14, 10))
+        .fill(color.linear_multiply(if is_light() { 0.08 } else { 0.12 }))
+        .stroke(Stroke::new(1.0_f32, color.linear_multiply(0.55)))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
@@ -91,19 +358,19 @@ pub fn banner<R>(ui: &mut Ui, color: Color32, add: impl FnOnce(&mut Ui) -> R) ->
         .inner
 }
 
+/// The small uppercase label at the top of a card.
 pub fn section_title(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(13.0).color(MUTED).strong());
+    ui.label(semibold(text.to_uppercase(), 12.0).color(MUTED()));
 }
 
-/// A small filled badge such as NEW REPO / UPDATE / BETA.
+/// A small pill such as NEW REPO / UPDATE / BETA.
 pub fn badge(ui: &mut Ui, text: &str, color: Color32) {
     egui::Frame::new()
-        .fill(color.linear_multiply(0.18))
-        .stroke(Stroke::new(1.0_f32, color))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(8, 2))
+        .fill(color.linear_multiply(if is_light() { 0.12 } else { 0.18 }))
+        .corner_radius(CornerRadius::same(255))
+        .inner_margin(Margin::symmetric(10, 3))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).size(12.0).strong().color(color));
+            ui.label(semibold(text, 12.0).color(color));
         });
 }
 
@@ -112,111 +379,289 @@ pub fn mono(text: impl Into<String>) -> RichText {
 }
 
 pub fn muted(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).color(MUTED)
+    RichText::new(text.into()).color(MUTED())
 }
 
-/// The big primary action button.
-pub fn primary(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
-    let btn = egui::Button::new(RichText::new(text).strong().size(15.5).color(if enabled {
-        BG
+/// Icon + label, for buttons.
+pub fn with_icon(icon: &str, text: &str) -> String {
+    if icon.is_empty() {
+        text.to_string()
     } else {
-        MUTED
-    }))
-    .fill(if enabled { ACCENT } else { CONTROL })
-    .corner_radius(CornerRadius::same(10))
-    .min_size(Vec2::new(170.0, 38.0));
+        format!("{icon}  {text}")
+    }
+}
+
+/// The main action button (filled emerald).
+pub fn primary(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
+    let btn =
+        egui::Button::new(semibold(text, 14.5).color(if enabled { ON_ACCENT() } else { MUTED() }))
+            .fill(if enabled { ACCENT_BTN() } else { CONTROL() })
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(10))
+            .min_size(Vec2::new(150.0, 40.0));
     ui.add_enabled(enabled, btn)
 }
 
-pub fn status_color(s: StepStatus) -> Color32 {
-    match s {
-        StepStatus::Running => ACCENT,
-        StepStatus::Passed => SUCCESS,
-        StepStatus::Failed => ERROR,
-        StepStatus::Skipped => MUTED,
+/// A normal outlined button with an optional icon.
+pub fn button(ui: &mut Ui, icon: &str, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(semibold(with_icon(icon, text), 14.0).color(TEXT()))
+            .min_size(Vec2::new(0.0, 36.0)),
+    )
+}
+
+/// Same as [`button`] but can be disabled.
+pub fn button_enabled(ui: &mut Ui, enabled: bool, icon: &str, text: &str) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(semibold(with_icon(icon, text), 14.0)).min_size(Vec2::new(0.0, 36.0)),
+    )
+}
+
+/// A segmented switch. Returns the index picked this frame, if any.
+pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize, width: f32) -> Option<usize> {
+    let mut picked = None;
+    egui::Frame::new()
+        .fill(BG())
+        .stroke(Stroke::new(1.0_f32, BORDER()))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.set_width(width - 8.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let each = (ui.available_width() - 2.0 * (options.len() as f32 - 1.0))
+                    / options.len() as f32;
+                for (i, o) in options.iter().enumerate() {
+                    let on = i == selected;
+                    let b = egui::Button::new(semibold(*o, 13.0).color(if on {
+                        TEXT()
+                    } else {
+                        MUTED()
+                    }))
+                    .fill(if on { CARD() } else { Color32::TRANSPARENT })
+                    .stroke(if on {
+                        Stroke::new(1.0_f32, BORDER())
+                    } else {
+                        Stroke::NONE
+                    })
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(each, 30.0));
+                    if ui.add(b).clicked() && !on {
+                        picked = Some(i);
+                    }
+                }
+            });
+        });
+    picked
+}
+
+/// A sidebar entry: icon, label, optional count badge.
+pub fn nav_item(
+    ui: &mut Ui,
+    icon: &str,
+    label: &str,
+    on: bool,
+    badge: Option<&str>,
+    compact: bool,
+) -> egui::Response {
+    let fill = if on {
+        ACCENT_SOFT()
+    } else {
+        Color32::TRANSPARENT
+    };
+    let color = if on { ACCENT() } else { MUTED() };
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(10),
+        if hovered && !on { pal().hover } else { fill },
+    );
+    let c = if hovered { TEXT() } else { color };
+    let c = if on { ACCENT() } else { c };
+    if compact {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            FontId::proportional(18.0),
+            c,
+        );
+    } else {
+        painter.text(
+            egui::pos2(rect.left() + 14.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            icon,
+            FontId::proportional(17.0),
+            c,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 44.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::new(14.5, FontFamily::Name("semibold".into())),
+            c,
+        );
+        if let Some(b) = badge {
+            let galley =
+                painter.layout_no_wrap(b.to_string(), FontId::proportional(11.5), ACCENT());
+            let bw = galley.size().x + 14.0;
+            let br = egui::Rect::from_center_size(
+                egui::pos2(rect.right() - 10.0 - bw / 2.0, rect.center().y),
+                Vec2::new(bw, 20.0),
+            );
+            painter.rect_filled(br, CornerRadius::same(255), ACCENT_SOFT());
+            painter.galley(br.center() - galley.size() / 2.0, galley, ACCENT());
+        }
+    }
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if compact {
+        resp.on_hover_text(label)
+    } else {
+        resp
     }
 }
 
-/// Connected pipeline stepper drawn with the painter.
-pub fn stepper(ui: &mut Ui, names: &[&str], steps: &[Step]) {
-    let width = ui.available_width();
-    let height = 64.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    let n = names.len().max(1);
-    let gap = width / n as f32;
-    let y = rect.top() + 18.0;
-    let status_of = |name: &str| steps.iter().find(|s| s.name == name);
-    for (i, name) in names.iter().enumerate() {
-        let x = rect.left() + gap * (i as f32 + 0.5);
-        if i + 1 < n {
-            let next_x = rect.left() + gap * (i as f32 + 1.5);
-            let done = status_of(name)
-                .map(|s| s.status == StepStatus::Passed || s.status == StepStatus::Skipped)
-                .unwrap_or(false);
-            painter.line_segment(
-                [egui::pos2(x + 12.0, y), egui::pos2(next_x - 12.0, y)],
-                Stroke::new(
-                    2.0_f32,
-                    if done {
-                        SUCCESS.linear_multiply(0.7)
-                    } else {
-                        BORDER
-                    },
-                ),
-            );
-        }
-        let st = status_of(name);
-        let color = st.map(|s| status_color(s.status)).unwrap_or(BORDER);
-        let filled = st.is_some();
-        painter.circle(
-            egui::pos2(x, y),
-            10.0,
-            if filled {
-                color.linear_multiply(0.25)
-            } else {
-                CARD
-            },
-            Stroke::new(2.0_f32, color),
-        );
-        let glyph = match st.map(|s| s.status) {
-            Some(StepStatus::Passed) => "✔",
-            Some(StepStatus::Failed) => "✖",
-            Some(StepStatus::Skipped) => "–",
-            Some(StepStatus::Running) => "…",
-            None => "",
-        };
-        if !glyph.is_empty() {
-            painter.text(
-                egui::pos2(x, y),
-                egui::Align2::CENTER_CENTER,
-                glyph,
-                egui::FontId::proportional(11.0),
-                color,
-            );
-        }
-        painter.text(
-            egui::pos2(x, y + 20.0),
-            egui::Align2::CENTER_TOP,
-            *name,
-            egui::FontId::proportional(11.5),
-            if filled { TEXT } else { MUTED },
-        );
-        if let Some(s) = st {
-            if s.millis > 0 && s.status != StepStatus::Running {
-                let t = if s.millis >= 1000 {
-                    format!("{:.1}s", s.millis as f64 / 1000.0)
-                } else {
-                    format!("{}ms", s.millis)
-                };
-                painter.text(
-                    egui::pos2(x, y + 36.0),
-                    egui::Align2::CENTER_TOP,
-                    t,
-                    egui::FontId::monospace(10.5),
-                    MUTED,
-                );
-            }
-        }
+fn duration(ms: u128) -> String {
+    if ms >= 1000 {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms} ms")
     }
+}
+
+/// The step tracker: one tile per step, in a grid (3 across when there's
+/// room), each with a status icon, the step's name and a short detail.
+pub fn stepper(ui: &mut Ui, names: &[&str], steps: &[Step], waiting: &[&str]) {
+    let cols = if ui.available_width() > 640.0 {
+        3
+    } else if ui.available_width() > 400.0 {
+        2
+    } else {
+        1
+    };
+    egui::Grid::new(("stepper", names.len()))
+        .num_columns(cols)
+        .spacing([10.0, 10.0])
+        .min_col_width((ui.available_width() - 10.0 * (cols as f32 - 1.0)) / cols as f32)
+        .max_col_width((ui.available_width() - 10.0 * (cols as f32 - 1.0)) / cols as f32)
+        .show(ui, |ui| {
+            for (i, name) in names.iter().enumerate() {
+                let st = steps.iter().find(|s| s.name == *name);
+                inset(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (r, _) =
+                            ui.allocate_exact_size(Vec2::splat(26.0), egui::Sense::hover());
+                        let p = ui.painter_at(r);
+                        match st.map(|s| s.status) {
+                            Some(StepStatus::Passed) => {
+                                p.circle_filled(r.center(), 13.0, ACCENT_BTN());
+                                p.text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    icon::CHECK,
+                                    FontId::proportional(14.0),
+                                    ON_ACCENT(),
+                                );
+                            }
+                            Some(StepStatus::Failed) => {
+                                p.circle_filled(r.center(), 13.0, ERROR());
+                                p.text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    icon::X,
+                                    FontId::proportional(14.0),
+                                    CARD(),
+                                );
+                            }
+                            Some(StepStatus::Skipped) => {
+                                p.circle_stroke(r.center(), 11.0, Stroke::new(2.0_f32, BORDER()));
+                                p.text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "–",
+                                    FontId::proportional(13.0),
+                                    MUTED(),
+                                );
+                            }
+                            Some(StepStatus::Running) => {
+                                ui.put(r, egui::Spinner::new().size(20.0).color(ACCENT()));
+                            }
+                            None => {
+                                p.circle_stroke(r.center(), 11.0, Stroke::new(2.0_f32, BORDER()));
+                            }
+                        }
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.add(egui::Label::new(semibold(*name, 14.0)).truncate());
+                            let detail = match st {
+                                Some(s) if s.status == StepStatus::Running => {
+                                    "Running…".to_string()
+                                }
+                                Some(s) => {
+                                    let d = s.detail.lines().next().unwrap_or("").trim();
+                                    let t = if s.millis > 0 {
+                                        duration(s.millis)
+                                    } else {
+                                        String::new()
+                                    };
+                                    match (d.is_empty(), t.is_empty()) {
+                                        (true, _) => t,
+                                        (false, true) => d.to_string(),
+                                        (false, false) => format!("{d} · {t}"),
+                                    }
+                                }
+                                None => waiting.get(i).copied().unwrap_or("Waiting").to_string(),
+                            };
+                            ui.add(
+                                egui::Label::new(RichText::new(detail).size(12.5).color(MUTED()))
+                                    .truncate(),
+                            );
+                        });
+                    });
+                });
+                if (i + 1) % cols == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+}
+
+/// Draw a toast in the bottom-right corner. Returns false once it's gone.
+pub fn toast(ctx: &egui::Context, text: &str, age_secs: f32, bottom_gap: f32) -> bool {
+    const SHOW: f32 = 4.0;
+    if age_secs > SHOW {
+        return false;
+    }
+    let alpha = ((SHOW - age_secs) / 0.4).clamp(0.0, 1.0);
+    egui::Area::new(egui::Id::new("toast"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, -bottom_gap))
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.set_opacity(alpha);
+            egui::Frame::new()
+                .fill(CARD())
+                .stroke(Stroke::new(1.0_f32, BORDER()))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::symmetric(16, 12))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 8],
+                    blur: 24,
+                    spread: 0,
+                    color: Color32::from_black_alpha(if is_light() { 30 } else { 110 }),
+                })
+                .show(ui, |ui| {
+                    ui.set_max_width(380.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(icon::CIRCLE_CHECK).size(18.0).color(ACCENT()));
+                        ui.add(egui::Label::new(RichText::new(text).size(14.0)).wrap());
+                    });
+                });
+        });
+    ctx.request_repaint();
+    true
 }

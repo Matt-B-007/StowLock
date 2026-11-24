@@ -24,6 +24,8 @@ pub struct RedactContext {
     pub repos: Vec<(String, bool)>,
     pub include_public_repo_names: bool,
     pub include_username: bool,
+    /// The user's own words to hide ("Also hide these words").
+    pub extra_words: Vec<String>,
 }
 
 impl RedactContext {
@@ -221,6 +223,14 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
     for (i, login) in kept.iter().enumerate() {
         s = s.replace(login.as_str(), &format!("\u{1}KEPT{i}\u{1}"));
     }
+    for (i, w) in rc
+        .extra_words
+        .iter()
+        .filter(|w| !w.trim().is_empty())
+        .enumerate()
+    {
+        s = replace_word(&s, w.trim(), &format!("<hidden-{}>", i + 1));
+    }
     if !rc.hostname.is_empty() {
         s = replace_word(&s, &rc.hostname, "<host>");
     }
@@ -312,6 +322,58 @@ pub struct ReportInput {
     pub panic: Option<String>,
 }
 
+/// Keep a project's contents out of the report: git's per-file lines
+/// ("create mode 100644 src/x.rs") are left out, and from a project's test
+/// output only the command and its pass/fail and failure lines are kept.
+pub fn privacy_filter(lines: &[String]) -> Vec<String> {
+    let file_line =
+        Regex::new(r"^\s*(create|delete) mode \d+ |^\s*mode change \d+|^\s*rename .+ \(\d+%\)$")
+            .unwrap();
+    let mut out = Vec::new();
+    let (mut files, mut test_lines) = (0usize, 0usize);
+    let flush = |out: &mut Vec<String>, files: &mut usize, tests: &mut usize, prefix: &str| {
+        if *files > 0 {
+            out.push(format!("{prefix}  [{files} file name(s) left out]"));
+            *files = 0;
+        }
+        if *tests > 0 {
+            out.push(format!(
+                "{prefix}  [{tests} line(s) of project test output left out]"
+            ));
+            *tests = 0;
+        }
+    };
+    let mut last_prefix = String::new();
+    for l in lines {
+        // "HH:MM:SS LEVEL [stage]   text"
+        let (prefix, text) = match l.find("] ") {
+            Some(i) if l.starts_with(|c: char| c.is_ascii_digit()) => (&l[..=i], &l[i + 1..]),
+            _ => ("", l.as_str()),
+        };
+        let body = text.trim_start();
+        if file_line.is_match(body)
+            || body.starts_with("[") && body.contains("lines hidden]") && prefix.contains("[push]")
+        {
+            files += 1;
+            last_prefix = prefix.to_string();
+            continue;
+        }
+        if prefix.contains("[tests]")
+            && !body.starts_with("$ ")
+            && !body.is_empty()
+            && !crate::logbook::is_important(body)
+        {
+            test_lines += 1;
+            last_prefix = prefix.to_string();
+            continue;
+        }
+        flush(&mut out, &mut files, &mut test_lines, &last_prefix);
+        out.push(l.clone());
+    }
+    flush(&mut out, &mut files, &mut test_lines, &last_prefix);
+    out
+}
+
 fn status_word(s: StepStatus) -> &'static str {
     match s {
         StepStatus::Running => "Running",
@@ -352,8 +414,13 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
             se.owner, se.slug, se.mode, se.channel, if se.tag.is_empty() { "none" } else { &se.tag }, se.stack
         ));
     }
-    let runs: Vec<crate::logbook::Run> = if !input.runs.is_empty() {
-        input.runs.clone()
+    let runs: Vec<crate::logbook::Run> = if input.runs.iter().any(|r| !r.steps.is_empty()) {
+        input
+            .runs
+            .iter()
+            .filter(|r| !r.steps.is_empty())
+            .cloned()
+            .collect()
     } else if !input.steps.is_empty() {
         vec![crate::logbook::Run {
             label: "Last run".into(),
@@ -371,11 +438,10 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
             } else {
                 format!(", {}", r.started)
             };
-            s.push_str(&format!("\n### {}{when}\n\n", r.label));
             if r.steps.is_empty() {
-                s.push_str("No steps recorded.\n");
                 continue;
             }
+            s.push_str(&format!("\n### {}{when}\n\n", r.label));
             s.push_str("| Step | Result | Time | Detail |\n| --- | --- | --- | --- |\n");
             for st in &r.steps {
                 let detail = st.detail.lines().next().unwrap_or("").replace('|', "/");
@@ -404,18 +470,24 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
     if let Some(st) = &input.selftest_summary {
         s.push_str(&format!("\n## Latest self-test\n\n{st}\n"));
     }
-    if !input.problem_lines.is_empty() {
+    let problems = privacy_filter(&input.problem_lines);
+    if !problems.is_empty() {
         s.push_str(&format!(
             "\n## Warnings and errors ({})\n\n```text\n{}\n```\n",
-            input.problem_lines.len(),
-            input.problem_lines.join("\n")
+            problems.len(),
+            problems.join("\n")
         ));
     }
-    if !input.log_lines.is_empty() {
+    // Lines already shown under warnings aren't repeated.
+    let latest: Vec<String> = privacy_filter(&input.log_lines)
+        .into_iter()
+        .filter(|l| !input.problem_lines.contains(l))
+        .collect();
+    if !latest.is_empty() {
         s.push_str(&format!(
             "\n## Latest log lines ({})\n\n```text\n{}\n```\n",
-            input.log_lines.len(),
-            input.log_lines.join("\n")
+            latest.len(),
+            latest.join("\n")
         ));
     }
     let all_steps: Vec<Step> = runs.iter().flat_map(|r| r.steps.clone()).collect();
@@ -529,6 +601,10 @@ pub fn install_panic_hook(paths: AppPaths, log: Logger, workspace: PathBuf) {
         };
         let rc = RedactContext::local(&workspace);
         let text = build_report(&input, &rc);
+        let _ = util::atomic_write(
+            &crate::updater::crashed_version_file(&paths),
+            crate::config::APP_VERSION.as_bytes(),
+        );
         if let Ok(p) = save_report(&paths, "crash", &text) {
             let _ = util::atomic_write(&paths.crash_marker(), p.display().to_string().as_bytes());
         }
@@ -551,7 +627,119 @@ mod tests {
             repos: vec![("sluice".into(), true), ("json-diff-ui".into(), false)],
             include_public_repo_names: false,
             include_username: false,
+            extra_words: vec![],
         }
+    }
+
+    /// Log lines shaped like the real reports from 2026-11-23, with this
+    /// test's made-up identity in place of the real one.
+    fn real_shaped_log() -> Vec<String> {
+        [
+            "11:14:37 INFO  [intake] Loaded /home/matt/Downloads/sluice-v0.12.1.zip",
+            "11:14:38 INFO  [intake] Copied from /run/media/matt/USB/sluice-v0.12.1.zip",
+            "17:37:35 WARN  [tests] $ cargo test --no-fail-fast  (exit Some(101), 15567 ms)",
+            "17:37:35 INFO  [tests]   running 41 tests",
+            "17:37:35 INFO  [tests]   test manage::tests::refuses_while_steam_runs ... ok",
+            "17:37:35 INFO  [tests]   sluice: the game closed after 0s. To get help, run: sluice report 1240440",
+            "17:37:35 WARN  [tests]   test parse::tests::reads_config ... FAILED",
+            "17:37:35 WARN  [tests]   test result: FAILED. 40 passed; 1 failed",
+            "17:38:16 INFO  [push] $ git commit -m \"Update to v0.12.1\"  (exit Some(0), 26 ms)",
+            "17:38:16 INFO  [push]    48 files changed, 10770 insertions(+), 687 deletions(-)",
+            "17:38:16 INFO  [push]    create mode 100644 crates/secret-plans/src/steam.rs",
+            "17:38:16 INFO  [push]    create mode 100644 packaging/aur/sluice/PKGBUILD",
+            "17:38:16 INFO  [push]   [7 lines hidden]",
+            "17:38:18 INFO  [push]   To https://github.com/Matt-B-007/sluice.git",
+            "17:38:20 INFO  [push] Pushed Matt-B-007/sluice from cachy-box as matt@cachy-box.lan",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn input_with(lines: Vec<String>, note: &str) -> ReportInput {
+        ReportInput {
+            title: "t".into(),
+            what_doing: note.into(),
+            expected: String::new(),
+            env: EnvInfo::default(),
+            session: None,
+            steps: vec![],
+            runs: vec![],
+            failing_command: None,
+            health: vec![],
+            selftest_summary: None,
+            problem_lines: lines
+                .iter()
+                .filter(|l| l.contains("WARN"))
+                .cloned()
+                .collect(),
+            log_lines: lines,
+            panic: None,
+        }
+    }
+
+    #[test]
+    fn real_shaped_report_keeps_private_things_private() {
+        let mut ctx = rc();
+        ctx.extra_words = vec!["Riverside Clinic".into()];
+        let text = build_report(
+            &input_with(
+                real_shaped_log(),
+                "Broke while syncing Riverside Clinic files",
+            ),
+            &ctx,
+        );
+        for leak in [
+            "matt",
+            "Matt-B-007",
+            "cachy-box",
+            "sluice",
+            "secret-plans",
+            "steam.rs",
+            "PKGBUILD",
+            "1240440",
+            "Riverside",
+            "refuses_while_steam_runs",
+        ] {
+            assert!(
+                !text.to_lowercase().contains(&leak.to_lowercase()),
+                "{leak} leaked:\n{text}"
+            );
+        }
+        // What's needed to fix a bug stays.
+        assert!(text.contains("48 files changed"));
+        assert!(text.contains("reads_config ... FAILED"));
+        assert!(text.contains("test result: FAILED. 40 passed; 1 failed"));
+        assert!(text.contains("file name(s) left out"));
+        assert!(text.contains("project test output left out"));
+        assert!(text.contains("StowLock"));
+        // Failure lines appear once, not under both headings.
+        assert_eq!(text.matches("reads_config ... FAILED").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn empty_runs_are_left_out() {
+        let mut i = input_with(vec![], "");
+        i.runs = vec![
+            crate::logbook::Run {
+                label: "Stage x".into(),
+                started: "11:14".into(),
+                steps: vec![],
+            },
+            crate::logbook::Run {
+                label: "Push x".into(),
+                started: "11:15".into(),
+                steps: vec![Step {
+                    name: "Commit & push".into(),
+                    status: StepStatus::Passed,
+                    millis: 5,
+                    detail: String::new(),
+                }],
+            },
+        ];
+        let text = build_report(&i, &rc());
+        assert!(!text.contains("No steps recorded"));
+        assert!(text.contains("Recent runs (last 1)"));
     }
 
     #[test]

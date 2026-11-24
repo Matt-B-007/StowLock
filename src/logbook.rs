@@ -81,7 +81,7 @@ fn is_progress(line: &str) -> bool {
 }
 
 /// Lines worth keeping however long the output is (results, failures).
-fn is_important(line: &str) -> bool {
+pub(crate) fn is_important(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
     l.contains("test result")
         || l.contains("error")
@@ -218,7 +218,13 @@ impl Logger {
         let text = out.combined();
         if !text.is_empty() {
             for l in shorten(&text) {
-                self.log(lvl, stage, &format!("  {l}"));
+                // Only failure lines are warnings; the rest is normal output.
+                let line_lvl = if !out.ok() && is_important(&l) {
+                    Level::Warn
+                } else {
+                    Level::Info
+                };
+                self.log(line_lvl, stage, &format!("  {l}"));
             }
         }
         if !out.ok() {
@@ -253,6 +259,16 @@ impl Logger {
     /// Start a new run (the last 3 are kept for bug reports).
     pub fn begin_run(&self, label: &str) {
         let mut g = self.inner.lock().unwrap();
+        // A run that never got a step (e.g. a stage that was replaced by a
+        // push straight away) is reused instead of leaving an empty entry.
+        if let Some(last) = g.runs.back_mut() {
+            if last.steps.is_empty() {
+                last.label = label.to_string();
+                last.started = chrono::Local::now().format("%H:%M").to_string();
+                g.failing_command = None;
+                return;
+            }
+        }
         g.runs.push_back(Run {
             label: label.to_string(),
             started: chrono::Local::now().format("%H:%M").to_string(),
@@ -380,10 +396,18 @@ mod tests {
         assert_eq!(l.steps()[0].status, StepStatus::Passed);
         for i in 0..4 {
             l.begin_run(&format!("run {i}"));
+            l.step("Stage", StepStatus::Passed, 1, "");
         }
         let runs = l.runs();
         assert_eq!(runs.len(), 3, "last 3 runs kept");
         assert_eq!(runs[2].label, "run 3");
+        // A run that never got a step is reused, not left empty.
+        l.begin_run("Stage x");
+        l.begin_run("Push x");
+        let runs = l.runs();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[2].label, "Push x");
+        assert_eq!(runs[1].label, "run 3");
     }
 
     #[test]

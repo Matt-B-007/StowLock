@@ -47,11 +47,31 @@ pub struct Ctx {
     pub gh: Arc<dyn GitHubApi>,
     pub log: Logger,
     pub cancel: Arc<AtomicBool>,
+    /// Tests and the self-test use a pretend Trash inside their own folder,
+    /// so they never put anything in the user's real Trash. None = real Trash.
+    pub trash_dir: Option<PathBuf>,
 }
 
 impl Ctx {
     pub fn workspace(&self) -> PathBuf {
         self.config.workspace()
+    }
+
+    /// Move a folder to the Trash (the pretend one in tests).
+    pub fn trash(&self, path: &Path) -> Res<String> {
+        let Some(dir) = &self.trash_dir else {
+            return util::move_to_trash(path);
+        };
+        std::fs::create_dir_all(dir).ctx("creating the test Trash")?;
+        let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+        let mut dest = dir.join(base);
+        let mut n = 1;
+        while dest.exists() {
+            n += 1;
+            dest = dir.join(format!("{base}.{n}"));
+        }
+        std::fs::rename(path, &dest).ctx("moving to the Trash")?;
+        Ok("Trash".into())
     }
     fn timed<T>(&self, name: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
         let t = Instant::now();
@@ -238,7 +258,7 @@ fn stage_new(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut StageRes
                 req.slug
             ));
         }
-        match util::move_to_trash(target) {
+        match ctx.trash(target) {
             Ok(_) => result.notes.push(if ours {
                 "Moved the earlier unpushed staging to the Trash".into()
             } else {
@@ -246,7 +266,8 @@ fn stage_new(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut StageRes
             }),
             Err(_) => {
                 let aside = ws.join(format!(
-                    ".stowlock-old-{}-{}",
+                    "{}{}-{}",
+                    crate::attempts::FOLDER_PREFIX,
                     req.slug,
                     util::now_stamp_secs()
                 ));
@@ -377,7 +398,8 @@ fn stage_update(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut Stage
             );
         }
         let label = format!(
-            "StowLock: unpushed staging saved {}",
+            "{} {}",
+            crate::attempts::STASH_PREFIX,
             util::now_stamp_secs()
         );
         let fb = (
@@ -487,6 +509,12 @@ pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
             cancel: ctx.cancel.clone(),
             pass_env: st.pass_env,
             log: &ctx.log,
+            build_cache: Some(
+                ctx.paths
+                    .cache_dir
+                    .join("builds")
+                    .join(slug.to_ascii_lowercase()),
+            ),
         };
         let r = preflight::run_tests(dir, stack, &env);
         let status = match r.status {
@@ -563,7 +591,7 @@ pub fn push_blockers(
                 && ctx.config.run_tests_before_push
                 && !override_tests
             {
-                v.push("Tests failed (tick \"Push anyway\" to override)".into());
+                v.push("Tests failed. See \"What to do next\" above".into());
             }
             if c.tests.status == preflight::TestStatus::Cancelled && !override_tests {
                 v.push("Tests were cancelled".into());

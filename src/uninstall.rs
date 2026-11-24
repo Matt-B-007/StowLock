@@ -55,7 +55,7 @@ impl Plan {
         let mut s = format!("StowLock uninstall: {}\n\n", self.level.label());
         if let Some(cmd) = &self.pacman_owned {
             s.push_str(&format!(
-                "The program was installed by pacman. Remove it with: {cmd}\n\n"
+                "The program was installed from the AUR. Remove it with: {cmd}\n\n"
             ));
         }
         s.push_str("Will remove:\n");

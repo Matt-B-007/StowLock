@@ -254,6 +254,36 @@ pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
 }
 
 /// Start a program detached from us (terminal for Run, xdg-open, restart).
+/// Ask a yes/no question with the desktop's dialog (KDE, then zenity), or in
+/// the terminal if there's no dialog. No way to ask means "no".
+pub fn ask_yes_no(title: &str, question: &str) -> bool {
+    if which("kdialog").is_some() {
+        if let Ok(s) = std::process::Command::new("kdialog")
+            .args(["--title", title, "--yesno", question])
+            .status()
+        {
+            return s.success();
+        }
+    }
+    if which("zenity").is_some() {
+        if let Ok(s) = std::process::Command::new("zenity")
+            .args(["--question", "--title", title, "--text", question])
+            .status()
+        {
+            return s.success();
+        }
+    }
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        print!("{question} [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        return matches!(line.trim(), "y" | "Y" | "yes" | "Yes");
+    }
+    false
+}
+
 pub fn spawn_detached(
     program: &str,
     args: &[&str],

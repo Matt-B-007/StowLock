@@ -31,6 +31,9 @@ jobs:
         run: |
           cp target/release/stowlock stowlock-linux-x86_64
           sha256sum stowlock-linux-x86_64 > stowlock-linux-x86_64.sha256
+          ./packaging/aur/make-pkgbuild.sh "$GITHUB_REF_NAME" stowlock-linux-x86_64 aur > aur-package-name
+          cp aur/PKGBUILD aur-PKGBUILD
+          cp aur/.SRCINFO aur-SRCINFO
       - name: Attach to release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -39,7 +42,32 @@ jobs:
           PRE=""
           case "$TAG" in *-beta*|*-alpha*|*-rc*) PRE="--prerelease" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 --clobber
+            gh release upload "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 aur-PKGBUILD aur-SRCINFO --clobber
           else
-            gh release create "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 --generate-notes $PRE
+            gh release create "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 aur-PKGBUILD aur-SRCINFO --generate-notes $PRE
           fi
+      - name: Publish to the AUR
+        # Runs only once the AUR_SSH_PRIVATE_KEY secret is set in the repo
+        # (Settings > Secrets and variables > Actions). Betas go to
+        # stowlock-beta-bin, full releases to stowlock-bin.
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$AUR_KEY" ]; then
+            echo "No AUR_SSH_PRIVATE_KEY secret yet, so the AUR package wasn't published."
+            exit 0
+          fi
+          PKG="$(cat aur-package-name)"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git clone "ssh://aur@aur.archlinux.org/$PKG.git" aur-repo
+          cp aur/PKGBUILD aur/.SRCINFO aur-repo/
+          cd aur-repo
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then echo "AUR already up to date"; exit 0; fi
+          git -c user.name="Matt-B-007" -c user.email="Matt-B-007@users.noreply.github.com" commit -m "Update to $TAG"
+          git push origin HEAD:master
+          rm -f ~/.ssh/aur

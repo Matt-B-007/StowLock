@@ -8,6 +8,8 @@ StowLock is a small native Linux app (Rust + egui) for people who build projects
 
 Built for CachyOS and other Arch-based distributions; it runs on any x86_64 Linux desktop.
 
+<p align="center"><img src="assets/screenshots/stage.png" width="760" alt="The Stage screen: a zip routed to an update of an existing repo"></p>
+
 ## What it does
 
 - **Routes every zip to the right repo.** `sluice-v2.zip` updates your existing `sluice` repo instead of creating `sluice-v2`. The full target (`zip → folder → github.com/you/repo`) is shown before anything happens.
@@ -19,14 +21,35 @@ Built for CachyOS and other Arch-based distributions; it runs on any x86_64 Linu
 - **Stable or beta releases.** Optional version tags (`v0.2.0`, `v0.3.0-beta.1`) with GitHub releases; betas are marked as pre-releases.
 - **Keeps Downloads empty.** After a successful push the zip moves to `~/GitHub_Projects/_archive/<project>/`.
 - **Never force-pushes**, never overwrites unsaved local work, and stops if GitHub has changes you don't.
-- **Pushed today** tracker, a **Projects** tab, a **Health** view and a built-in **self-test**.
+- **If a check fails, nothing is lost.** Load a fixed zip and the failed attempt is set aside (a git stash, or a folder for a new repo). **Projects → Saved earlier attempts** lists them with Restore and Delete.
+- **Sidebar screens:** Stage, Projects, History, Health, Bug report and Settings, in a light or dark theme that follows your desktop.
+- A **History** of every push, a **Health** view and a built-in **self-test**.
 - **No terminal needed:** installs git and GitHub's `gh` tool through your desktop's password dialog and signs you in with a one-time code in your browser.
 
 ## Install
 
-### Download (recommended)
+### One command (easiest)
 
-1. Download `stowlock-linux-x86_64` from the [latest release](https://github.com/Matt-B-007/stowlock/releases/latest).
+Open a terminal and paste:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Matt-B-007/StowLock/main/install.sh | sh
+```
+
+It downloads the newest release, checks it against its published checksum and installs it for your user (no password). StowLock then appears in your app menu and updates itself from **Settings → Updates**. Run the same command again any time to reinstall. Add `STOWLOCK_CHANNEL=stable` in front of `sh` for full releases only.
+
+### From the AUR (CachyOS, Arch)
+
+```bash
+paru -S stowlock-beta-bin     # betas, while StowLock is in beta
+paru -S stowlock-bin          # full releases, once 0.1.0 is out
+```
+
+(`yay` works the same way.) Updates then come with your normal system updates, and `sudo pacman -R stowlock-beta-bin` removes it.
+
+### Download
+
+1. Download `stowlock-linux-x86_64` from the [latest release](https://github.com/Matt-B-007/StowLock/releases).
 2. Make it executable and install it:
 
    ```bash
@@ -34,17 +57,25 @@ Built for CachyOS and other Arch-based distributions; it runs on any x86_64 Linu
    ./stowlock-linux-x86_64 --install
    ```
 
-StowLock now appears in your app menu, and "Open with StowLock" works on zip files. Future updates take two clicks inside the app.
+StowLock now appears in your app menu, and "Open with StowLock" works on zip files. The installer says which version it installed and which it replaced, and warns you if your browser renamed the download (for example `stowlock-linux-x86_64(1)`).
 
 ### Build from source
 
 ```bash
 sudo pacman -S --needed rust git github-cli
-git clone https://github.com/Matt-B-007/stowlock.git
-cd stowlock
+git clone https://github.com/Matt-B-007/StowLock.git
+cd StowLock
 cargo build --release
 ./target/release/stowlock --install
 ```
+
+## Updates
+
+- **Settings → Update channel:** **Stable** offers only full releases; **Beta** also offers betas. If you're running a beta, it starts on Beta. It never offers an older version.
+- The update notice shows **What's new** and an **Update** button; StowLock downloads the new version, checks it against its published checksum, swaps it in and restarts. No GitHub sign-in is needed for updates.
+- From a terminal: `stowlock --update`.
+- **Going back:** the version you had before an update is kept. Use **Settings → Go back to …**, or run `stowlock --rollback` if the window won't open. If a new version crashes, StowLock offers to go back the next time it starts.
+- If you open a newer copy while an older one is running, StowLock asks whether to switch.
 
 ## First run
 
@@ -73,12 +104,16 @@ StowLock never writes its own files into a project folder.
 - Nothing leaves your computer except what you push to GitHub, the sign-in, your repo list and a release check against this repository (no personal data). No tracking, analytics or automatic crash uploads.
 - StowLock never reads, stores or logs your GitHub token; sign-in is handled by `gh`.
 - Its folders are readable only by your account. Secrets are blanked out the moment they're written to the log, and logs and reports are deleted after 30 days.
-- Bug reports replace your username, GitHub account, repo names, email, computer name and folder paths with placeholders. You always see exactly what will be shared before you copy it or open an issue.
+- Bug reports replace your username, GitHub account, organisations, repo and project names, emails, computer name, IP and MAC addresses and folder paths with placeholders, wherever they appear. Your project's file names and its own test output are left out (only pass/fail lines and failure messages stay).
+- Your note in **What happened?** is hidden the same way, and **Also hide these words** adds your own words (a client's name, say) to every future report.
+- Nothing is ever sent automatically. You see exactly what will be shared before you copy, save or download it, and saved reports are readable only by your account.
+
+<p align="center"><img src="assets/screenshots/bug-report.png" width="760" alt="The Bug report screen with a preview of exactly what gets shared"></p>
 
 ## Self-test
 
 ```bash
-stowlock --self-test            # 23 checks in a sandbox; never touches your projects or GitHub
+stowlock --self-test            # checks in a sandbox; never touches your projects or GitHub
 stowlock --self-test --online   # also read-only checks of your GitHub sign-in
 ```
 
@@ -102,8 +137,10 @@ cargo test       # unit and end-to-end tests (against a fake GitHub made of loca
 cargo run        # start the app
 ```
 
-Pushing a `v*` tag builds `stowlock-linux-x86_64` and its checksum in GitHub Actions and attaches them to the release.
+CI runs the tests twice: on Ubuntu, and on an up-to-date Arch Linux with git's strictest settings, so problems with new versions of git and Rust show up before a release.
+
+Pushing a `v*` tag builds `stowlock-linux-x86_64` and its checksum in GitHub Actions, attaches them to the release with the AUR files (`aur-PKGBUILD`, `aur-SRCINFO`), and publishes the AUR package once the `AUR_SSH_PRIVATE_KEY` secret is set in the repository.
 
 ## License
 
-StowLock is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE).
+StowLock is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE). It bundles the [Inter](https://rsms.me/inter/) font (SIL Open Font License 1.1) and [Lucide](https://lucide.dev) icons (ISC License); their licenses are in `assets/licenses/`.

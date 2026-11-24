@@ -40,6 +40,7 @@ impl Sandbox {
             gh: fake.clone(),
             log,
             cancel: Arc::new(AtomicBool::new(false)),
+            trash_dir: Some(root.join("Trash")),
         };
         Ok(Sandbox {
             root: root.to_path_buf(),

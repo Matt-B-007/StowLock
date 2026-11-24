@@ -580,6 +580,7 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
                 return Ok(Some("python3 not installed".into()));
             }
             let env = crate::preflight::TestEnv {
+                build_cache: None,
                 timeout_secs: 60,
                 cancel: Default::default(),
                 pass_env: false,
@@ -911,20 +912,21 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
     rn.check(
         "T20",
         "Self-update",
-        "Version comparison; checksum mismatch rejected",
+        "Update channels; version comparison; checksum mismatch rejected",
         "updater.rs",
         "Check is_newer and verify_checksum.",
         Box::new(|| {
             ensure!(
-                updater::is_newer("v9.0.0", APP_VERSION)
-                    && !updater::is_newer("v0.0.1", APP_VERSION),
-                "newer detected",
+                updater::is_newer("v9.0.0", APP_VERSION, false)
+                    && !updater::is_newer("v0.0.1", APP_VERSION, true),
+                "newer detected, older never offered",
                 "wrong comparison"
             );
             ensure!(
-                !updater::is_newer("v9.0.0-beta.1", APP_VERSION),
-                "betas ignored",
-                "beta offered"
+                !updater::is_newer("v9.0.0-beta.1", APP_VERSION, false)
+                    && updater::is_newer("v9.0.0-beta.1", APP_VERSION, true),
+                "Stable skips betas, Beta offers them",
+                "wrong channel handling"
             );
             let f = tmp.join("bin");
             std::fs::write(&f, "x").ok();
