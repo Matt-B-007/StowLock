@@ -34,39 +34,42 @@ const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
+/// Graphite and emerald, dark. Every text colour meets 4.5:1 contrast on
+/// every background it's used on (checked when the palette was chosen).
 const DARK: Pal = Pal {
-    bg: rgb(0x0E1311),
-    side: rgb(0x0A0E0C),
-    card: rgb(0x151C19),
-    control: rgb(0x1B2420),
-    hover: rgb(0x212C27),
-    border: rgb(0x25302B),
-    text: rgb(0xE8EDEA),
-    muted: rgb(0x93A29B),
-    accent: rgb(0x5EE0AE),
+    bg: rgb(0x101113),
+    side: rgb(0x0B0C0E),
+    card: rgb(0x17181B),
+    control: rgb(0x1E2023),
+    hover: rgb(0x25272B),
+    border: rgb(0x2A2C30),
+    text: rgb(0xECEDEF),
+    muted: rgb(0x9EA3AB),
+    accent: rgb(0x5EE6B0),
     accent_btn: rgb(0x10B981),
-    on_accent: rgb(0x04251A),
-    accent_soft: rgb(0x11372A),
-    success: rgb(0x34D399),
+    on_accent: rgb(0x03241A),
+    accent_soft: rgb(0x173528),
+    success: rgb(0x6EE7B7),
     warning: rgb(0xFBBF24),
     error: rgb(0xF87171),
 };
 
+/// Graphite and emerald, light.
 const LIGHT: Pal = Pal {
-    bg: rgb(0xF4F7F5),
-    side: rgb(0xEDF2EF),
+    bg: rgb(0xF6F7F8),
+    side: rgb(0xEEF0F2),
     card: rgb(0xFFFFFF),
-    control: rgb(0xF0F4F2),
-    hover: rgb(0xE3EAE6),
-    border: rgb(0xDCE4DF),
-    text: rgb(0x0F1714),
-    muted: rgb(0x56665E),
-    accent: rgb(0x046C4E),
+    control: rgb(0xF1F3F5),
+    hover: rgb(0xE6E9ED),
+    border: rgb(0xE2E5E9),
+    text: rgb(0x111317),
+    muted: rgb(0x5B6270),
+    accent: rgb(0x047857),
     accent_btn: rgb(0x047857),
     on_accent: rgb(0xFFFFFF),
-    accent_soft: rgb(0xD9F3E7),
+    accent_soft: rgb(0xDDF4EA),
     success: rgb(0x047857),
-    warning: rgb(0xA16207),
+    warning: rgb(0x975A06),
     error: rgb(0xB91C1C),
 };
 
@@ -517,6 +520,8 @@ pub fn nav_item(
             painter.galley(br.center() - galley.size() / 2.0, galley, ACCENT());
         }
     }
+    // A real, named button for screen readers (and the click-through tests).
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, label));
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if compact {
         resp.on_hover_text(label)
@@ -664,4 +669,58 @@ pub fn toast(ctx: &egui::Context, text: &str, age_secs: f32, bottom_gap: f32) ->
         });
     ctx.request_repaint();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lum(c: Color32) -> f64 {
+        let f = |v: u8| {
+            let c = v as f64 / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn every_text_colour_is_readable_in_both_themes() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            for (fg, fg_name) in [
+                (p.text, "text"),
+                (p.muted, "muted"),
+                (p.accent, "accent"),
+                (p.success, "success"),
+                (p.warning, "warning"),
+                (p.error, "error"),
+            ] {
+                for (bg, bg_name) in [
+                    (p.bg, "bg"),
+                    (p.card, "card"),
+                    (p.side, "side"),
+                    (p.control, "control"),
+                ] {
+                    let c = contrast(fg, bg);
+                    assert!(c >= 4.5, "{name}: {fg_name} on {bg_name} is {c:.2}:1");
+                }
+            }
+            assert!(
+                contrast(p.on_accent, p.accent_btn) >= 4.5,
+                "{name}: button text"
+            );
+            assert!(
+                contrast(p.accent, p.accent_soft) >= 4.5,
+                "{name}: selected nav item"
+            );
+        }
+    }
 }

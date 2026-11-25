@@ -322,56 +322,143 @@ pub struct ReportInput {
     pub panic: Option<String>,
 }
 
+/// Split "HH:MM:SS LEVEL [stage]   text" into its prefix and text.
+fn split_line(l: &str) -> (&str, &str) {
+    match l.find("] ") {
+        Some(i) if l.starts_with(|c: char| c.is_ascii_digit()) => (&l[..=i], &l[i + 1..]),
+        _ => ("", l),
+    }
+}
+
 /// Keep a project's contents out of the report: git's per-file lines
 /// ("create mode 100644 src/x.rs") are left out, and from a project's test
-/// output only the command and its pass/fail and failure lines are kept.
+/// output only the command, its pass/fail lines and failure messages are
+/// kept. Each command gets one short note of what was left out, at its end.
 pub fn privacy_filter(lines: &[String]) -> Vec<String> {
     let file_line =
         Regex::new(r"^\s*(create|delete) mode \d+ |^\s*mode change \d+|^\s*rename .+ \(\d+%\)$")
             .unwrap();
-    let mut out = Vec::new();
-    let (mut files, mut test_lines) = (0usize, 0usize);
+    let bodies: Vec<&str> = lines.iter().map(|l| split_line(l).1.trim_start()).collect();
+    let keep = crate::logbook::mark_important(&bodies);
+    let mut out: Vec<String> = Vec::new();
+    let (mut files, mut tests) = (0usize, 0usize);
+    let mut prefix_for_note = String::new();
     let flush = |out: &mut Vec<String>, files: &mut usize, tests: &mut usize, prefix: &str| {
+        let mut notes = Vec::new();
         if *files > 0 {
-            out.push(format!("{prefix}  [{files} file name(s) left out]"));
-            *files = 0;
+            notes.push(format!(
+                "{files} file name{} left out",
+                if *files == 1 { "" } else { "s" }
+            ));
         }
         if *tests > 0 {
-            out.push(format!(
-                "{prefix}  [{tests} line(s) of project test output left out]"
+            notes.push(format!(
+                "{tests} line{} of project test output left out",
+                if *tests == 1 { "" } else { "s" }
             ));
-            *tests = 0;
         }
+        if !notes.is_empty() {
+            out.push(format!("{prefix}  [{}]", notes.join(", ")));
+        }
+        *files = 0;
+        *tests = 0;
     };
-    let mut last_prefix = String::new();
-    for l in lines {
-        // "HH:MM:SS LEVEL [stage]   text"
-        let (prefix, text) = match l.find("] ") {
-            Some(i) if l.starts_with(|c: char| c.is_ascii_digit()) => (&l[..=i], &l[i + 1..]),
-            _ => ("", l.as_str()),
-        };
-        let body = text.trim_start();
-        if file_line.is_match(body)
-            || body.starts_with("[") && body.contains("lines hidden]") && prefix.contains("[push]")
-        {
+    for (i, l) in lines.iter().enumerate() {
+        let (prefix, _) = split_line(l);
+        let body = bodies[i];
+        let is_header = body.starts_with("$ ");
+        if is_header {
+            flush(&mut out, &mut files, &mut tests, &prefix_for_note);
+            prefix_for_note = prefix.to_string();
+            out.push(l.clone());
+            continue;
+        }
+        let hidden_marker = body.starts_with('[') && body.contains("hidden]");
+        if file_line.is_match(body) || (hidden_marker && prefix.contains("[push]")) {
             files += 1;
-            last_prefix = prefix.to_string();
             continue;
         }
-        if prefix.contains("[tests]")
-            && !body.starts_with("$ ")
-            && !body.is_empty()
-            && !crate::logbook::is_important(body)
-        {
-            test_lines += 1;
-            last_prefix = prefix.to_string();
+        if prefix.contains("[tests]") {
+            if body.is_empty() || (body.starts_with('[') && body.contains("left out]")) {
+                continue;
+            }
+            if !keep[i] && !hidden_marker {
+                tests += 1;
+                continue;
+            }
+            out.push(l.clone());
             continue;
         }
-        flush(&mut out, &mut files, &mut test_lines, &last_prefix);
+        flush(&mut out, &mut files, &mut tests, &prefix_for_note);
         out.push(l.clone());
     }
-    flush(&mut out, &mut files, &mut test_lines, &last_prefix);
+    flush(&mut out, &mut files, &mut tests, &prefix_for_note);
     out
+}
+
+/// When a check is run again with the same result, show its output once:
+/// the repeat becomes one line saying so.
+pub fn fold_repeats(lines: &[String]) -> Vec<String> {
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    for l in lines {
+        if split_line(l).1.trim_start().starts_with("$ ") || blocks.is_empty() {
+            blocks.push(Vec::new());
+        }
+        blocks.last_mut().unwrap().push(l.clone());
+    }
+    let norm = |b: &Vec<String>| -> Vec<String> {
+        b.iter()
+            .skip(1)
+            .map(|l| {
+                let t = split_line(l).1.trim().to_string();
+                // Thread ids and timings differ between runs.
+                Regex::new(r"\(\d+\)|finished in [\d.]+s|\d+ ms")
+                    .unwrap()
+                    .replace_all(&t, "")
+                    .to_string()
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    let mut prev: Option<Vec<String>> = None;
+    for b in &blocks {
+        let n = norm(b);
+        if b.len() > 2 && prev.as_ref() == Some(&n) {
+            out.push(format!("{}  (same output as the previous check)", b[0]));
+        } else {
+            out.extend(b.iter().cloned());
+        }
+        prev = Some(n);
+    }
+    out
+}
+
+/// A prompt for the user's AI when their *project's* tests fail: which tests,
+/// what the failure said, and a request to fix the project (not StowLock).
+pub fn project_fix_prompt(summary: &str, output: &[String]) -> String {
+    let failures: Vec<String> = output
+        .iter()
+        .map(|l| split_line(l).1.trim().to_string())
+        .filter(|t| !t.is_empty() && !t.starts_with('['))
+        .filter(|t| crate::logbook::is_failure_line(t) || t.starts_with("thread '"))
+        .take(40)
+        .collect();
+    let mut p = String::from(
+        "My project's tests failed when StowLock checked it before pushing to GitHub.\n",
+    );
+    if !summary.trim().is_empty() {
+        p.push_str(&format!("Result: {}\n", summary.trim()));
+    }
+    if !failures.is_empty() {
+        p.push_str("Failure output:\n");
+        for f in failures {
+            p.push_str(&format!("  {f}\n"));
+        }
+    }
+    p.push_str(
+        "Please fix the project so these tests pass, without changing behaviour elsewhere. If a test itself is wrong, explain why before changing it, and give me the updated project as a zip.\n",
+    );
+    p
 }
 
 fn status_word(s: StepStatus) -> &'static str {
@@ -470,7 +557,7 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
     if let Some(st) = &input.selftest_summary {
         s.push_str(&format!("\n## Latest self-test\n\n{st}\n"));
     }
-    let problems = privacy_filter(&input.problem_lines);
+    let problems = fold_repeats(&privacy_filter(&input.problem_lines));
     if !problems.is_empty() {
         s.push_str(&format!(
             "\n## Warnings and errors ({})\n\n```text\n{}\n```\n",
@@ -495,15 +582,26 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
         .iter()
         .filter(|s| s.status == StepStatus::Failed)
         .collect();
-    if !failed.is_empty() || input.panic.is_some() {
-        s.push_str("\n## AI fix prompt\n\n```text\n");
+    let (project_tests, stowlock_faults): (Vec<&&Step>, Vec<&&Step>) =
+        failed.iter().partition(|f| {
+            f.name == "Pre-flight tests"
+                && !crate::health::counts_against_stowlock(&f.name, &f.detail)
+        });
+    if !project_tests.is_empty() {
+        s.push_str("\n## AI fix prompt (for your project)\n\n```text\n");
+        let summary = project_tests[0].detail.lines().next().unwrap_or("");
+        s.push_str(&project_fix_prompt(summary, &problems));
+        s.push_str("```\n");
+    }
+    if !stowlock_faults.is_empty() || input.panic.is_some() {
+        s.push_str("\n## AI fix prompt (for StowLock)\n\n```text\n");
         if let Some(p) = &input.panic {
             s.push_str(&format!(
                 "StowLock {APP_VERSION} crashed: {}\n",
                 p.lines().next().unwrap_or("")
             ));
         }
-        for f in failed {
+        for f in stowlock_faults {
             s.push_str(&format!(
                 "StowLock {APP_VERSION}: the step \"{}\" failed. Actual: {}\n",
                 f.name,
@@ -710,11 +808,89 @@ mod tests {
         assert!(text.contains("48 files changed"));
         assert!(text.contains("reads_config ... FAILED"));
         assert!(text.contains("test result: FAILED. 40 passed; 1 failed"));
-        assert!(text.contains("file name(s) left out"));
+        assert!(text.contains("file names left out"));
         assert!(text.contains("project test output left out"));
         assert!(text.contains("StowLock"));
         // Failure lines appear once, not under both headings.
         assert_eq!(text.matches("reads_config ... FAILED").count(), 1, "{text}");
+    }
+
+    /// Shaped like the 2026-11-24 report: a project's e2e test fails, the
+    /// check is run twice, and a passing test's name contains "failed".
+    fn failing_project_log() -> Vec<String> {
+        let mut v = Vec::new();
+        for t in ["12:25:21", "12:25:47"] {
+            for (lvl, line) in [
+                ("WARN ", "$ cargo test --no-fail-fast  (exit Some(101), 5338 ms)"),
+                ("INFO ", "  running 7 tests"),
+                ("INFO ", "  test launch::starts_game ... ok"),
+                ("INFO ", "  "),
+                ("INFO ", "  test fsutil::tests::failed_write_keeps_original ... ok"),
+                ("WARN ", "  test obs_capture_starts_the_game_through_obs_gamecapture ... FAILED"),
+                ("WARN ", "  ---- obs_capture_starts_the_game_through_obs_gamecapture stdout ----"),
+                ("WARN ", "  thread 'obs_capture_starts_the_game_through_obs_gamecapture' (316740) panicked at crates/sluice/tests/e2e.rs:528:5:"),
+                ("INFO ", "  wrapper didn't launch obs-gamecapture: got [\"steam\"]"),
+                ("INFO ", "  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"),
+                ("INFO ", "  "),
+                ("INFO ", "  test result: ok. 68 passed; 0 failed; 0 ignored; finished in 2.48s"),
+                ("WARN ", "  test result: FAILED. 6 passed; 1 failed; 0 ignored; finished in 2.25s"),
+            ] {
+                v.push(format!("{t} {lvl} [tests] {line}"));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn project_test_failure_report_is_short_and_useful() {
+        let lines = failing_project_log();
+        let mut i = input_with(lines.clone(), "");
+        i.problem_lines = lines.clone();
+        i.runs = vec![crate::logbook::Run {
+            label: "Stage sluice".into(),
+            started: "12:24".into(),
+            steps: vec![Step {
+                name: "Pre-flight tests".into(),
+                status: StepStatus::Failed,
+                millis: 5742,
+                detail: "cargo test --no-fail-fast failed · 74 passed, 1 failed: obs_capture_starts_the_game_through_obs_gamecapture".into(),
+            }],
+        }];
+        i.steps = i.runs[0].steps.clone();
+        i.failing_command = Some(("cargo test --no-fail-fast".into(), Some(101)));
+        let text = build_report(&i, &rc());
+        // The failure message survives, the passing test doesn't.
+        assert!(
+            text.contains("wrapper didn't launch obs-gamecapture"),
+            "{text}"
+        );
+        assert!(!text.contains("failed_write_keeps_original"), "{text}");
+        // The second identical run is folded into one line.
+        assert!(
+            text.contains("(same output as the previous check)"),
+            "{text}"
+        );
+        // No blank lines or stacks of markers.
+        assert!(!text.contains("[tests]   \n"));
+        // The AI prompt is about the project.
+        assert!(text.contains("AI fix prompt (for your project)"));
+        assert!(text.contains("My project's tests failed"));
+        assert!(
+            !text.contains("Find the cause in the StowLock source"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn passing_lines_are_not_warnings() {
+        use crate::logbook::is_failure_line;
+        assert!(!is_failure_line("test result: ok. 68 passed; 0 failed"));
+        assert!(!is_failure_line(
+            "test fsutil::tests::failed_write_keeps_original ... ok"
+        ));
+        assert!(is_failure_line("test obs_capture ... FAILED"));
+        assert!(is_failure_line("test result: FAILED. 6 passed; 1 failed"));
+        assert!(is_failure_line("assertion `left == right` failed"));
     }
 
     #[test]

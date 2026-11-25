@@ -115,6 +115,20 @@ pub fn looks_like_duplicate(name: &str) -> bool {
             .is_some_and(|(_, tail)| tail.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// The command that puts ~/.local/bin on PATH for the user's shell.
+pub fn path_fix_command(shell: &str) -> &'static str {
+    let name = shell.rsplit('/').next().unwrap_or("");
+    match name {
+        "fish" => "fish_add_path ~/.local/bin",
+        "zsh" => {
+            "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc  (then open a new terminal)"
+        }
+        _ => {
+            "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc  (then open a new terminal)"
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct InstallReport {
     pub lines: Vec<String>,
@@ -190,8 +204,9 @@ pub fn install(inst: &InstallPaths) -> Res<InstallReport> {
         .push(format!("Added the icon {}", util::tilde(&inst.icon)));
     if !bin_dir_on_path(inst) {
         r.warnings.push(format!(
-            "{} isn't on your PATH, so typing `stowlock` in a terminal won't work yet. The app menu entry works either way.",
-            util::tilde(bin_dir)
+            "{} isn't on your PATH, so typing `stowlock` in a terminal won't work yet. The app menu entry works either way. To fix it, run: {}",
+            util::tilde(bin_dir),
+            path_fix_command(&std::env::var("SHELL").unwrap_or_default())
         ));
     }
     Ok(r)
@@ -200,6 +215,17 @@ pub fn install(inst: &InstallPaths) -> Res<InstallReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_fix_per_shell() {
+        assert_eq!(
+            path_fix_command("/usr/bin/fish"),
+            "fish_add_path ~/.local/bin"
+        );
+        assert!(path_fix_command("/bin/zsh").contains(".zshrc"));
+        assert!(path_fix_command("/bin/bash").contains(".bashrc"));
+        assert!(path_fix_command("").contains(".bashrc"));
+    }
 
     #[test]
     fn spots_renamed_downloads() {

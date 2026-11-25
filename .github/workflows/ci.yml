@@ -36,3 +36,22 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
       - run: ./target/release/stowlock --self-test
+      - name: Build and install the AUR package (from local files)
+        run: |
+          useradd -m builder
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          OUT=/tmp/aurtest
+          PKG="$(./packaging/aur/make-pkgbuild.sh "v$VER" target/release/stowlock "$OUT")"
+          cp target/release/stowlock "$OUT/stowlock-$VER"
+          cp assets/stowlock.svg "$OUT/stowlock-$VER.svg"
+          cp LICENSE "$OUT/LICENSE-$VER"
+          # Same files and checksums as the release, read from disk instead of GitHub.
+          sed -i -E 's#::https://[^"]+"#"#' "$OUT/PKGBUILD"
+          chown -R builder "$OUT"
+          su builder -c "cd $OUT && makepkg --noconfirm -f"
+          pacman -U --noconfirm "$OUT"/*.pkg.tar.zst
+          stowlock --version
+          test -f /usr/share/applications/stowlock.desktop
+          test -f /usr/share/icons/hicolor/scalable/apps/stowlock.svg
+          pacman -R --noconfirm "$PKG"
+

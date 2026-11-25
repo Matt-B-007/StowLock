@@ -179,12 +179,13 @@ fn main() {
         let config = config::Config::load(&paths);
         let beta = config.beta_updates();
         let log = logbook::Logger::new(None);
-        match updater::check(&paths, &config.update_repo, beta) {
-            Ok(None) => println!(
-                "You have the newest {} version ({APP_VERSION}).",
-                if beta { "beta or stable" } else { "stable" }
+        match updater::check(&paths, &config.update_repo, beta).map(|c| (c.newer, c.newest_tag)) {
+            Ok((None, newest)) => println!(
+                "You have the newest {} version ({APP_VERSION}). Newest on GitHub: {}.",
+                if beta { "beta or stable" } else { "stable" },
+                newest.unwrap_or_else(|| "none yet".into())
             ),
-            Ok(Some(rel)) => {
+            Ok((Some(rel), _)) => {
                 println!("Updating StowLock {APP_VERSION} to {}…", rel.label());
                 match updater::apply(&paths, &config.update_repo, &rel.tag, &log) {
                     Ok(p) => {
@@ -198,7 +199,7 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("Couldn't check for updates: {e}");
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         }

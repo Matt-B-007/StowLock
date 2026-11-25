@@ -48,6 +48,7 @@ pub trait GitHubApi: Send + Sync {
         slug: &str,
         tag: &str,
         prerelease: bool,
+        notes: Option<&str>,
         log: &Logger,
     ) -> Res<()>;
     fn repo_url(&self, owner: &str, slug: &str) -> String {
@@ -253,18 +254,36 @@ impl GitHubApi for RealGh {
         slug: &str,
         tag: &str,
         prerelease: bool,
+        notes: Option<&str>,
         log: &Logger,
     ) -> Res<()> {
         let repo = format!("{owner}/{slug}");
+        // The project's own CHANGELOG notes when there are some, otherwise
+        // GitHub's generated list of changes.
+        let notes_file = match notes {
+            Some(n) => {
+                let f = tempfile::NamedTempFile::new().ctx("writing the release notes")?;
+                std::fs::write(f.path(), n).ctx("writing the release notes")?;
+                Some(f)
+            }
+            None => None,
+        };
+        let notes_path = notes_file.as_ref().map(|f| f.path().display().to_string());
         let mut args = vec![
             "release",
             "create",
             tag,
             "-R",
             repo.as_str(),
-            "--generate-notes",
             "--verify-tag",
         ];
+        match &notes_path {
+            Some(p) => {
+                args.push("--notes-file");
+                args.push(p.as_str());
+            }
+            None => args.push("--generate-notes"),
+        }
         if prerelease {
             args.push("--prerelease");
         }
@@ -393,8 +412,17 @@ impl GitHubApi for FakeGh {
         slug: &str,
         tag: &str,
         prerelease: bool,
+        notes: Option<&str>,
         _log: &Logger,
     ) -> Res<()> {
+        if let Some(n) = notes {
+            std::fs::write(
+                self.bare(owner, slug)
+                    .join(format!("stowlock-notes-{tag}.md")),
+                n,
+            )
+            .ctx("release notes")?;
+        }
         let mut v = self.releases(owner, slug);
         v.push((tag.to_string(), prerelease));
         std::fs::write(

@@ -87,12 +87,11 @@ enum Msg {
     Archived(Result<PathBuf, String>),
     Projects(Vec<ProjectInfo>),
     SelfTest(Box<SelfTestReport>, Option<PathBuf>),
-    UpdateChecked(Result<Option<updater::Release>, String>),
+    UpdateChecked(Result<updater::CheckResult, String>),
     UpdateApplied(Result<PathBuf, String>),
     RolledBack(Result<(PathBuf, String), String>),
     SignIn(SignInEvent),
     Tools(Output),
-    Toast(String),
     BugDownloaded(Result<Option<PathBuf>, String>),
     Done,
 }
@@ -152,6 +151,11 @@ struct Session {
     run_cmd: String,
     pass_env: bool,
     confirm: bool,
+    /// When the review window opened; its push button ignores clicks for
+    /// half a second so a double-click can't push by accident.
+    confirm_at: Option<std::time::Instant>,
+    /// "I understand this will be public" for a new public repo.
+    public_ack: bool,
     outcome: Option<PushOutcome>,
     show_changes: bool,
     /// Version found in the zip (Archive Only), and whether `tag` was filled from it.
@@ -187,6 +191,8 @@ impl Session {
             run_cmd: String::new(),
             pass_env: false,
             confirm: false,
+            confirm_at: None,
+            public_ack: false,
             outcome: None,
             show_changes: false,
             found_version: None,
@@ -478,8 +484,14 @@ impl App {
     fn save_config(&mut self) {
         if self.config != self.saved_config {
             match self.config.save(&self.paths) {
-                Ok(_) => self.saved_config = self.config.clone(),
-                Err(e) => self.fail(&e, "settings"),
+                Ok(_) => {
+                    self.saved_config = self.config.clone();
+                    HealthState::record(&self.paths, "Settings & state", true, "");
+                }
+                Err(e) => {
+                    HealthState::record(&self.paths, "Settings & state", false, &e);
+                    self.fail(&e, "settings");
+                }
             }
         }
     }
@@ -790,15 +802,7 @@ impl App {
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
             let r = updater::check(&paths, &repo, beta);
-            if manual {
-                if let Ok(None) = &r {
-                    Self::send(
-                        &tx,
-                        &ctx,
-                        Msg::Toast(format!("StowLock {APP_VERSION} is the latest version.")),
-                    );
-                }
-            }
+            let _ = manual;
             Self::send(&tx, &ctx, Msg::UpdateChecked(r));
         });
     }
@@ -1114,32 +1118,35 @@ impl App {
                 self.last_selftest = Some((*r, path));
             }
             Msg::UpdateChecked(r) => match r {
-                Ok(Some(rel)) => {
+                Ok(c) => {
                     HealthState::record(&self.paths, "Self-update", true, "");
-                    self.update = UpdateState::Available(rel);
-                }
-                Ok(None) => {
-                    HealthState::record(&self.paths, "Self-update", true, "");
-                    self.update_note = Some(format!(
-                        "You have the newest {} version ({APP_VERSION}). Checked {}.",
-                        if self.config.beta_updates() {
-                            "beta or stable"
-                        } else {
-                            "stable"
-                        },
-                        chrono::Local::now().format("%H:%M")
-                    ));
-                    if self.update_manual {
-                        self.toast(&format!("You have the newest version ({APP_VERSION})."));
+                    let when = chrono::Local::now().format("%H:%M");
+                    let newest = c.newest_tag.clone().unwrap_or_else(|| "none yet".into());
+                    let how = if c.via_sign_in {
+                        " (through your GitHub sign-in)"
+                    } else {
+                        ""
+                    };
+                    self.update_note = Some(match &c.newer {
+                        Some(rel) => format!("{} is available. You have {APP_VERSION}. Checked {when}{how}.", rel.label()),
+                        None => format!(
+                            "You have the newest version ({APP_VERSION}). Newest on GitHub: {newest}. Checked {when}{how}."
+                        ),
+                    });
+                    match c.newer {
+                        Some(rel) => self.update = UpdateState::Available(rel),
+                        None if self.update_manual => {
+                            self.toast(&format!("You have the newest version ({APP_VERSION})."))
+                        }
+                        None => {}
                     }
                 }
                 Err(e) => {
                     self.log
                         .warn("update", &format!("Update check failed: {e}"));
-                    let first = e.lines().next().unwrap_or("").trim().to_string();
-                    self.update_note = Some(format!("Couldn't check for updates: {first}"));
+                    self.update_note = Some(e.clone());
                     if self.update_manual {
-                        self.toast(&format!("Couldn't check for updates: {first}"));
+                        self.toast(&e);
                     }
                 }
             },
@@ -1198,7 +1205,6 @@ impl App {
                 });
                 self.refresh_env();
             }
-            Msg::Toast(s) => self.toast(&s),
             Msg::BugDownloaded(r) => {
                 self.bug.saving = false;
                 match r {
@@ -2931,10 +2937,11 @@ impl App {
                         let mut recheck = false;
                         let mut report = false;
                         let mut open = false;
+                        let mut copied = false;
                         ui::banner(ui, WARNING(), |ui| {
                             ui.label(ui::semibold("What to do next", 14.5));
                             ui.add(egui::Label::new(
-                                "1. Get a fixed zip (for example, give the test output to your AI) and load it. The failed attempt is kept, never lost.",
+                                "1. Copy for AI, paste it into your AI chat, and load the fixed zip it gives you. The failed attempt is kept, never lost.",
                             ).wrap());
                             ui.add(
                                 egui::Label::new(
@@ -2949,6 +2956,16 @@ impl App {
                                 .wrap(),
                             );
                             ui.horizontal_wrapped(|ui| {
+                                if ui::primary(ui, &ui::with_icon(ui::icon::COPY, "Copy for AI"), true)
+                                    .on_hover_text("Copies the failed tests and their messages, with a request to fix the project")
+                                    .clicked()
+                                {
+                                    let lines: Vec<String> = c.tests.tail.lines().map(|l| l.to_string()).collect();
+                                    let prompt = report::project_fix_prompt(&c.tests.summary, &lines);
+                                    let prompt = report::redact(&prompt, &self.redact_ctx());
+                                    ui.ctx().copy_text(prompt);
+                                    copied = true;
+                                }
                                 pick |=
                                     ui::button(ui, ui::icon::UPLOAD, "Load a fixed zip…").clicked();
                                 open |=
@@ -2962,6 +2979,11 @@ impl App {
                                 "Push anyway: I know why the tests fail and it's safe",
                             );
                         });
+                        if copied {
+                            self.toast(
+                                "Copied. Paste it into your AI chat, then load the fixed zip.",
+                            );
+                        }
                         if pick {
                             self.pick_zip();
                         }
@@ -3041,7 +3063,7 @@ impl App {
             });
             ui.horizontal_wrapped(|ui| {
                 if self.run_child.is_none() {
-                    if ui.button("▶ Run").clicked() {
+                    if ui::button(ui, ui::icon::PLAY, "Run").clicked() {
                         match pipeline::run_in_terminal(
                             &st.dir,
                             &self.session.run_cmd,
@@ -3057,21 +3079,32 @@ impl App {
                             }
                         }
                     }
-                } else if ui.button("■ Stop").clicked() {
+                } else if ui::button(ui, ui::icon::X, "Stop").clicked() {
                     if let Some(mut c) = self.run_child.take() {
                         let _ = c.kill();
                     }
                 }
-                if ui.button("Open Folder").clicked() {
+                if ui::button(ui, ui::icon::FOLDER_OPEN, "Open folder").clicked() {
                     let _ = proc::xdg_open(&st.dir.display().to_string());
                 }
-                if ui.button("Open in Editor").clicked() {
-                    if let Err(e) = pipeline::open_in_editor(&st.dir) {
-                        self.fail(&e, "editor");
+                if ui::button(ui, ui::icon::PEN, "Open in editor").clicked() {
+                    match pipeline::open_in_editor(&st.dir) {
+                        Ok(_) => HealthState::record(&self.paths, "Run/Editor", true, ""),
+                        Err(e) => {
+                            HealthState::record(&self.paths, "Run/Editor", false, &e);
+                            self.fail(&e, "editor");
+                        }
                     }
                 }
                 if ui
-                    .add_enabled(self.busy.is_none(), egui::Button::new("↻ Re-check"))
+                    .add_enabled(
+                        self.busy.is_none(),
+                        egui::Button::new(ui::semibold(
+                            ui::with_icon(ui::icon::REFRESH, "Re-check"),
+                            14.0,
+                        ))
+                        .min_size(egui::vec2(0.0, 36.0)),
+                    )
                     .clicked()
                 {
                     self.recheck();
@@ -3300,63 +3333,9 @@ impl App {
                 {
                     blockers.push("Already pushed".into());
                 }
-                let changes = stage
-                    .changes
-                    .as_ref()
-                    .map(|c| format!(", {}", c.short()))
-                    .unwrap_or_default();
-                let tag = if s.tag.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        ", {} {}{}",
-                        s.channel.label(),
-                        s.tag.trim(),
-                        if s.channel == Channel::Beta {
-                            " (pre-release)"
-                        } else {
-                            ""
-                        }
-                    )
-                };
-                let vis = if s.mode == Mode::New {
-                    if s.private {
-                        " (private)"
-                    } else {
-                        " (PUBLIC)"
-                    }
-                } else {
-                    ""
-                };
-                let summary = format!(
-                    "Will push to github.com/{}/{}{vis}: {}{tag}{changes}",
-                    s.owner,
-                    s.slug,
-                    s.mode.badge()
-                );
-                if s.confirm {
-                    ui.add(egui::Label::new(RichText::new(&summary).strong()).wrap());
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Back").clicked() {
-                            self.session.confirm = false;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let ok = busy.is_none() && blockers.is_empty();
-                            let go = ui::primary(ui, "Confirm push", ok).clicked()
-                                || (ok
-                                    && ui.input(|i| {
-                                        i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)
-                                    }));
-                            if go {
-                                self.push();
-                            }
-                        });
-                    });
-                    return;
-                }
+                let pushed = s.outcome.as_ref().map(|o| !o.nothing_to_push).unwrap_or(false);
                 ui.horizontal(|ui| {
-                    Self::action_text(ui, BTN, |ui| {
+                    Self::action_text(ui, BTN + 140.0, |ui| {
                         if let Some(b) = &busy {
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -3365,27 +3344,296 @@ impl App {
                                     self.cancel.store(true, Ordering::Relaxed);
                                 }
                             });
-                        } else if blockers.is_empty() {
-                            ui.add(egui::Label::new(ui::muted(&summary).size(12.5)).wrap());
-                        } else {
-                            for b in blockers.iter().take(3) {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(format!("• {b}")).color(WARNING()).size(12.5),
-                                    )
-                                    .wrap(),
-                                );
+                        } else if pushed {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(ui::icon::CIRCLE_CHECK).size(16.0).color(ui::SUCCESS()));
+                                ui.add(egui::Label::new(ui::semibold(
+                                    format!("Pushed to github.com/{}/{}{}", s.owner, s.slug,
+                                        s.outcome.as_ref().and_then(|o| o.tag.clone()).map(|t| format!(" · {t}")).unwrap_or_default()),
+                                    14.0,
+                                )).truncate());
+                            });
+                        } else if s.checks.is_none() {
+                            ui.label(ui::muted("Run checks first: Stage & check tests the project before anything is pushed."));
+                        } else if let Some(b) = blockers.first() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(ui::icon::CIRCLE_X).size(16.0).color(ERROR()));
+                                ui.add(egui::Label::new(RichText::new(format!("Blocked: {b}")).color(ERROR())).wrap());
+                            });
+                            for more in blockers.iter().skip(1).take(2) {
+                                ui.add(egui::Label::new(ui::muted(format!("Also: {more}")).size(12.5)).wrap());
                             }
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(ui::icon::CIRCLE_CHECK).size(16.0).color(ui::SUCCESS()));
+                                ui.label(ui::semibold("Ready to push", 14.0).color(ui::SUCCESS()));
+                                ui.label(ui::muted(format!("· github.com/{}/{}", s.owner, s.slug)).size(12.5));
+                            });
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if pushed {
+                            if ui::primary(ui, "Stage another zip", busy.is_none()).clicked() {
+                                self.pick_zip();
+                            }
+                            if ui::button(ui, ui::icon::EXTERNAL, "View on GitHub").clicked() {
+                                let url = format!("https://github.com/{}/{}", s.owner, s.slug);
+                                let _ = proc::xdg_open(&url);
+                            }
+                            return;
+                        }
                         let ok = busy.is_none() && blockers.is_empty();
-                        if ui::primary(ui, "Push to GitHub", ok).clicked() {
+                        if ui::primary(ui, &ui::with_icon(ui::icon::UPLOAD, "Push to GitHub…"), ok).clicked() {
                             self.session.confirm = true;
+                            self.session.confirm_at = Some(std::time::Instant::now());
+                            self.session.public_ack = false;
                         }
                     });
                 });
             });
+        if self.session.confirm {
+            self.push_review(ctx);
+        }
+    }
+
+    /// The "Ready to push" window: everything about the push in one place,
+    /// and a confirm button that says exactly what it will do.
+    fn push_review(&mut self, ctx: &egui::Context) {
+        let s = self.session.clone();
+        let Some(stage) = s.stage.clone() else {
+            self.session.confirm = false;
+            return;
+        };
+        let public_new = s.mode == Mode::New && !s.private;
+        let tag = s.tag.trim().to_string();
+        let armed = s
+            .confirm_at
+            .map(|t| t.elapsed().as_secs_f32() >= 0.5)
+            .unwrap_or(true);
+        if !armed {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let mut close = false;
+        let mut go = false;
+        let mut show_files = false;
+        let modal = egui::Modal::new(egui::Id::new("push_review")).show(ctx, |ui| {
+            ui.set_width(520.0_f32.min(ctx.screen_rect().width() - 80.0));
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(r, egui::CornerRadius::same(10), ui::ACCENT_SOFT());
+                ui.painter().text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    ui::icon::UPLOAD,
+                    egui::FontId::proportional(18.0),
+                    ACCENT(),
+                );
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.label(ui::semibold("Ready to push", 18.0));
+                    ui.label(ui::muted("Check the details, then push.").size(13.0));
+                });
+            });
+            ui.add_space(8.0);
+            egui::Grid::new("review")
+                .num_columns(2)
+                .spacing([14.0, 10.0])
+                .max_col_width(400.0)
+                .show(ui, |ui| {
+                    ui.label(ui::muted("Where"));
+                    ui.add(
+                        egui::Label::new(ui::mono(format!("github.com/{}/{}", s.owner, s.slug)))
+                            .truncate(),
+                    );
+                    ui.end_row();
+                    ui.label(ui::muted("Type"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui::badge(
+                            ui,
+                            if s.mode == Mode::New {
+                                "New repo"
+                            } else {
+                                "Update"
+                            },
+                            ui::SUCCESS(),
+                        );
+                        if s.mode == Mode::New {
+                            if s.private {
+                                ui::badge(ui, "Private", MUTED());
+                            } else {
+                                ui::badge(ui, "Public", WARNING());
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(ui::muted("Version"));
+                    ui.label(if tag.is_empty() {
+                        "No release (code only)".to_string()
+                    } else if s.channel == Channel::Beta {
+                        format!("{tag} · Beta (pre-release)")
+                    } else {
+                        format!("{tag} · Stable")
+                    });
+                    ui.end_row();
+                    ui.label(ui::muted("Changes"));
+                    ui.horizontal_wrapped(|ui| match &stage.changes {
+                        Some(c) if c.total() > 0 => {
+                            ui.label(format!(
+                                "{} file{}:",
+                                c.total(),
+                                if c.total() == 1 { "" } else { "s" }
+                            ));
+                            if !c.added.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("{} added", c.added.len()))
+                                        .color(ui::SUCCESS()),
+                                );
+                            }
+                            if !c.changed.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("{} changed", c.changed.len()))
+                                        .color(WARNING()),
+                                );
+                            }
+                            if !c.removed.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("{} removed", c.removed.len()))
+                                        .color(ERROR()),
+                                );
+                            }
+                            show_files = ui
+                                .link(if s.show_changes {
+                                    "hide list"
+                                } else {
+                                    "show list"
+                                })
+                                .clicked();
+                        }
+                        Some(_) => {
+                            ui.label("No file changes (a new version tag only)");
+                        }
+                        None => {
+                            ui.label(format!("{} files (first push)", stage.files));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(ui::muted("Checks"));
+                    let tests = s
+                        .checks
+                        .as_ref()
+                        .map(|c| c.tests.summary.clone())
+                        .unwrap_or_default();
+                    ui.horizontal_wrapped(|ui| {
+                        if s.override_tests {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} Tests failed, pushing anyway",
+                                    ui::icon::TRIANGLE_ALERT
+                                ))
+                                .color(WARNING()),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} {}",
+                                    ui::icon::CIRCLE_CHECK,
+                                    if tests.is_empty() {
+                                        "Passed".to_string()
+                                    } else {
+                                        tests
+                                    }
+                                ))
+                                .color(ui::SUCCESS()),
+                            );
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(ui::muted("After"));
+                    let mut after = Vec::new();
+                    if !tag.is_empty() {
+                        after.push("release created");
+                    }
+                    if s.archive_after {
+                        after.push(if s.archive_move {
+                            "zip moved to the archive"
+                        } else {
+                            "zip copied to the archive"
+                        });
+                    }
+                    ui.label(if after.is_empty() {
+                        "Nothing else".to_string()
+                    } else {
+                        util::capitalize(&after.join(" · "))
+                    });
+                    ui.end_row();
+                });
+            if s.show_changes {
+                if let Some(c) = &stage.changes {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .id_salt("review_files")
+                        .show(ui, |ui| {
+                            for (list, sign, col) in [
+                                (&c.added, "+", ui::SUCCESS()),
+                                (&c.changed, "~", WARNING()),
+                                (&c.removed, "−", ERROR()),
+                            ] {
+                                for f in list.iter() {
+                                    ui.label(ui::mono(format!("{sign} {f}")).color(col));
+                                }
+                            }
+                        });
+                }
+            }
+            if public_new {
+                ui.add_space(4.0);
+                ui::banner(ui, WARNING(), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            "This creates a public repository: anyone can see this code.",
+                        )
+                        .wrap(),
+                    );
+                    ui.checkbox(
+                        &mut self.session.public_ack,
+                        "I understand this will be public",
+                    );
+                });
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui::button(ui, "", "Back").clicked() {
+                    close = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if tag.is_empty() {
+                        format!("Push to {}", s.slug)
+                    } else {
+                        format!("Push {tag} to {}", s.slug)
+                    };
+                    let ready = armed && (!public_new || self.session.public_ack);
+                    let clicked =
+                        ui::primary(ui, &ui::with_icon(ui::icon::UPLOAD, &label), ready).clicked();
+                    let keyed =
+                        ready && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+                    if clicked || keyed {
+                        go = true;
+                    }
+                });
+            });
+        });
+        if show_files {
+            self.session.show_changes = !self.session.show_changes;
+        }
+        if modal.should_close() || close {
+            self.session.confirm = false;
+        }
+        if go {
+            self.session.confirm = false;
+            self.push();
+        }
     }
 
     fn projects_tab(&mut self, ui: &mut egui::Ui) {
@@ -4298,5 +4546,175 @@ impl App {
         if !open {
             self.show_uninstall = false;
         }
+    }
+}
+
+/// Click-through tests: the real app, driven by clicking its buttons (through
+/// the accessibility tree, as a screen reader would). GitHub is the local
+/// stand-in, so nothing ever reaches the real GitHub.
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+
+    fn wait_until(h: &mut Harness<'_, App>, what: &str, f: impl Fn(&App) -> bool) {
+        for _ in 0..1500 {
+            h.step();
+            if f(h.state()) {
+                h.step();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn steps(h: &mut Harness<'_, App>, n: usize) {
+        for _ in 0..n {
+            h.step();
+        }
+    }
+
+    /// Click the button whose name contains `text`.
+    fn click_button(h: &mut Harness<'_, App>, text: &str) {
+        let n = h
+            .get_all_by_label_contains(text)
+            .find(|n| {
+                n.role() == egui::accesskit::Role::Button
+                    || n.role() == egui::accesskit::Role::CheckBox
+            })
+            .unwrap_or_else(|| panic!("no button named like \"{text}\""));
+        n.click();
+        steps(h, 2);
+    }
+
+    fn click_nav(h: &mut Harness<'_, App>, label: &str) {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, label)
+            .click();
+        steps(h, 3);
+    }
+
+    #[test]
+    fn click_through_the_app() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = AppPaths::under(&d.path().join("app"));
+        paths.ensure().unwrap();
+        let mut cfg = Config::load(&paths);
+        cfg.workspace_dir = d.path().join("ws").display().to_string();
+        cfg.check_for_updates = false;
+        cfg.theme = "dark".into();
+        cfg.fallback_git_name = "StowLock Test".into();
+        cfg.fallback_git_email = "test@example.invalid".into();
+        cfg.save(&paths).unwrap();
+        let zip = crate::fixtures::Sandbox::new(&d.path().join("sb"))
+            .unwrap()
+            .zip(
+                "demo-app-v0.2.0.zip",
+                &[("main.py", b"print('hi')\n", 0o644)],
+            );
+
+        let p2 = paths.clone();
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1280.0, 860.0))
+            .build_eframe(move |cc| App::new(cc, p2, Logger::new(None), None, None));
+        // Let the start-up checks finish, then sign in to the stand-in GitHub.
+        wait_until(&mut h, "start-up checks", |a| a.env.checked);
+        {
+            let a = h.state_mut();
+            a.env.git = true;
+            a.env.gh = true;
+            a.env.login = Some("selftest-user".into());
+            a.gh = Arc::new(crate::github::FakeGh::new(&d.path().join("gh")));
+        }
+        steps(&mut h, 2);
+
+        // Every screen opens from the sidebar.
+        for (nav, marker) in [
+            ("Projects", "projects in"),
+            ("History", "Nothing pushed yet"),
+            ("Health", "Run self-test"),
+            ("Bug report", "Also hide these words"),
+            ("Settings", "Update channel"),
+        ] {
+            click_nav(&mut h, nav);
+            assert!(
+                h.query_by_label_contains(marker).is_some(),
+                "{nav} screen didn't show \"{marker}\""
+            );
+        }
+
+        // Settings: the update channel and the theme switch.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Stable")
+            .click();
+        steps(&mut h, 2);
+        assert_eq!(h.state().config.update_channel, "stable");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Light")
+            .click();
+        steps(&mut h, 3);
+        assert!(ui::is_light(), "Light theme didn't apply");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Dark")
+            .click();
+        steps(&mut h, 3);
+        assert!(!ui::is_light());
+
+        // Stage & check a zip.
+        click_nav(&mut h, "Stage");
+        h.state_mut().load_zip(zip);
+        steps(&mut h, 3);
+        click_button(&mut h, "Stage & check");
+        wait_until(&mut h, "checks", |a| {
+            a.session.checks.is_some() && a.busy.is_none()
+        });
+        assert!(
+            h.query_by_label_contains("Ready to push").is_some(),
+            "status label"
+        );
+        h.state_mut().session.private = false; // a new public repo
+
+        // The review window opens; an instant second click can't push.
+        click_button(&mut h, "Push to GitHub");
+        steps(&mut h, 2);
+        assert!(h.state().session.confirm, "review window didn't open");
+        assert!(h
+            .query_by_label_contains("I understand this will be public")
+            .is_some());
+        click_button(&mut h, "to demo-app");
+        steps(&mut h, 2);
+        assert!(
+            h.state().session.outcome.is_none(),
+            "pushed on a double-click"
+        );
+        // Armed after half a second, but a public repo still needs the tick.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        steps(&mut h, 2);
+        click_button(&mut h, "to demo-app");
+        steps(&mut h, 2);
+        assert!(
+            h.state().session.outcome.is_none(),
+            "pushed a public repo without the tick"
+        );
+        click_button(&mut h, "I understand this will be public");
+        steps(&mut h, 2);
+        click_button(&mut h, "to demo-app");
+        wait_until(&mut h, "push", |a| {
+            a.session.outcome.is_some() && a.busy.is_none()
+        });
+
+        // Finished state: no "already exists" warning, the next steps instead.
+        assert!(h.query_by_label_contains("View on GitHub").is_some());
+        assert!(h.query_by_label_contains("Stage another zip").is_some());
+        assert!(h.query_by_label_contains("already exists").is_none());
+        assert!(
+            d.path().join("gh").exists(),
+            "nothing reached the stand-in GitHub"
+        );
+
+        // The push shows in History.
+        click_nav(&mut h, "History");
+        assert!(
+            h.query_by_label_contains("demo-app").is_some(),
+            "History is empty"
+        );
     }
 }

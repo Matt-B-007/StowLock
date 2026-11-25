@@ -196,6 +196,15 @@ pub fn move_file(from: &Path, to: &Path) -> Res<()> {
     fs::remove_file(from).ctx("removing original file")
 }
 
+/// "release created" -> "Release created".
+pub fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -735,11 +735,19 @@ pub fn push(ctx: &Ctx, req: &PushRequest) -> Res<PushOutcome> {
                 )?;
             }
             git::git_ok(&dir, &["push", "origin", &tag], log, "release")?;
+            let notes = crate::version::changelog_notes(&dir, &tag);
+            if notes.is_some() {
+                log.info(
+                    "release",
+                    "Using the CHANGELOG notes for this version as the release notes",
+                );
+            }
             if let Err(e) = ctx.gh.create_release(
                 &req.owner,
                 &req.slug,
                 &tag,
                 req.channel == Channel::Beta,
+                notes.as_deref(),
                 log,
             ) {
                 if !e.to_ascii_lowercase().contains("already exists") {

@@ -128,20 +128,94 @@ fn fetch(url: &str, out: Option<&Path>, secs: u64) -> Res<String> {
     }
 }
 
-/// The newest release for this channel, if newer than this build.
-pub fn check(paths: &AppPaths, repo: &str, beta: bool) -> Res<Option<Release>> {
+/// The newest release on GitHub for this channel, newer or not.
+pub fn newest_tag(json: &str, beta: bool) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let parse = |s: &str| semver::Version::parse(s.trim().trim_start_matches('v')).ok();
+    v.as_array()?
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?.to_string();
+            let ver = parse(&tag)?;
+            (beta || ver.pre.is_empty()).then_some((ver, tag))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, t)| t)
+}
+
+/// What an update check found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckResult {
+    /// A newer release this channel may offer.
+    pub newer: Option<Release>,
+    /// The newest release on GitHub for this channel (may be this version).
+    pub newest_tag: Option<String>,
+    /// The anonymous check was refused, so the user's GitHub sign-in was used.
+    pub via_sign_in: bool,
+}
+
+/// Turn a failed download into words a person can act on.
+pub fn explain_fetch_error(err: &str) -> String {
+    let e = err.to_ascii_lowercase();
+    if e.contains("404") {
+        "StowLock couldn't see its releases on GitHub. If the StowLock repository is private, sign in to GitHub (Settings) so updates can use your account.".into()
+    } else if e.contains("403") || e.contains("429") || e.contains("rate limit") {
+        "GitHub is limiting requests from your network right now. Try again in an hour.".into()
+    } else if e.contains("resolve host") || e.contains("connect") || e.contains("timed out") {
+        "Couldn't reach GitHub. Check your internet connection and try again.".into()
+    } else if e.contains("curl is needed") {
+        err.to_string()
+    } else {
+        format!(
+            "Couldn't check for updates ({}).",
+            err.lines().next().unwrap_or("").trim()
+        )
+    }
+}
+
+/// The releases list: anonymously first (works for anyone with a public repo),
+/// then through the user's GitHub sign-in if GitHub refused (a private repo).
+fn releases_json(repo: &str) -> Res<(String, bool)> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=30");
+    match fetch(&url, None, 30) {
+        Ok(j) => Ok((j, false)),
+        Err(e) => {
+            if proc::which("gh").is_some() {
+                let o = proc::run(
+                    "gh",
+                    &["api", &format!("repos/{repo}/releases?per_page=30")],
+                    &Opts::default_timeout().with_timeout(30),
+                );
+                if o.ok() {
+                    return Ok((o.stdout, true));
+                }
+            }
+            Err(explain_fetch_error(&e))
+        }
+    }
+}
+
+/// Check GitHub for this channel's newest release.
+pub fn check(paths: &AppPaths, repo: &str, beta: bool) -> Res<CheckResult> {
     let _ = util::write_json(
         &last_check_file(paths),
         &LastCheck {
             at: chrono::Local::now().timestamp(),
         },
     );
-    let json = fetch(
-        &format!("https://api.github.com/repos/{repo}/releases?per_page=30"),
-        None,
-        30,
-    )?;
-    Ok(pick_from_releases(&json, APP_VERSION, beta))
+    let (json, via_sign_in) = releases_json(repo)?;
+    if serde_json::from_str::<serde_json::Value>(&json)
+        .map(|v| !v.is_array())
+        .unwrap_or(true)
+    {
+        return Err("GitHub sent an unexpected answer. Try again later.".into());
+    }
+    Ok(CheckResult {
+        newer: pick_from_releases(&json, APP_VERSION, beta),
+        newest_tag: newest_tag(&json, beta),
+        via_sign_in,
+    })
 }
 
 // ---- Going back to the previous version ----
@@ -259,10 +333,35 @@ pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathB
     let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let bin = dir.join(ASSET);
     let sha_file = dir.join(format!("{ASSET}.sha256"));
-    fetch(&format!("{base}/{ASSET}"), Some(&bin), 300)
-        .map_err(|e| format!("The download failed: {e}"))?;
-    fetch(&format!("{base}/{ASSET}.sha256"), Some(&sha_file), 60)
-        .map_err(|_| "The release has no checksum file, so it wasn't installed.".to_string())?;
+    let direct = fetch(&format!("{base}/{ASSET}"), Some(&bin), 300)
+        .and_then(|_| fetch(&format!("{base}/{ASSET}.sha256"), Some(&sha_file), 60));
+    if let Err(e) = direct {
+        // A private repo: download through the user's GitHub sign-in instead.
+        let d = dir.display().to_string();
+        let pattern = format!("{ASSET}*");
+        let o = proc::run(
+            "gh",
+            &[
+                "release",
+                "download",
+                tag,
+                "--repo",
+                repo,
+                "--pattern",
+                &pattern,
+                "--dir",
+                &d,
+                "--clobber",
+            ],
+            &Opts::default_timeout().with_timeout(300),
+        );
+        if !o.ok() {
+            return Err(format!("The download failed. {}", explain_fetch_error(&e)));
+        }
+    }
+    if !sha_file.exists() {
+        return Err("The release has no checksum file, so it wasn't installed.".into());
+    }
     log.info("update", &format!("Downloaded StowLock {tag}"));
     let sha = std::fs::read_to_string(&sha_file)
         .map_err(|_| "The release has no checksum file, so it wasn't installed.".to_string())?;
@@ -328,6 +427,31 @@ mod tests {
         assert_eq!(
             pick_from_releases("<html>rate limited</html>", "0.1.0", true),
             None
+        );
+    }
+
+    #[test]
+    fn newest_on_github_per_channel() {
+        let json = r#"[{"tag_name":"v0.1.0-beta.4","prerelease":true,"draft":false},
+                       {"tag_name":"v0.0.9","prerelease":false,"draft":false},
+                       {"tag_name":"v0.2.0","prerelease":false,"draft":true}]"#;
+        assert_eq!(newest_tag(json, true).as_deref(), Some("v0.1.0-beta.4"));
+        assert_eq!(newest_tag(json, false).as_deref(), Some("v0.0.9"));
+    }
+
+    #[test]
+    fn errors_are_explained() {
+        assert!(
+            explain_fetch_error("curl: (22) The requested URL returned error: 404")
+                .contains("private")
+        );
+        assert!(
+            explain_fetch_error("curl: (22) The requested URL returned error: 403")
+                .contains("limiting")
+        );
+        assert!(
+            explain_fetch_error("curl: (6) Could not resolve host: api.github.com")
+                .contains("internet")
         );
     }
 

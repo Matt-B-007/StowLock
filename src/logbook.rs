@@ -82,7 +82,11 @@ fn is_progress(line: &str) -> bool {
 
 /// Lines worth keeping however long the output is (results, failures).
 pub(crate) fn is_important(line: &str) -> bool {
-    let l = line.to_ascii_lowercase();
+    let l = line.trim().to_ascii_lowercase();
+    // A passing test is never important, even if its name says "failed".
+    if l.ends_with("... ok") || l.ends_with(" ok") && l.starts_with("test ") {
+        return false;
+    }
     l.contains("test result")
         || l.contains("error")
         || l.contains("warning:")
@@ -94,6 +98,56 @@ pub(crate) fn is_important(line: &str) -> bool {
         || l.starts_with("tests:")
         || l.starts_with("ok ")
         || l.starts_with("fail")
+        || is_failure_message(&l)
+}
+
+/// The lines that say *what* failed: assertion messages and their values.
+fn is_failure_message(l: &str) -> bool {
+    l.starts_with("assertion")
+        || l.starts_with("left:")
+        || l.starts_with("right:")
+        || l.starts_with("e  ")
+        || l.starts_with("expected")
+        || l.starts_with("received")
+        || l.contains("_test.go:")
+        || l.starts_with("--- fail")
+}
+
+/// A line that means something went wrong (logged as a warning). Passing
+/// results such as "test result: ok" are kept, but as normal lines.
+pub(crate) fn is_failure_line(line: &str) -> bool {
+    let l = line.trim().to_ascii_lowercase();
+    if l.ends_with("... ok") || l.starts_with("test result: ok") {
+        return false;
+    }
+    (l.contains("failed") && !l.contains(" 0 failed"))
+        || l.contains("panicked")
+        || l.contains("error")
+        || l.starts_with("---- ")
+        || l.starts_with("failures:")
+        || is_failure_message(&l)
+}
+
+/// Which lines to keep from test output: the important ones, plus up to four
+/// lines after each "panicked at" (the message saying what went wrong).
+pub(crate) fn mark_important(lines: &[&str]) -> Vec<bool> {
+    let mut keep = vec![false; lines.len()];
+    let mut after_panic = 0usize;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.is_empty() {
+            after_panic = 0;
+        }
+        if is_important(t) || (after_panic > 0 && !t.is_empty()) {
+            keep[i] = true;
+        }
+        if t.contains("panicked at") {
+            after_panic = 4;
+        } else {
+            after_panic = after_panic.saturating_sub(1);
+        }
+    }
+    keep
 }
 
 /// Shorten long command output for the log: build progress lines collapse
@@ -122,7 +176,14 @@ pub fn shorten(text: &str) -> Vec<String> {
     }
     out.extend(rest[..10].iter().map(|s| s.to_string()));
     let middle = &rest[10..rest.len() - 30];
-    let kept: Vec<&&str> = middle.iter().filter(|l| is_important(l)).take(20).collect();
+    let marks = mark_important(middle);
+    let kept: Vec<&&str> = middle
+        .iter()
+        .zip(marks)
+        .filter(|(_, k)| *k)
+        .map(|(l, _)| l)
+        .take(40)
+        .collect();
     out.push(format!(
         "[{} line{} hidden]",
         middle.len() - kept.len(),
@@ -219,7 +280,7 @@ impl Logger {
         if !text.is_empty() {
             for l in shorten(&text) {
                 // Only failure lines are warnings; the rest is normal output.
-                let line_lvl = if !out.ok() && is_important(&l) {
+                let line_lvl = if !out.ok() && is_failure_line(&l) {
                     Level::Warn
                 } else {
                     Level::Info

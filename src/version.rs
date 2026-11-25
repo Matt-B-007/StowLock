@@ -178,3 +178,91 @@ mod tests {
         assert!(validate("v0.2.0-beta.1", Channel::Beta, "v", &existing).is_ok());
     }
 }
+
+/// The project's notes for `tag` from its CHANGELOG (CHANGELOG.md, CHANGES.md,
+/// HISTORY.md, any case), used as the GitHub release notes. A heading like
+/// "## [0.2.0] - 2026-11-24" or "## v0.2.0" starts the section; it ends at the
+/// next heading of the same or a higher level.
+pub fn changelog_notes(dir: &std::path::Path, tag: &str) -> Option<String> {
+    let version = tag.trim().trim_start_matches('v');
+    if version.is_empty() {
+        return None;
+    }
+    let file = std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+        matches!(
+            n.as_str(),
+            "changelog.md" | "changes.md" | "history.md" | "changelog"
+        )
+        .then(|| e.path())
+    })?;
+    let meta = std::fs::metadata(&file).ok()?;
+    if meta.len() > 2_000_000 {
+        return None;
+    }
+    let text = std::fs::read_to_string(&file).ok()?;
+    let ver_re = regex::Regex::new(&format!(
+        r"(^|[^0-9A-Za-z.])v?{}($|[^0-9A-Za-z.\-])",
+        regex::escape(version)
+    ))
+    .ok()?;
+    let mut level = 0usize;
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        let is_heading = hashes > 0 && line[hashes..].starts_with(' ');
+        if level == 0 {
+            if is_heading && ver_re.is_match(&line[hashes..]) {
+                level = hashes;
+            }
+            continue;
+        }
+        if is_heading && hashes <= level {
+            break;
+        }
+        out.push(line);
+    }
+    let notes = out.join("\n").trim().to_string();
+    if notes.is_empty() {
+        return None;
+    }
+    let notes: String = notes.chars().take(20_000).collect();
+    Some(notes)
+}
+
+#[cfg(test)]
+mod changelog_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_section_for_a_version() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("CHANGELOG.md"),
+            "# Changelog\n\n## [Unreleased]\n- wip\n\n## [0.1.0-beta.4] - 2026-11-24\n### Added\n- Push review step\n\n### Fixed\n- Updates work for private repos\n\n## [0.1.0] - 2026-10-01\n- First\n",
+        )
+        .unwrap();
+        let n = changelog_notes(d.path(), "v0.1.0-beta.4").unwrap();
+        assert!(n.starts_with("### Added"));
+        assert!(n.contains("Updates work for private repos"));
+        assert!(!n.contains("First"), "stops at the next version");
+        // 0.1.0 must not match the 0.1.0-beta.4 heading.
+        assert_eq!(
+            changelog_notes(d.path(), "v0.1.0").as_deref(),
+            Some("- First")
+        );
+        assert_eq!(changelog_notes(d.path(), "v9.9.9"), None);
+    }
+
+    #[test]
+    fn no_changelog_means_no_notes() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(changelog_notes(d.path(), "v1.0.0"), None);
+        std::fs::write(d.path().join("changes.md"), "## v1.0.0\n\n").unwrap();
+        assert_eq!(
+            changelog_notes(d.path(), "v1.0.0"),
+            None,
+            "an empty section"
+        );
+    }
+}

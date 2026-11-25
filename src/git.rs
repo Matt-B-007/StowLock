@@ -66,6 +66,7 @@ impl Changes {
             self.removed.len()
         )
     }
+    #[allow(dead_code)]
     pub fn short(&self) -> String {
         format!(
             "+{} ~{} −{}",

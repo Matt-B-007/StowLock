@@ -27,9 +27,16 @@ if [ "$CHANNEL" = "stable" ]; then
 else
   API="https://api.github.com/repos/$REPO/releases?per_page=1"
 fi
-TAG="$(curl -fsSL "$API" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')" \
-  || fail "Couldn't reach GitHub to find the newest release."
-[ -n "$TAG" ] || fail "Couldn't find a release to install."
+JSON="$(curl -fsSL "$API" 2>"${TMPDIR:-/tmp}/stowlock-install-err")" || {
+  ERR="$(cat "${TMPDIR:-/tmp}/stowlock-install-err" 2>/dev/null)"
+  case "$ERR" in
+    *404*) fail "GitHub didn't find StowLock's releases. The repository may be private or have no releases yet." ;;
+    *403*|*429*) fail "GitHub is limiting requests from your network right now. Try again in an hour." ;;
+    *) fail "Couldn't reach GitHub. Check your internet connection and try again." ;;
+  esac
+}
+TAG="$(printf '%s\n' "$JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+[ -n "$TAG" ] || fail "There's no StowLock release to install yet."
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
