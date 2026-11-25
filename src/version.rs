@@ -120,6 +120,87 @@ pub fn validate(
     Ok(())
 }
 
+/// The newest release that `tag` would count as older than (or equal to),
+/// if any. A tag like v0.1.1-beta.1 counts as older than v0.1.1, so nobody on
+/// v0.1.1 would ever be offered it.
+pub fn newer_existing(tag: &str, prefix: &str, existing: &[String]) -> Option<String> {
+    let v = parse_tag(tag, prefix)?;
+    existing
+        .iter()
+        .filter_map(|e| parse_tag(e, prefix).map(|ev| (ev, e.clone())))
+        .filter(|(ev, e)| *ev >= v && e.trim() != tag.trim())
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, e)| e)
+}
+
+/// The newest stable and newest beta among the tags (for "Latest on GitHub").
+pub fn latest(existing: &[String], prefix: &str) -> (Option<String>, Option<String>) {
+    let mut stable: Option<(Version, String)> = None;
+    let mut beta: Option<(Version, String)> = None;
+    for e in existing {
+        if let Some(v) = parse_tag(e, prefix) {
+            let slot = if v.pre.is_empty() {
+                &mut stable
+            } else {
+                &mut beta
+            };
+            if slot.as_ref().map(|(sv, _)| v > *sv).unwrap_or(true) {
+                *slot = Some((v, e.clone()));
+            }
+        }
+    }
+    // A beta older than the newest stable isn't interesting any more.
+    if let (Some((sv, _)), Some((bv, _))) = (&stable, &beta) {
+        if bv < sv {
+            beta = None;
+        }
+    }
+    (stable.map(|x| x.1), beta.map(|x| x.1))
+}
+
+/// The next "fix" and "feature" versions after the newest release, on the
+/// given channel: after v0.1.1, a beta is v0.1.2-beta.1 / v0.2.0-beta.1 and a
+/// stable is v0.1.2 / v0.2.0. A beta of an unreleased version continues its
+/// numbering instead (…-beta.2), and a stable finishes it.
+pub fn next_choices(existing: &[String], channel: Channel, prefix: &str) -> (String, String) {
+    let versions: Vec<Version> = existing
+        .iter()
+        .filter_map(|t| parse_tag(t, prefix))
+        .collect();
+    let base = versions
+        .iter()
+        .filter(|v| v.pre.is_empty())
+        .max()
+        .cloned()
+        .unwrap_or_else(|| Version::new(0, 0, 0));
+    let fix = Version::new(base.major, base.minor, base.patch + 1);
+    let feature = if base.major == 0 && base.minor == 0 && base.patch == 0 {
+        Version::new(0, 1, 0)
+    } else {
+        Version::new(base.major, base.minor + 1, 0)
+    };
+    let fmt = |mut v: Version| -> String {
+        if channel == Channel::Beta {
+            // Continue an open beta of the same version.
+            let n = versions
+                .iter()
+                .filter(|o| {
+                    !o.pre.is_empty()
+                        && o.major == v.major
+                        && o.minor == v.minor
+                        && o.patch == v.patch
+                })
+                .filter_map(beta_number)
+                .max()
+                .map(|n| n + 1)
+                .unwrap_or(1);
+            v.pre = Prerelease::new(&format!("beta.{n}")).unwrap();
+        }
+        format!("{prefix}{v}")
+    };
+    (fmt(fix), fmt(feature))
+}
+
 pub fn default_commit_message(is_new: bool, tag: &str) -> String {
     if is_new {
         "Initial commit".into()
@@ -228,6 +309,70 @@ pub fn changelog_notes(dir: &std::path::Path, tag: &str) -> Option<String> {
     }
     let notes: String = notes.chars().take(20_000).collect();
     Some(notes)
+}
+
+#[cfg(test)]
+mod next_tests {
+    use super::*;
+
+    fn tags(t: &[&str]) -> Vec<String> {
+        t.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn older_tags_are_caught() {
+        let t = tags(&["v0.1.0", "v0.1.1"]);
+        assert_eq!(
+            newer_existing("v0.1.1-beta.1", "v", &t).as_deref(),
+            Some("v0.1.1")
+        );
+        assert_eq!(
+            newer_existing("v0.1.0-beta.9", "v", &t).as_deref(),
+            Some("v0.1.1")
+        );
+        assert_eq!(newer_existing("v0.1.2-beta.1", "v", &t), None);
+        assert_eq!(newer_existing("v0.2.0", "v", &t), None);
+    }
+
+    #[test]
+    fn next_fix_and_feature() {
+        let t = tags(&["v0.1.0", "v0.1.1"]);
+        assert_eq!(
+            next_choices(&t, Channel::Beta, "v"),
+            ("v0.1.2-beta.1".into(), "v0.2.0-beta.1".into())
+        );
+        assert_eq!(
+            next_choices(&t, Channel::Stable, "v"),
+            ("v0.1.2".into(), "v0.2.0".into())
+        );
+        let open = tags(&["v0.1.1", "v0.2.0-beta.1", "v0.2.0-beta.2"]);
+        assert_eq!(
+            next_choices(&open, Channel::Beta, "v").1,
+            "v0.2.0-beta.3",
+            "continues the open beta"
+        );
+        assert_eq!(
+            next_choices(&[], Channel::Beta, "v"),
+            ("v0.0.1-beta.1".into(), "v0.1.0-beta.1".into())
+        );
+    }
+
+    #[test]
+    fn latest_on_github() {
+        let t = tags(&[
+            "v0.1.0",
+            "v0.1.1",
+            "v0.2.0-beta.2",
+            "v0.2.0-beta.1",
+            "v0.1.1-beta.3",
+        ]);
+        assert_eq!(
+            latest(&t, "v"),
+            (Some("v0.1.1".into()), Some("v0.2.0-beta.2".into()))
+        );
+        let old_beta = tags(&["v0.1.1", "v0.1.1-beta.3"]);
+        assert_eq!(latest(&old_beta, "v"), (Some("v0.1.1".into()), None));
+    }
 }
 
 #[cfg(test)]

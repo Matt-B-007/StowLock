@@ -4,6 +4,14 @@
 
 <p align="center"><b>Drop in a project zip, get a clean, tested GitHub repo, with old versions neatly archived.</b></p>
 
+**Install** (one line, no password, updates itself afterwards):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Matt-B-007/StowLock/main/install.sh | sh
+```
+
+<!-- AUR: once stowlock-beta-bin is published, add: or `paru -S stowlock-beta-bin` -->
+
 StowLock is a small native Linux app (Rust + egui) for people who build projects with AI tools and get them back as zip files. Instead of a Downloads folder full of `project-final-v2 (3).zip` and git commands typed by hand, StowLock puts each project in its own folder, checks it, lets you try it, pushes it to the right GitHub repo (new or existing) and files the zip away.
 
 Built for CachyOS and other Arch-based distributions; it runs on any x86_64 Linux desktop.
@@ -16,9 +24,10 @@ Built for CachyOS and other Arch-based distributions; it runs on any x86_64 Linu
 - **Three modes:** **New repo**, **Update** (syncs files into the existing repo, removes deleted files, keeps history) and **Archive only** (files an old zip without pushing).
 - **Safe extraction.** Zip paths that try to escape the folder, symlinks and zip bombs are refused. A single wrapper folder (`myapp-main/`) is unwrapped.
 - **Clean repos.** Removes OS junk, `node_modules`, `target`, virtualenvs and nested `.git` folders; writes a `.gitignore`; adds a starter README and an optional license for new repos. `.env` files are never deleted and never committed.
-- **Checks before push.** Runs your project's tests (Rust, Node, Python, Go) and scans for leaked keys and tokens. Failing checks block the push unless you explicitly override (secret hits can't be overridden on a public repo).
+- **Checks before push that match GitHub's.** If the project has GitHub workflows, StowLock runs their steps here with the same commands and settings, and lists the steps only GitHub can run. Otherwise it runs the project's tests (Rust, Node, Python, Go). It also scans for leaked keys and tokens. Optional exact mode runs the workflows with `act` (needs Docker). Failing checks block the push unless you explicitly override (secret hits can't be overridden on a public repo).
 - **Try it first.** Run the staged project in a terminal, fix it in your editor, re-check, then push exactly what's in the folder.
-- **Stable or beta releases.** Optional version tags (`v0.2.0`, `v0.3.0-beta.1`) with GitHub releases; betas are marked as pre-releases.
+- **Stable or beta releases.** The version is read from the zip; StowLock shows the latest on GitHub, suggests the next fix or feature, and warns when a version would count as older than one already released. Betas are marked as pre-releases.
+- **Watches GitHub's build after every push.** If it fails, StowLock shows the failing step, opens the log, copies it for an AI, or deletes the release and tag so the version can be reused.
 - **Keeps Downloads empty.** After a successful push the zip moves to `~/GitHub_Projects/_archive/<project>/`.
 - **Never force-pushes**, never overwrites unsaved local work, and stops if GitHub has changes you don't.
 - **If a check fails, nothing is lost.** Load a fixed zip and the failed attempt is set aside (a git stash, or a folder for a new repo). **Projects → Saved earlier attempts** lists them with Restore and Delete.

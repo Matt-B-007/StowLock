@@ -53,6 +53,10 @@ pub struct TestEnv<'a> {
     /// Where build files are kept between checks of the same project, so a
     /// second check doesn't rebuild everything. None = the project's own folder.
     pub build_cache: Option<PathBuf>,
+    /// Run the project's own GitHub workflow steps when it has them.
+    pub match_github: bool,
+    /// Run the GitHub workflows exactly, with act (needs act and Docker).
+    pub exact: bool,
 }
 
 /// The names of failed tests (cargo, pytest, go, jest), shortest form,
@@ -133,6 +137,16 @@ pub fn result_summary(transcript: &str) -> Option<String> {
 }
 
 fn run_step(dir: &Path, program: &str, args: &[&str], env: &TestEnv) -> Output {
+    run_step_with(dir, program, args, env, &[])
+}
+
+fn run_step_with(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    env: &TestEnv,
+    extra: &[(String, String)],
+) -> Output {
     let opts = Opts {
         cwd: Some(dir.to_path_buf()),
         timeout: Some(Duration::from_secs(env.timeout_secs)),
@@ -143,6 +157,7 @@ fn run_step(dir: &Path, program: &str, args: &[&str], env: &TestEnv) -> Output {
             if let Some(c) = &env.build_cache {
                 e.push(("CARGO_TARGET_DIR".into(), c.display().to_string()));
             }
+            e.extend(extra.iter().cloned());
             e
         },
         stdin: None,
@@ -160,7 +175,142 @@ fn missing(tool: &str, pkg: &str) -> TestResult {
 }
 
 /// Run the checks for a stack. Steps stop at the first failure.
+/// Run the project's GitHub workflow steps here, as GitHub would.
+fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestResult {
+    let start = Instant::now();
+    let mut transcript = String::new();
+    let skipped_note = || -> String {
+        if plan.skipped.is_empty() {
+            return String::new();
+        }
+        let mut n = String::from("\nSkipped on this computer (GitHub only):\n");
+        for sk in &plan.skipped {
+            n.push_str(&format!("  - {}: {} ({})\n", sk.job, sk.name, sk.why));
+        }
+        n
+    };
+    let finish = |status: TestStatus, summary: String, transcript: &str| TestResult {
+        status,
+        summary,
+        tail: format!(
+            "{}{}",
+            crate::logbook::shorten(transcript).join("\n"),
+            skipped_note()
+        ),
+        duration: start.elapsed(),
+        hint: None,
+    };
+    let ran_of = |n: usize| format!("Ran {n} of {} GitHub steps here", plan.total());
+    for (i, step) in plan.steps.iter().enumerate() {
+        let cmd = match &env.build_cache {
+            Some(c) => crate::workflows::use_build_cache(&step.run, c),
+            None => step.run.clone(),
+        };
+        let wd = match &step.workdir {
+            Some(w) if !w.contains("..") => dir.join(w),
+            _ => dir.to_path_buf(),
+        };
+        let o = run_step_with(
+            &wd,
+            "bash",
+            &["-e", "-o", "pipefail", "-c", &cmd],
+            env,
+            &step.env,
+        );
+        transcript.push_str(&format!(
+            "$ [{}] {}\n{}\n",
+            step.job,
+            step.name,
+            o.combined()
+        ));
+        if o.cancelled {
+            return finish(TestStatus::Cancelled, "Cancelled".into(), &transcript);
+        }
+        if !o.ok() {
+            let what = if o.timed_out { "timed out" } else { "failed" };
+            let counts = result_summary(&transcript)
+                .map(|c| format!(" · {}", with_failed_names(c, &transcript)))
+                .unwrap_or_default();
+            return finish(
+                TestStatus::Failed,
+                format!(
+                    "GitHub step \"{}\" {what} · {}{counts}",
+                    step.name,
+                    ran_of(i + 1)
+                ),
+                &transcript,
+            );
+        }
+    }
+    let counts = result_summary(&transcript)
+        .map(|c| format!(" · {c}"))
+        .unwrap_or_default();
+    let skipped = if plan.skipped.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} GitHub-only skipped", plan.skipped.len())
+    };
+    finish(
+        TestStatus::Passed,
+        format!("Passed: {}{skipped}{counts}", ran_of(plan.steps.len())),
+        &transcript,
+    )
+}
+
+/// Exact mode: run the GitHub workflows with act, in containers like GitHub's.
+fn run_with_act(dir: &Path, env: &TestEnv) -> Option<TestResult> {
+    if proc::which("act").is_none() || proc::which("docker").is_none() {
+        return None;
+    }
+    let start = Instant::now();
+    let long = TestEnv {
+        timeout_secs: env.timeout_secs.max(1800),
+        cancel: env.cancel.clone(),
+        pass_env: env.pass_env,
+        log: env.log,
+        build_cache: None,
+        match_github: false,
+        exact: false,
+    };
+    let o = run_step(dir, "act", &["push", "--rm"], &long);
+    let transcript = format!("$ act push --rm\n{}\n", o.combined());
+    let status = if o.cancelled {
+        TestStatus::Cancelled
+    } else if o.ok() {
+        TestStatus::Passed
+    } else {
+        TestStatus::Failed
+    };
+    let counts = result_summary(&transcript)
+        .map(|c| format!(" · {c}"))
+        .unwrap_or_default();
+    Some(TestResult {
+        status,
+        summary: match status {
+            TestStatus::Passed => {
+                format!("Passed: your GitHub workflows, run exactly (act){counts}")
+            }
+            _ => format!("GitHub workflows (act) failed{counts}"),
+        },
+        tail: crate::logbook::shorten(&transcript).join("\n"),
+        duration: start.elapsed(),
+        hint: None,
+    })
+}
+
 pub fn run_tests(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
+    if env.exact {
+        if let Some(r) = run_with_act(dir, env) {
+            return r;
+        }
+    }
+    if env.match_github {
+        if let Some(plan) = crate::workflows::plan(dir) {
+            if !plan.steps.is_empty() {
+                return run_plan(dir, &plan, env);
+            }
+        }
+    }
     let start = Instant::now();
     let mut transcript = String::new();
     let finish = |status: TestStatus, summary: String, transcript: &str| TestResult {
@@ -313,6 +463,8 @@ mod tests {
             pass_env: false,
             log,
             build_cache: None,
+            match_github: true,
+            exact: false,
         }
     }
 
@@ -377,5 +529,32 @@ mod tests {
         let r = run_tests(d.path(), Stack::Other, &env(&log));
         assert_eq!(r.status, TestStatus::Skipped);
         assert!(r.passed_or_skipped());
+    }
+
+    #[test]
+    fn runs_the_projects_github_steps() {
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("ci.yml"), "on: [push]\nenv:\n  GREETING: hello\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: Check greeting\n        run: test \"$GREETING\" = hello && test \"$CI\" = true\n      - run: sudo apt-get install foo\n").unwrap();
+        std::fs::write(d.path().join("main.py"), "print(1)\n").unwrap();
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Python, &env(&log));
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+        assert!(
+            r.summary.contains("Ran 1 of 2 GitHub steps here"),
+            "{}",
+            r.summary
+        );
+        assert!(r.tail.contains("installs system packages"), "{}", r.tail);
+        // A failing GitHub step fails the check, named.
+        std::fs::write(wf.join("ci.yml"), "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Lint\n        run: exit 3\n").unwrap();
+        let r = run_tests(d.path(), Stack::Python, &env(&log));
+        assert_eq!(r.status, TestStatus::Failed);
+        assert!(
+            r.summary.contains("GitHub step \"Lint\" failed"),
+            "{}",
+            r.summary
+        );
     }
 }

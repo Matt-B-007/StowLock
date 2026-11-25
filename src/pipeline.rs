@@ -515,6 +515,8 @@ pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
                     .join("builds")
                     .join(slug.to_ascii_lowercase()),
             ),
+            match_github: ctx.config.match_github_checks,
+            exact: ctx.config.exact_github_checks,
         };
         let r = preflight::run_tests(dir, stack, &env);
         let status = match r.status {
@@ -628,6 +630,59 @@ pub struct PushOutcome {
     pub archived: Option<PathBuf>,
     pub warnings: Vec<String>,
     pub nothing_to_push: bool,
+    /// The pushed commit (to follow GitHub's build for it).
+    pub commit: Option<String>,
+    /// The tag reached GitHub but creating the release failed: the reason.
+    /// The UI offers Finish the release or Remove the tag.
+    pub release_failed: Option<String>,
+}
+
+/// Create the GitHub release for `tag`, with the CHANGELOG notes if any.
+fn create_release_with_notes(
+    ctx: &Ctx,
+    dir: &Path,
+    owner: &str,
+    slug: &str,
+    tag: &str,
+    beta: bool,
+) -> Res<()> {
+    let notes = crate::version::changelog_notes(dir, tag);
+    if notes.is_some() {
+        ctx.log.info(
+            "release",
+            "Using the CHANGELOG notes for this version as the release notes",
+        );
+    }
+    match ctx
+        .gh
+        .create_release(owner, slug, tag, beta, notes.as_deref(), &ctx.log)
+    {
+        Err(e) if !e.to_ascii_lowercase().contains("already exists") => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Finish the release for a tag that's already on GitHub (after creating the
+/// release failed). Not blocked by "already exists": it's this push's tag.
+pub fn finish_release(ctx: &Ctx, owner: &str, slug: &str, tag: &str, beta: bool) -> Res<()> {
+    let dir = detect::project_dir(&ctx.workspace(), slug);
+    create_release_with_notes(ctx, &dir, owner, slug, tag, beta)?;
+    ctx.log
+        .info("release", &format!("Finished the release {tag}"));
+    Ok(())
+}
+
+/// Remove a release and its tag from GitHub and from this computer, so the
+/// version can be used again. The code and commits stay.
+pub fn remove_release(ctx: &Ctx, owner: &str, slug: &str, tag: &str) -> Res<()> {
+    ctx.gh.delete_release(owner, slug, tag, &ctx.log)?;
+    let dir = detect::project_dir(&ctx.workspace(), slug);
+    if dir.is_dir() {
+        let _ = git::git(&dir, &["tag", "-d", tag]);
+    }
+    ctx.log
+        .info("release", &format!("Removed the release and tag {tag}"));
+    Ok(())
 }
 
 pub fn push(ctx: &Ctx, req: &PushRequest) -> Res<PushOutcome> {
@@ -723,9 +778,16 @@ pub fn push(ctx: &Ctx, req: &PushRequest) -> Res<PushOutcome> {
         log.info("push", "No changes to push");
         return Ok(outcome);
     }
+    outcome.commit = git::git(&dir, &["rev-parse", "HEAD"]).ok().then(|| {
+        git::git(&dir, &["rev-parse", "HEAD"])
+            .stdout
+            .trim()
+            .to_string()
+    });
     if !tag.is_empty() {
-        ctx.timed("Tag & release", || {
-            if !git::tags(&dir).contains(&tag) {
+        let r = ctx.timed("Tag & release", || {
+            let created = !git::tags(&dir).contains(&tag);
+            if created {
                 git::with_identity(
                     &dir,
                     &["tag", "-a", &tag, "-m", &format!("Release {tag}")],
@@ -734,29 +796,39 @@ pub fn push(ctx: &Ctx, req: &PushRequest) -> Res<PushOutcome> {
                     "release",
                 )?;
             }
-            git::git_ok(&dir, &["push", "origin", &tag], log, "release")?;
-            let notes = crate::version::changelog_notes(&dir, &tag);
-            if notes.is_some() {
-                log.info(
-                    "release",
-                    "Using the CHANGELOG notes for this version as the release notes",
-                );
+            if let Err(e) = git::git_ok(&dir, &["push", "origin", &tag], log, "release") {
+                // Nothing reached GitHub: take the tag back off this computer
+                // too, so trying again isn't blocked by "already exists".
+                if created {
+                    let _ = git::git(&dir, &["tag", "-d", &tag]);
+                    log.info(
+                        "release",
+                        &format!("Removed the local tag {tag} so you can try again"),
+                    );
+                }
+                return Err(e);
             }
-            if let Err(e) = ctx.gh.create_release(
+            if let Err(e) = create_release_with_notes(
+                ctx,
+                &dir,
                 &req.owner,
                 &req.slug,
                 &tag,
                 req.channel == Channel::Beta,
-                notes.as_deref(),
-                log,
             ) {
-                if !e.to_ascii_lowercase().contains("already exists") {
-                    return Err(e);
-                }
+                outcome.release_failed = Some(e.clone());
+                return Err(format!(
+                    "The tag {tag} is on GitHub, but creating the release failed: {e}"
+                ));
             }
             Ok(())
-        })?;
-        outcome.tag = Some(tag.clone());
+        });
+        match r {
+            Ok(()) => outcome.tag = Some(tag.clone()),
+            // The code and tag are on GitHub; offer Finish/Remove instead of failing.
+            Err(_) if outcome.release_failed.is_some() => outcome.tag = Some(tag.clone()),
+            Err(e) => return Err(e),
+        }
     }
     if let Some(zip) = &req.archive_zip {
         let t = Instant::now();
@@ -1394,5 +1466,35 @@ mod tests {
             std::fs::read_to_string(st.dir.join("main.py")).unwrap(),
             "print(2)\n"
         );
+    }
+
+    #[test]
+    fn failed_release_can_be_finished_or_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let z = sb.zip("demo-app.zip", &[("main.py", b"print(1)\n", 0o644)]);
+        stage(&sb.ctx, &req(&sb, &z, Mode::New)).unwrap();
+        // GitHub accepts the tag but creating the release fails.
+        std::fs::create_dir_all(&sb.fake.root).unwrap();
+        std::fs::write(sb.fake.root.join("fail-release"), "HTTP 502").unwrap();
+        let out = push(
+            &sb.ctx,
+            &preq(&sb, Mode::New, "v0.1.0", Channel::Stable, None),
+        )
+        .unwrap();
+        assert!(out.release_failed.as_deref().unwrap_or("").contains("502"));
+        assert_eq!(out.tag.as_deref(), Some("v0.1.0"));
+        assert!(out.commit.is_some());
+        let fake = sb.fake.clone();
+        assert!(fake.releases(&sb.owner, "demo-app").is_empty());
+        // Finish the release once GitHub works again.
+        std::fs::remove_file(sb.fake.root.join("fail-release")).unwrap();
+        finish_release(&sb.ctx, &sb.owner, "demo-app", "v0.1.0", false).unwrap();
+        assert_eq!(fake.releases(&sb.owner, "demo-app").len(), 1);
+        // Remove it: gone from GitHub and this computer, so v0.1.0 is free.
+        remove_release(&sb.ctx, &sb.owner, "demo-app", "v0.1.0").unwrap();
+        assert!(fake.releases(&sb.owner, "demo-app").is_empty());
+        let dir = detect::project_dir(&sb.ctx.workspace(), "demo-app");
+        assert!(!git::tags(&dir).contains(&"v0.1.0".to_string()));
     }
 }

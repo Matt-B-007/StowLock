@@ -581,6 +581,8 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
             }
             let env = crate::preflight::TestEnv {
                 build_cache: None,
+                match_github: false,
+                exact: false,
                 timeout_secs: 60,
                 cancel: Default::default(),
                 pass_env: false,

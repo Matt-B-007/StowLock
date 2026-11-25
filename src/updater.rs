@@ -81,6 +81,7 @@ pub fn pick_from_releases(json: &str, current: &str, beta: bool) -> Option<Relea
     v.as_array()?
         .iter()
         .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+        .filter(|r| has_app(r))
         .filter_map(|r| {
             let tag = r["tag_name"].as_str()?.to_string();
             let ver = parse(&tag)?;
@@ -128,6 +129,22 @@ fn fetch(url: &str, out: Option<&Path>, secs: u64) -> Res<String> {
     }
 }
 
+/// Has GitHub's build attached the app to this release? A release whose
+/// build failed, or is still running, has no app yet and is never offered.
+fn has_app(r: &serde_json::Value) -> bool {
+    match r["assets"].as_array() {
+        Some(a) => a.iter().any(|x| x["name"].as_str() == Some(ASSET)),
+        None => true, // an answer without asset details: don't block on it
+    }
+}
+
+/// A newer beta than `current`, for telling Stable users one exists.
+pub fn newer_beta(json: &str, current: &str) -> Option<String> {
+    pick_from_releases(json, current, true)
+        .filter(|r| r.prerelease)
+        .map(|r| r.tag)
+}
+
 /// The newest release on GitHub for this channel, newer or not.
 pub fn newest_tag(json: &str, beta: bool) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -153,6 +170,8 @@ pub struct CheckResult {
     pub newest_tag: Option<String>,
     /// The anonymous check was refused, so the user's GitHub sign-in was used.
     pub via_sign_in: bool,
+    /// On Stable: a newer beta exists (switch the channel to try it).
+    pub newer_beta: Option<String>,
 }
 
 /// Turn a failed download into words a person can act on.
@@ -215,6 +234,11 @@ pub fn check(paths: &AppPaths, repo: &str, beta: bool) -> Res<CheckResult> {
         newer: pick_from_releases(&json, APP_VERSION, beta),
         newest_tag: newest_tag(&json, beta),
         via_sign_in,
+        newer_beta: if beta {
+            None
+        } else {
+            newer_beta(&json, APP_VERSION)
+        },
     })
 }
 
@@ -428,6 +452,25 @@ mod tests {
             pick_from_releases("<html>rate limited</html>", "0.1.0", true),
             None
         );
+    }
+
+    #[test]
+    fn releases_without_the_app_are_never_offered() {
+        let json = r#"[
+            {"tag_name":"v9.0.1","prerelease":false,"draft":false,"assets":[{"name":"stowlock-linux-x86_64.sha256"}]},
+            {"tag_name":"v9.0.0","prerelease":false,"draft":false,"assets":[{"name":"stowlock-linux-x86_64"},{"name":"stowlock-linux-x86_64.sha256"}]}
+        ]"#;
+        assert_eq!(
+            pick_from_releases(json, "0.1.0", false).unwrap().tag,
+            "v9.0.0"
+        );
+    }
+
+    #[test]
+    fn stable_users_hear_about_newer_betas() {
+        let json = r#"[{"tag_name":"v9.1.0-beta.1","prerelease":true,"draft":false}]"#;
+        assert_eq!(newer_beta(json, "0.1.0").as_deref(), Some("v9.1.0-beta.1"));
+        assert_eq!(newer_beta(json, "9.1.0"), None);
     }
 
     #[test]

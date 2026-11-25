@@ -4,6 +4,24 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.1.0-beta.5] - 2026-11-25
+
+### Added
+- **One flow from zip to release.** The version (and Stable or Beta) is read from the zip's own files. When the checks pass, the review window opens by itself. After pushing a new StowLock release, StowLock offers to update to it.
+- **Latest on GitHub** beside the version box, with one-click **Next fix** and **Next feature**.
+- **Older-version warning.** A version that counts as older than one already released (for example `v0.1.1-beta.1` after `v0.1.1`) is flagged, with one-click fixes. The review window says **Who gets this**, and an older version needs a "Push it anyway" tick.
+- **Watches GitHub's build after every push:** live status, and on failure the failing step, Open the build log, Copy for AI, Delete the release and tag, or Keep it. A build that passed here but failed on GitHub is called out.
+- **Checks that match GitHub's.** When a project has GitHub workflows, Stage & check runs their steps with the same commands and settings, and lists the steps only GitHub can run (installs, publishing, other systems). Optional exact mode runs them with `act` (needs Docker). Both are in Settings → Checks.
+- **Clean up failed releases.** If the tag reached GitHub but the release didn't, choose Finish the release or Remove the tag. History has **Delete release…** (type the tag to confirm; the code stays).
+- The one-line install is now at the very top of the README.
+
+### Changed
+- The update section explains itself: it tells Stable users when a newer beta exists and how to switch, and explains when GitHub's newest release counts as older than yours.
+- Updates only offer releases that have the app attached, so a release whose build failed is never offered.
+
+### Fixed
+- A tag created locally is removed again if pushing it fails.
+
 ## [0.1.0-beta.4] - 2026-11-24
 
 ### Added

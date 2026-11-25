@@ -84,6 +84,10 @@ enum Msg {
     Staged(Result<StageResult, String>),
     Checked(Checks),
     Pushed(Result<PushOutcome, String>),
+    /// GitHub's build for a pushed commit: (watch id, status).
+    Build(u64, Result<crate::github::Build, String>),
+    /// Finish the release / Remove the tag / Delete release finished.
+    ReleaseFixed(Result<String, String>),
     Archived(Result<PathBuf, String>),
     Projects(Vec<ProjectInfo>),
     SelfTest(Box<SelfTestReport>, Option<PathBuf>),
@@ -156,6 +160,12 @@ struct Session {
     confirm_at: Option<std::time::Instant>,
     /// "I understand this will be public" for a new public repo.
     public_ack: bool,
+    /// The tag as it was last frame (to react to edits and one-click picks).
+    last_tag: String,
+    /// "Push it anyway" for a version that counts as older than a release.
+    older_ack: bool,
+    /// Open the review window by itself once the checks pass.
+    review_when_ready: bool,
     outcome: Option<PushOutcome>,
     show_changes: bool,
     /// Version found in the zip (Archive Only), and whether `tag` was filled from it.
@@ -193,6 +203,9 @@ impl Session {
             confirm: false,
             confirm_at: None,
             public_ack: false,
+            last_tag: String::new(),
+            older_ack: false,
+            review_when_ready: false,
             outcome: None,
             show_changes: false,
             found_version: None,
@@ -206,6 +219,19 @@ impl Session {
             self.mode
         }
     }
+}
+
+/// GitHub's build for the last push, followed in the background.
+#[derive(Debug, Clone)]
+struct BuildWatch {
+    id: u64,
+    owner: String,
+    slug: String,
+    tag: Option<String>,
+    status: Option<crate::github::Build>,
+    /// The local checks passed (so a failure on GitHub is a mismatch).
+    local_passed: bool,
+    dismissed: bool,
 }
 
 struct BugForm {
@@ -278,6 +304,14 @@ pub struct App {
     installed_version: Option<String>,
     /// Set when pacman installed StowLock (the AUR package): updates go through paru/yay.
     pacman_pkg: Option<String>,
+    /// Following GitHub's build after a push.
+    build: Option<BuildWatch>,
+    /// Seconds before the first build check, and between checks.
+    build_poll: (u64, u64),
+    /// "Delete release…" in History: (owner, slug, tag, what the user typed).
+    deleting_release: Option<(String, String, String, String)>,
+    /// Confirming "Remove the tag" / "Delete the release and tag" after a push.
+    confirm_remove_tag: bool,
     /// The last update check's result, shown in Settings.
     update_note: Option<String>,
     /// The running check was started with Check now (so say the result).
@@ -387,6 +421,10 @@ impl App {
             installed,
             installed_version,
             pacman_pkg,
+            build: None,
+            build_poll: (8, 15),
+            deleting_release: None,
+            confirm_remove_tag: false,
             update_note: None,
             update_manual: false,
             install_inst: inst,
@@ -588,6 +626,17 @@ impl App {
         s.description = format!("{}, a vibe-coded project", detect::title_from_slug(&s.slug));
         s.zip = Some(zip.clone());
         s.found_version = detect::detect_version(&zip, &self.config.tag_prefix);
+        // Fill in the version (and Stable/Beta) from the zip's own files.
+        if let Some(fv) = &s.found_version {
+            if let Some(v) = version::parse_tag(&fv.tag, &self.config.tag_prefix) {
+                s.tag = fv.tag.clone();
+                s.channel = if v.pre.is_empty() {
+                    Channel::Stable
+                } else {
+                    Channel::Beta
+                };
+            }
+        }
         let label = format!("Stage {}", s.slug);
         self.session = s;
         self.error = None;
@@ -667,6 +716,7 @@ impl App {
         let Some(zip) = self.session.zip.clone() else {
             return;
         };
+        self.session.review_when_ready = true;
         let s = &self.session;
         let req = StageRequest {
             zip,
@@ -697,6 +747,7 @@ impl App {
     }
 
     fn recheck(&mut self) {
+        self.session.review_when_ready = true;
         let Some(st) = self.session.stage.clone() else {
             return;
         };
@@ -813,6 +864,207 @@ impl App {
         let repo = self.config.update_repo.clone();
         let log = self.log.clone();
         self.spawn_bg(move || Msg::UpdateApplied(updater::apply(&paths, &repo, &tag, &log)));
+    }
+
+    /// Follow GitHub's build for a pushed commit: check every 15 seconds for
+    /// up to 40 minutes. No build within 90 seconds means the project has none.
+    fn watch_build(&mut self, commit: String, tag: Option<String>) {
+        let id = self.build.as_ref().map(|w| w.id + 1).unwrap_or(1);
+        let local_passed = self
+            .session
+            .checks
+            .as_ref()
+            .map(|c| c.tests.status == TestStatus::Passed)
+            .unwrap_or(false);
+        self.build = Some(BuildWatch {
+            id,
+            owner: self.session.owner.clone(),
+            slug: self.session.slug.clone(),
+            tag,
+            status: None,
+            local_passed,
+            dismissed: false,
+        });
+        let gh = self.gh.clone();
+        let (owner, slug) = (self.session.owner.clone(), self.session.slug.clone());
+        let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let (first, every) = self.build_poll;
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_secs(first));
+            loop {
+                let r = gh.build_status(&owner, &slug, &commit);
+                let done = match &r {
+                    Ok(crate::github::Build::Passed { .. })
+                    | Ok(crate::github::Build::Failed { .. }) => true,
+                    Ok(crate::github::Build::None) => start.elapsed().as_secs() > 90,
+                    Ok(crate::github::Build::Running { .. }) => false,
+                    Err(_) => start.elapsed().as_secs() > 300,
+                };
+                let quiet_none = matches!(r, Ok(crate::github::Build::None)) && !done;
+                if !quiet_none {
+                    Self::send(&tx, &ctx, Msg::Build(id, r));
+                }
+                if done || start.elapsed().as_secs() > 40 * 60 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(every));
+            }
+        });
+    }
+
+    fn fix_release(&mut self, finish: bool, owner: String, slug: String, tag: String, beta: bool) {
+        let ctx = self.pctx();
+        self.spawn_bg(move || {
+            Msg::ReleaseFixed(if finish {
+                pipeline::finish_release(&ctx, &owner, &slug, &tag, beta)
+                    .map(|_| format!("Finished the release {tag}"))
+            } else {
+                pipeline::remove_release(&ctx, &owner, &slug, &tag)
+                    .map(|_| format!("Removed the release and tag {tag}. You can use {tag} again."))
+            })
+        });
+    }
+
+    /// The GitHub build card (and the failed-release card) after a push.
+    fn after_push_cards(&mut self, ui: &mut egui::Ui) {
+        // The tag is on GitHub but the release failed.
+        if let Some(out) = self.session.outcome.clone() {
+            if let (Some(why), Some(tag)) = (out.release_failed.clone(), out.tag.clone()) {
+                let (owner, slug, beta) = (
+                    self.session.owner.clone(),
+                    self.session.slug.clone(),
+                    self.session.channel == Channel::Beta,
+                );
+                ui::banner(ui, WARNING(), |ui| {
+                    ui.label(ui::semibold(
+                        format!("The tag {tag} is on GitHub, but the release wasn't created"),
+                        14.5,
+                    ));
+                    ui.add(
+                        egui::Label::new(ui::muted(why.lines().next().unwrap_or("")).size(13.0))
+                            .wrap(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        if ui::primary(ui, "Finish the release", self.busy.is_none()).clicked() {
+                            self.fix_release(true, owner.clone(), slug.clone(), tag.clone(), beta);
+                        }
+                        if self.confirm_remove_tag {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        ui::semibold(format!("Remove {tag} from GitHub"), 13.5)
+                                            .color(ui::CARD()),
+                                    )
+                                    .fill(ERROR()),
+                                )
+                                .clicked()
+                            {
+                                self.fix_release(
+                                    false,
+                                    owner.clone(),
+                                    slug.clone(),
+                                    tag.clone(),
+                                    beta,
+                                );
+                            }
+                            if ui::button(ui, "", "Keep it").clicked() {
+                                self.confirm_remove_tag = false;
+                            }
+                        } else if ui::button(ui, ui::icon::TRASH, "Remove the tag…").clicked() {
+                            self.confirm_remove_tag = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+            }
+        }
+        let Some(w) = self.build.clone() else { return };
+        if w.dismissed || !w.slug.eq_ignore_ascii_case(&self.session.slug) {
+            return;
+        }
+        use crate::github::Build;
+        match &w.status {
+            None | Some(Build::Running { .. }) => {
+                ui::banner(ui, ACCENT(), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spinner();
+                        ui.label(format!(
+                            "GitHub is building {}…",
+                            w.tag.clone().unwrap_or_else(|| "this push".into())
+                        ));
+                        if let Some(Build::Running { url }) = &w.status {
+                            if ui.link("Watch on GitHub").clicked() {
+                                let _ = proc::xdg_open(url);
+                            }
+                        }
+                    });
+                });
+            }
+            Some(Build::None) => {}
+            Some(Build::Passed { url }) => {
+                let url = url.clone();
+                ui::banner(ui, ui::SUCCESS(), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(ui::icon::CIRCLE_CHECK).color(ui::SUCCESS()));
+                        ui.label(format!(
+                            "Built on GitHub{}",
+                            if w.tag.is_some() {
+                                ": the release is ready"
+                            } else {
+                                ""
+                            }
+                        ));
+                        if ui.link("View the build").clicked() {
+                            let _ = proc::xdg_open(&url);
+                        }
+                    });
+                });
+            }
+            Some(Build::Failed { url, step, log }) => {
+                let (url, step, log) = (url.clone(), step.clone(), log.clone());
+                ui::banner(ui, ERROR(), |ui| {
+                    ui.label(
+                        ui::semibold(format!("GitHub's build failed at {step}"), 14.5)
+                            .color(ERROR()),
+                    );
+                    if w.local_passed {
+                        ui.add(egui::Label::new(ui::muted("It passed here but failed on GitHub: GitHub runs on a different machine, often with newer tools.").size(13.0)).wrap());
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui::button(ui, ui::icon::EXTERNAL, "Open the build log").clicked() {
+                            let _ = proc::xdg_open(&url);
+                        }
+                        if ui::button(ui, ui::icon::COPY, "Copy for AI").clicked() {
+                            let lines: Vec<String> = log.lines().map(|l| l.to_string()).collect();
+                            let prompt = format!(
+                                "My project built and passed its tests on my computer, but GitHub's build failed at: {step}\n\n{}",
+                                report::project_fix_prompt("GitHub Actions build failed", &lines)
+                            );
+                            ui.ctx().copy_text(report::redact(&prompt, &self.redact_ctx()));
+                            self.toast("Copied. Paste it into your AI chat, then load the fixed zip.");
+                        }
+                        if let Some(tag) = w.tag.clone() {
+                            if self.confirm_remove_tag {
+                                if ui.add(egui::Button::new(ui::semibold(format!("Delete {tag} from GitHub"), 13.5).color(ui::CARD())).fill(ERROR())).clicked() {
+                                    self.fix_release(false, w.owner.clone(), w.slug.clone(), tag.clone(), false);
+                                }
+                            } else if ui::button(ui, ui::icon::TRASH, "Delete the release and tag…").on_hover_text("So you can fix it and reuse the same version").clicked() {
+                                self.confirm_remove_tag = true;
+                            }
+                        }
+                        if ui::button(ui, "", "Keep it").clicked() {
+                            self.confirm_remove_tag = false;
+                            if let Some(b) = self.build.as_mut() {
+                                b.dismissed = true;
+                            }
+                        }
+                    });
+                });
+            }
+        }
+        ui.add_space(8.0);
     }
 
     fn start_rollback(&mut self) {
@@ -1067,6 +1319,45 @@ impl App {
                     self.fail(&e, "stage");
                 }
             },
+            Msg::Build(id, r) => {
+                let Some(w) = self.build.as_mut().filter(|w| w.id == id) else {
+                    return;
+                };
+                match r {
+                    Ok(b) => {
+                        let passed = matches!(b, crate::github::Build::Passed { .. });
+                        let failed = matches!(b, crate::github::Build::Failed { .. });
+                        w.status = Some(b);
+                        if failed {
+                            self.log.warn("build", "GitHub's build failed");
+                        }
+                        // Pushing StowLock itself: offer the new version now.
+                        let ours = format!("{}/{}", w.owner, w.slug)
+                            .eq_ignore_ascii_case(&self.config.update_repo);
+                        if passed && ours && w.tag.is_some() && self.pacman_pkg.is_none() {
+                            self.check_updates(true);
+                        }
+                    }
+                    Err(e) => self
+                        .log
+                        .warn("build", &format!("Couldn't follow GitHub's build: {e}")),
+                }
+            }
+            Msg::ReleaseFixed(r) => match r {
+                Ok(msg) => {
+                    self.toast(&msg);
+                    if let Some(o) = self.session.outcome.as_mut() {
+                        o.release_failed = None;
+                        if msg.starts_with("Removed") {
+                            o.tag = None;
+                        }
+                    }
+                    self.deleting_release = None;
+                    self.confirm_remove_tag = false;
+                    self.history = History::load(&self.paths);
+                }
+                Err(e) => self.fail(&e, "release"),
+            },
             Msg::Checked(c) => {
                 self.session.checks = Some(c);
                 self.record_health(self.session.mode == Mode::Update);
@@ -1083,6 +1374,9 @@ impl App {
                         }
                         if !out.nothing_to_push {
                             HealthState::record(&self.paths, "History", true, "");
+                        }
+                        if let (false, Some(commit)) = (out.nothing_to_push, out.commit.clone()) {
+                            self.watch_build(commit, out.tag.clone());
                         }
                         self.session.outcome = Some(out);
                         self.history = History::load(&self.paths);
@@ -1127,12 +1421,25 @@ impl App {
                     } else {
                         ""
                     };
-                    self.update_note = Some(match &c.newer {
+                    let newest_older = c.newest_tag.as_deref().is_some_and(|t| {
+                        instance::is_older(t.trim_start_matches('v'), APP_VERSION)
+                    });
+                    let mut note = match &c.newer {
                         Some(rel) => format!("{} is available. You have {APP_VERSION}. Checked {when}{how}.", rel.label()),
+                        None if newest_older => format!(
+                            "You have the newest version ({APP_VERSION}). {newest} on GitHub counts as older than yours, so it isn't offered. Checked {when}{how}."
+                        ),
                         None => format!(
                             "You have the newest version ({APP_VERSION}). Newest on GitHub: {newest}. Checked {when}{how}."
                         ),
-                    });
+                    };
+                    if let Some(b) = &c.newer_beta {
+                        note.push_str(&format!(
+                            " A beta ({}) is available: switch the Update channel to Beta to try it.",
+                            b.trim_start_matches('v')
+                        ));
+                    }
+                    self.update_note = Some(note);
                     match c.newer {
                         Some(rel) => self.update = UpdateState::Available(rel),
                         None if self.update_manual => {
@@ -2432,6 +2739,7 @@ impl App {
         }
         if let Some(out) = self.session.outcome.clone() {
             ui.add_space(8.0);
+            self.after_push_cards(ui);
             self.completion_card(ui, &out);
         }
         self.log_drawer(ui);
@@ -2721,41 +3029,85 @@ impl App {
                         ui.end_row();
                         ui.label("Visibility");
                         ui.horizontal_wrapped(|ui| {
-                            ui.selectable_value(&mut self.session.private, true, "🔒 Private");
-                            ui.selectable_value(&mut self.session.private, false, "🌐 Public");
+                            ui.selectable_value(&mut self.session.private, true, "Private");
+                            ui.selectable_value(&mut self.session.private, false, "Public");
                         });
                         ui.end_row();
                     }
                     ui.label("Version");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(&mut self.session.channel, Channel::Stable, "Stable");
-                        ui.selectable_value(&mut self.session.channel, Channel::Beta, "Beta");
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.session.tag)
-                                .hint_text("optional, e.g. v0.1.0")
-                                .desired_width(150.0)
-                                .font(egui::TextStyle::Monospace),
-                        );
-                        if r.changed() && !self.session.commit_edited {
-                            self.session.commit_msg = version::default_commit_message(
-                                mode == Mode::New,
-                                &self.session.tag,
+                    let mut new_tag: Option<String> = None;
+                    ui.vertical(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let sel = usize::from(self.session.channel == Channel::Beta);
+                            if let Some(i) = ui::segmented(ui, &["Stable", "Beta"], sel, 180.0) {
+                                self.session.channel = if i == 1 { Channel::Beta } else { Channel::Stable };
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.session.tag)
+                                    .hint_text("optional, e.g. v0.1.0")
+                                    .desired_width(170.0)
+                                    .font(egui::TextStyle::Monospace),
                             );
+                        });
+                        let prefix = self.config.tag_prefix.clone();
+                        if let Some(fv) = &self.session.found_version {
+                            if self.session.tag.trim() == fv.tag {
+                                ui.label(ui::muted(format!("From {} in the zip", fv.source)).size(12.5));
+                            }
                         }
-                        let sug =
-                            version::suggest(&tags, self.session.channel, &self.config.tag_prefix);
-                        if self.session.tag != sug
-                            && ui.small_button(format!("Use {sug}")).clicked()
-                        {
-                            self.session.tag = sug;
-                            if !self.session.commit_edited {
-                                self.session.commit_msg = version::default_commit_message(
-                                    mode == Mode::New,
-                                    &self.session.tag,
-                                );
+                        let (ls, lb) = version::latest(&tags, &prefix);
+                        let latest = match (&ls, &lb) {
+                            (None, None) => "No releases on GitHub yet".to_string(),
+                            (Some(s), None) => format!("Latest on GitHub: {s}"),
+                            (None, Some(b)) => format!("Latest on GitHub: {b} (beta)"),
+                            (Some(s), Some(b)) => format!("Latest on GitHub: {s} · {b} (beta)"),
+                        };
+                        ui.label(ui::muted(latest).size(12.5));
+                        let (fix, feature) = version::next_choices(&tags, self.session.channel, &prefix);
+                        ui.horizontal_wrapped(|ui| {
+                            if self.session.tag.trim() != fix
+                                && ui.small_button(format!("Next fix: {fix}")).clicked()
+                            {
+                                new_tag = Some(fix.clone());
+                            }
+                            if self.session.tag.trim() != feature
+                                && ui.small_button(format!("Next feature: {feature}")).clicked()
+                            {
+                                new_tag = Some(feature.clone());
+                            }
+                        });
+                        if self.session.outcome.is_none() {
+                            if let Some(newer) = version::newer_existing(&self.session.tag, &prefix, &tags) {
+                                ui::banner(ui, WARNING(), |ui| {
+                                    ui.add(egui::Label::new(format!(
+                                        "{} counts as older than {newer}, so people on {newer} won't be offered it.",
+                                        self.session.tag.trim()
+                                    )).wrap());
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui::button(ui, "", &format!("Use {fix}")).clicked() {
+                                            new_tag = Some(fix.clone());
+                                        }
+                                        if ui::button(ui, "", &format!("Use {feature}")).clicked() {
+                                            new_tag = Some(feature.clone());
+                                        }
+                                    });
+                                });
                             }
                         }
                     });
+                    if let Some(t) = new_tag {
+                        self.session.tag = t;
+                    }
+                    if self.session.tag != self.session.last_tag {
+                        self.session.last_tag = self.session.tag.clone();
+                        if let Some(v) = version::parse_tag(&self.session.tag, &self.config.tag_prefix) {
+                            self.session.channel = if v.pre.is_empty() { Channel::Stable } else { Channel::Beta };
+                        }
+                        if !self.session.commit_edited {
+                            self.session.commit_msg =
+                                version::default_commit_message(mode == Mode::New, &self.session.tag);
+                        }
+                    }
                     ui.end_row();
                     ui.label("Commit message");
                     if ui
@@ -3334,6 +3686,16 @@ impl App {
                     blockers.push("Already pushed".into());
                 }
                 let pushed = s.outcome.as_ref().map(|o| !o.nothing_to_push).unwrap_or(false);
+                // When the checks you started pass, go straight to the review.
+                if s.review_when_ready && busy.is_none() && s.checks.is_some() {
+                    self.session.review_when_ready = false;
+                    if blockers.is_empty() && s.outcome.is_none() {
+                        self.session.confirm = true;
+                        self.session.confirm_at = Some(std::time::Instant::now());
+                        self.session.public_ack = false;
+                        self.session.older_ack = false;
+                    }
+                }
                 ui.horizontal(|ui| {
                     Self::action_text(ui, BTN + 140.0, |ui| {
                         if let Some(b) = &busy {
@@ -3387,6 +3749,7 @@ impl App {
                             self.session.confirm = true;
                             self.session.confirm_at = Some(std::time::Instant::now());
                             self.session.public_ack = false;
+                            self.session.older_ack = false;
                         }
                     });
                 });
@@ -3549,7 +3912,16 @@ impl App {
                         }
                     });
                     ui.end_row();
-                    ui.label(ui::muted("After"));
+                    ui.label(ui::muted("Who gets this"));
+                let older = version::newer_existing(&tag, &self.config.tag_prefix, &self.existing_tags());
+                ui.add(egui::Label::new(match (&older, tag.is_empty(), s.channel) {
+                    (_, true, _) => "Nobody is offered an update (no version tag)".to_string(),
+                    (Some(n), _, _) => format!("Nobody: this counts as older than {n}"),
+                    (None, _, Channel::Beta) => "People on the Beta update channel".to_string(),
+                    (None, _, Channel::Stable) => "Everyone using an older version".to_string(),
+                }).wrap());
+                ui.end_row();
+                ui.label(ui::muted("After"));
                     let mut after = Vec::new();
                     if !tag.is_empty() {
                         after.push("release created");
@@ -3586,6 +3958,14 @@ impl App {
                         });
                 }
             }
+            let older_tag = version::newer_existing(&tag, &self.config.tag_prefix, &self.existing_tags());
+            if let Some(n) = &older_tag {
+                ui.add_space(4.0);
+                ui::banner(ui, WARNING(), |ui| {
+                    ui.add(egui::Label::new(format!("{tag} counts as older than {n}, so nobody on {n} will be offered it. That's only right for tagging an old fix.")).wrap());
+                    ui.checkbox(&mut self.session.older_ack, "Push it anyway");
+                });
+            }
             if public_new {
                 ui.add_space(4.0);
                 ui::banner(ui, WARNING(), |ui| {
@@ -3613,7 +3993,9 @@ impl App {
                     } else {
                         format!("Push {tag} to {}", s.slug)
                     };
-                    let ready = armed && (!public_new || self.session.public_ack);
+                    let ready = armed
+                        && (!public_new || self.session.public_ack)
+                        && (older_tag.is_none() || self.session.older_ack);
                     let clicked =
                         ui::primary(ui, &ui::with_icon(ui::icon::UPLOAD, &label), ready).clicked();
                     let keyed =
@@ -3847,7 +4229,7 @@ impl App {
         }
     }
 
-    fn today_row(&self, ui: &mut egui::Ui, r: &PushRecord) {
+    fn today_row(&mut self, ui: &mut egui::Ui, r: &PushRecord) {
         ui.horizontal_wrapped(|ui| {
             ui.label(ui::mono(r.time()).color(MUTED()));
             if ui.link(RichText::new(&r.slug).monospace()).clicked() {
@@ -3865,7 +4247,69 @@ impl App {
                 );
             }
             ui.label(ui::muted(format!("{} · {}", r.mode, r.visibility)));
+            if let Some(t) = &r.tag {
+                let watching = self
+                    .build
+                    .as_ref()
+                    .filter(|w| w.slug == r.slug && w.tag.as_deref() == Some(t.as_str()));
+                if let Some(w) = watching {
+                    use crate::github::Build;
+                    let (txt, col) = match &w.status {
+                        None | Some(Build::Running { .. }) => ("building on GitHub…", MUTED()),
+                        Some(Build::Passed { .. }) => ("built", ui::SUCCESS()),
+                        Some(Build::Failed { .. }) => ("build failed", ERROR()),
+                        Some(Build::None) => ("", MUTED()),
+                    };
+                    if !txt.is_empty() {
+                        ui.label(RichText::new(txt).size(12.5).color(col));
+                    }
+                }
+                if self.deleting_release.is_none() && ui.small_button("Delete release…").clicked()
+                {
+                    self.deleting_release =
+                        Some((r.owner.clone(), r.slug.clone(), t.clone(), String::new()));
+                }
+            }
         });
+        if let Some((owner, slug, tag, mut typed)) = self.deleting_release.clone() {
+            if slug == r.slug && r.tag.as_deref() == Some(tag.as_str()) {
+                ui::banner(ui, ERROR(), |ui| {
+                    ui.add(egui::Label::new(format!("Delete the release {tag} and its tag from GitHub? Your code and commits stay. Type {tag} to confirm.")).wrap());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut typed)
+                                .desired_width(160.0)
+                                .hint_text(tag.as_str()),
+                        );
+                        let ok = typed.trim() == tag;
+                        if ui
+                            .add_enabled(
+                                ok,
+                                egui::Button::new(
+                                    ui::semibold("Delete release", 13.5).color(ui::CARD()),
+                                )
+                                .fill(ERROR()),
+                            )
+                            .clicked()
+                        {
+                            self.fix_release(
+                                false,
+                                owner.clone(),
+                                slug.clone(),
+                                tag.clone(),
+                                false,
+                            );
+                        }
+                        if ui::button(ui, "", "Cancel").clicked() {
+                            self.deleting_release = None;
+                        }
+                    });
+                });
+                if let Some(d) = self.deleting_release.as_mut() {
+                    d.3 = typed;
+                }
+            }
+        }
     }
 
     fn health_screen(&mut self, ui: &mut egui::Ui) {
@@ -4059,6 +4503,27 @@ impl App {
                     &mut self.config.run_tests_before_push,
                     "Run tests before pushing",
                 );
+                ui.checkbox(
+                    &mut self.config.match_github_checks,
+                    "Match GitHub's checks: run the project's own GitHub workflow steps",
+                )
+                .on_hover_text("Uses the same commands and settings as the project's .github/workflows files, and lists the steps only GitHub can run.");
+                let act_ready = proc::which("act").is_some() && proc::which("docker").is_some();
+                ui.add_enabled_ui(act_ready, |ui| {
+                    ui.checkbox(
+                        &mut self.config.exact_github_checks,
+                        "Exact mode: run the workflows exactly as GitHub would (act)",
+                    );
+                });
+                if !act_ready {
+                    ui.add(
+                        egui::Label::new(
+                            ui::muted("Exact mode needs act and Docker: sudo pacman -S act docker")
+                                .size(12.5),
+                        )
+                        .wrap(),
+                    );
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Test time limit");
                     ui.add(
@@ -4626,6 +5091,7 @@ mod ui_tests {
             a.env.gh = true;
             a.env.login = Some("selftest-user".into());
             a.gh = Arc::new(crate::github::FakeGh::new(&d.path().join("gh")));
+            a.build_poll = (0, 1);
         }
         steps(&mut h, 2);
 
@@ -4662,20 +5128,26 @@ mod ui_tests {
         click_nav(&mut h, "Stage");
         h.state_mut().load_zip(zip);
         steps(&mut h, 3);
+        // The version comes from the zip: no typing.
+        assert_eq!(h.state().session.tag, "v0.2.0");
+        assert_eq!(h.state().session.channel, Channel::Stable);
+        h.state_mut().session.private = false; // a new public repo
         click_button(&mut h, "Stage & check");
         wait_until(&mut h, "checks", |a| {
             a.session.checks.is_some() && a.busy.is_none()
         });
-        assert!(
-            h.query_by_label_contains("Ready to push").is_some(),
-            "status label"
-        );
-        h.state_mut().session.private = false; // a new public repo
-
-        // The review window opens; an instant second click can't push.
-        click_button(&mut h, "Push to GitHub");
         steps(&mut h, 2);
-        assert!(h.state().session.confirm, "review window didn't open");
+
+        // The review window opens by itself; an instant click can't push.
+        assert!(
+            h.state().session.confirm,
+            "review window didn't open by itself"
+        );
+        assert!(
+            h.query_by_label_contains("Everyone using an older version")
+                .is_some(),
+            "Who gets this"
+        );
         assert!(h
             .query_by_label_contains("I understand this will be public")
             .is_some());
@@ -4696,6 +5168,13 @@ mod ui_tests {
         );
         click_button(&mut h, "I understand this will be public");
         steps(&mut h, 2);
+        // GitHub's build will fail, to check the build card.
+        std::fs::create_dir_all(d.path().join("gh")).unwrap();
+        std::fs::write(
+            d.path().join("gh/build.json"),
+            r#"{"state":"failed","step":"arch (cargo test --locked)","log":"test x ... FAILED"}"#,
+        )
+        .unwrap();
         click_button(&mut h, "to demo-app");
         wait_until(&mut h, "push", |a| {
             a.session.outcome.is_some() && a.busy.is_none()
@@ -4708,6 +5187,31 @@ mod ui_tests {
         assert!(
             d.path().join("gh").exists(),
             "nothing reached the stand-in GitHub"
+        );
+
+        // GitHub's build fails: say where, and offer to delete the release.
+        wait_until(&mut h, "GitHub build", |a| {
+            matches!(
+                a.build.as_ref().and_then(|b| b.status.clone()),
+                Some(crate::github::Build::Failed { .. })
+            )
+        });
+        steps(&mut h, 2);
+        assert!(h
+            .query_by_label_contains("GitHub's build failed at arch (cargo test --locked)")
+            .is_some());
+        assert!(h
+            .query_by_label_contains("It passed here but failed on GitHub")
+            .is_some());
+        click_button(&mut h, "Delete the release and tag");
+        click_button(&mut h, "Delete v0.2.0 from GitHub");
+        wait_until(&mut h, "release removed", |a| {
+            a.busy.is_none() && a.session.outcome.as_ref().is_some_and(|o| o.tag.is_none())
+        });
+        let fake = crate::github::FakeGh::new(&d.path().join("gh"));
+        assert!(
+            fake.releases("selftest-user", "demo-app").is_empty(),
+            "release still on GitHub"
         );
 
         // The push shows in History.

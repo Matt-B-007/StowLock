@@ -33,6 +33,7 @@ mod uninstall;
 mod updater;
 mod util;
 mod version;
+mod workflows;
 
 use config::{AppPaths, Config, APP_VERSION};
 use std::io::{BufRead, Write};

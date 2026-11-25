@@ -113,6 +113,10 @@ pub struct Config {
     pub report_hide_words: Vec<String>,
     /// "light", "dark", or "" = follow the desktop.
     pub theme: String,
+    /// Run the project's own GitHub workflow steps in Stage & check.
+    pub match_github_checks: bool,
+    /// Run the GitHub workflows exactly with act (needs act and Docker).
+    pub exact_github_checks: bool,
     pub report_retention_days: u32,
     /// Advanced: where StowLock checks for its own updates.
     pub update_repo: String,
@@ -137,6 +141,8 @@ impl Default for Config {
             update_channel: String::new(),
             report_hide_words: Vec::new(),
             theme: String::new(),
+            match_github_checks: true,
+            exact_github_checks: false,
             report_retention_days: 30,
             update_repo: UPDATE_REPO.into(),
         }

@@ -24,6 +24,80 @@ pub struct Account {
     pub secure: bool,
 }
 
+/// How GitHub's build (Actions) for a pushed commit is going.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Build {
+    /// The project has no GitHub build for this commit.
+    None,
+    Running {
+        url: String,
+    },
+    Passed {
+        url: String,
+    },
+    Failed {
+        url: String,
+        /// "job (step)": where it failed.
+        step: String,
+        /// The end of the failed step's log.
+        log: String,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RunsState {
+    None,
+    Running(String),
+    Passed(String),
+    Failed(String),
+}
+
+/// Overall state of a commit's GitHub runs, and the id of a failed run.
+pub fn summarize_runs(runs: &[serde_json::Value]) -> (RunsState, Option<u64>) {
+    if runs.is_empty() {
+        return (RunsState::None, None);
+    }
+    let url = |r: &serde_json::Value| r["url"].as_str().unwrap_or("").to_string();
+    if let Some(r) = runs.iter().find(|r| {
+        matches!(
+            r["conclusion"].as_str(),
+            Some("failure") | Some("timed_out") | Some("startup_failure")
+        )
+    }) {
+        return (RunsState::Failed(url(r)), r["databaseId"].as_u64());
+    }
+    if let Some(r) = runs
+        .iter()
+        .find(|r| r["status"].as_str() != Some("completed"))
+    {
+        return (RunsState::Running(url(r)), None);
+    }
+    (RunsState::Passed(url(&runs[0])), None)
+}
+
+/// "job (step)" for the first failed step in `gh run view --json jobs`.
+pub fn failed_step(jobs_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(jobs_json).ok()?;
+    for job in v["jobs"].as_array()? {
+        if job["conclusion"].as_str() != Some("failure") {
+            continue;
+        }
+        let name = job["name"].as_str().unwrap_or("job");
+        let step = job["steps"]
+            .as_array()
+            .and_then(|st| {
+                st.iter()
+                    .find(|x| x["conclusion"].as_str() == Some("failure"))
+            })
+            .and_then(|x| x["name"].as_str());
+        return Some(match step {
+            Some(st) => format!("{name} ({st})"),
+            None => name.to_string(),
+        });
+    }
+    None
+}
+
 pub trait GitHubApi: Send + Sync {
     fn login(&self) -> Res<String>;
     fn orgs(&self) -> Vec<String>;
@@ -51,6 +125,11 @@ pub trait GitHubApi: Send + Sync {
         notes: Option<&str>,
         log: &Logger,
     ) -> Res<()>;
+    /// Delete a release and its tag on GitHub (the code stays).
+    fn delete_release(&self, owner: &str, slug: &str, tag: &str, log: &Logger) -> Res<()>;
+    /// GitHub's build status for a pushed commit.
+    fn build_status(&self, owner: &str, slug: &str, commit: &str) -> Res<Build>;
+
     fn repo_url(&self, owner: &str, slug: &str) -> String {
         format!("https://github.com/{owner}/{slug}")
     }
@@ -295,6 +374,83 @@ impl GitHubApi for RealGh {
         )
         .map(|_| ())
     }
+
+    fn delete_release(&self, owner: &str, slug: &str, tag: &str, log: &Logger) -> Res<()> {
+        let repo = format!("{owner}/{slug}");
+        match gh_logged(
+            &[
+                "release",
+                "delete",
+                tag,
+                "-R",
+                &repo,
+                "--cleanup-tag",
+                "--yes",
+            ],
+            &Opts::default_timeout().with_timeout(60),
+            log,
+            "release",
+        ) {
+            Ok(_) => Ok(()),
+            // No release (only a tag): delete the tag itself.
+            Err(e) if e.to_ascii_lowercase().contains("not found") => {
+                let o = gh(&[
+                    "api",
+                    "-X",
+                    "DELETE",
+                    &format!("repos/{repo}/git/refs/tags/{tag}"),
+                ]);
+                if o.ok() || o.combined().contains("Reference does not exist") {
+                    Ok(())
+                } else {
+                    Err(o.combined())
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn build_status(&self, owner: &str, slug: &str, commit: &str) -> Res<Build> {
+        let repo = format!("{owner}/{slug}");
+        let o = gh(&[
+            "run",
+            "list",
+            "-R",
+            &repo,
+            "--commit",
+            commit,
+            "--limit",
+            "20",
+            "--json",
+            "databaseId,status,conclusion,url,workflowName",
+        ]);
+        if !o.ok() {
+            return Err(o.combined());
+        }
+        let runs: Vec<serde_json::Value> = serde_json::from_str(&o.stdout).unwrap_or_default();
+        Ok(match summarize_runs(&runs) {
+            (RunsState::None, _) => Build::None,
+            (RunsState::Running(url), _) => Build::Running { url },
+            (RunsState::Passed(url), _) => Build::Passed { url },
+            (RunsState::Failed(url), id) => {
+                let (step, log) = match id {
+                    Some(id) => {
+                        let id = id.to_string();
+                        let jobs = gh(&["run", "view", &id, "-R", &repo, "--json", "jobs"]);
+                        let log = gh(&["run", "view", &id, "-R", &repo, "--log-failed"]);
+                        let mut tail: Vec<&str> = log.stdout.lines().rev().take(60).collect();
+                        tail.reverse();
+                        (
+                            failed_step(&jobs.stdout).unwrap_or_else(|| "a step".into()),
+                            tail.join("\n"),
+                        )
+                    }
+                    None => ("a step".into(), String::new()),
+                };
+                Build::Failed { url, step, log }
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------- fake
@@ -415,6 +571,10 @@ impl GitHubApi for FakeGh {
         notes: Option<&str>,
         _log: &Logger,
     ) -> Res<()> {
+        // Tests make GitHub fail release creation by leaving this file.
+        if let Ok(why) = std::fs::read_to_string(self.root.join("fail-release")) {
+            return Err(why);
+        }
         if let Some(n) = notes {
             std::fs::write(
                 self.bare(owner, slug)
@@ -433,6 +593,38 @@ impl GitHubApi for FakeGh {
     }
     fn repo_url(&self, owner: &str, slug: &str) -> String {
         self.bare(owner, slug).display().to_string()
+    }
+
+    fn delete_release(&self, owner: &str, slug: &str, tag: &str, _log: &Logger) -> Res<()> {
+        let mut v = self.releases(owner, slug);
+        v.retain(|(t, _)| t != tag);
+        std::fs::write(
+            self.bare(owner, slug).join("stowlock-releases.json"),
+            serde_json::to_string(&v).unwrap_or_default(),
+        )
+        .ctx("releases")?;
+        let _ = git::git_bare(&self.bare(owner, slug), &["tag", "-d", tag]);
+        Ok(())
+    }
+
+    /// Tests set the build result in `<root>/build.json` as
+    /// {"state":"passed"|"running"|"failed","step":"…","log":"…"}.
+    fn build_status(&self, _owner: &str, _slug: &str, _commit: &str) -> Res<Build> {
+        let Ok(t) = std::fs::read_to_string(self.root.join("build.json")) else {
+            return Ok(Build::None);
+        };
+        let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+        let url = "https://github.com/test/build/1".to_string();
+        Ok(match v["state"].as_str() {
+            Some("passed") => Build::Passed { url },
+            Some("running") => Build::Running { url },
+            Some("failed") => Build::Failed {
+                url,
+                step: v["step"].as_str().unwrap_or("a step").into(),
+                log: v["log"].as_str().unwrap_or("").into(),
+            },
+            _ => Build::None,
+        })
     }
 }
 
@@ -460,5 +652,42 @@ mod tests {
         assert_eq!(b[0].login, "octo");
         assert!(b[0].active && !b[0].secure);
         assert!(parse_auth_status("You are not logged into any GitHub hosts.").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    #[test]
+    fn summarises_a_commits_runs() {
+        let j = |s: &str| -> Vec<serde_json::Value> { serde_json::from_str(s).unwrap() };
+        assert_eq!(summarize_runs(&[]).0, RunsState::None);
+        let running = j(
+            r#"[{"status":"in_progress","conclusion":"","url":"u1"},{"status":"completed","conclusion":"success","url":"u2"}]"#,
+        );
+        assert_eq!(summarize_runs(&running).0, RunsState::Running("u1".into()));
+        let failed = j(
+            r#"[{"status":"in_progress","conclusion":"","url":"u1"},{"status":"completed","conclusion":"failure","url":"u3","databaseId":42}]"#,
+        );
+        assert_eq!(
+            summarize_runs(&failed),
+            (RunsState::Failed("u3".into()), Some(42))
+        );
+        let ok = j(
+            r#"[{"status":"completed","conclusion":"success","url":"u2"},{"status":"completed","conclusion":"skipped","url":"u4"}]"#,
+        );
+        assert_eq!(summarize_runs(&ok).0, RunsState::Passed("u2".into()));
+    }
+
+    #[test]
+    fn names_the_failed_step() {
+        let jobs = r#"{"jobs":[{"name":"test","conclusion":"success","steps":[]},
+            {"name":"arch","conclusion":"failure","steps":[{"name":"Install tools","conclusion":"success"},{"name":"cargo test --locked","conclusion":"failure"}]}]}"#;
+        assert_eq!(
+            failed_step(jobs).as_deref(),
+            Some("arch (cargo test --locked)")
+        );
+        assert_eq!(failed_step("{}"), None);
     }
 }
