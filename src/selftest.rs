@@ -915,9 +915,9 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
     rn.check(
         "T20",
         "Self-update",
-        "Update channels; version comparison; checksum mismatch rejected",
-        "updater.rs",
-        "Check is_newer and verify_checksum.",
+        "Update channels; version comparison; checksum mismatch and bad signatures rejected",
+        "updater.rs / signing.rs",
+        "Check is_newer, verify_download and the built-in signing keys.",
         Box::new(|| {
             ensure!(
                 updater::is_newer("v9.0.0", APP_VERSION, false)
@@ -937,6 +937,23 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
                 updater::verify_checksum(&f, &format!("{}  bin", "0".repeat(64))).is_err(),
                 "mismatch rejected",
                 "accepted"
+            );
+            let keys = crate::signing::trusted_keys();
+            ensure!(
+                keys.len() == 2,
+                "both signing keys built in",
+                "signing keys missing"
+            );
+            let sums = format!(
+                "{}  {}\n",
+                updater::sha256_hex(&f).unwrap_or_default(),
+                updater::ASSET
+            );
+            ensure!(
+                updater::verify_download(&f, sums.as_bytes(), "not a signature", &keys, "v9.0.0")
+                    .is_err(),
+                "unsigned download rejected",
+                "accepted without a signature"
             );
             Ok(None)
         }),

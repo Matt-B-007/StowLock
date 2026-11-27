@@ -81,7 +81,7 @@ cargo build --release
 ## Updates
 
 - **Settings → Update channel:** **Stable** offers only full releases; **Beta** also offers betas. If you're running a beta, it starts on Beta. It never offers an older version.
-- The update notice shows **What's new** and an **Update** button; StowLock downloads the new version, checks it against its published checksum, swaps it in and restarts. No GitHub sign-in is needed for updates.
+- The update notice shows **What's new** and an **Update** button. StowLock downloads the new version and installs it only if its checksum matches **and** the checksum list carries a valid signature from StowLock's signing key (minisign; the public keys are in `packaging/minisign/` and built into the app). A release without a valid signature is treated as not available yet. Then it swaps the new version in and restarts. No GitHub sign-in is needed for updates.
 - From a terminal: `stowlock --update`.
 - **Going back:** the version you had before an update is kept. Use **Settings → Go back to …**, or run `stowlock --rollback` if the window won't open. If a new version crashes, StowLock offers to go back the next time it starts.
 - If you open a newer copy while an older one is running, StowLock asks whether to switch.

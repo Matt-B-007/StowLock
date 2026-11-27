@@ -27,6 +27,7 @@ mod proc;
 mod report;
 mod secrets;
 mod selftest;
+mod signing;
 mod state;
 mod ui;
 mod uninstall;

@@ -129,11 +129,15 @@ fn fetch(url: &str, out: Option<&Path>, secs: u64) -> Res<String> {
     }
 }
 
-/// Has GitHub's build attached the app to this release? A release whose
-/// build failed, or is still running, has no app yet and is never offered.
+/// Is this release ready to install: the app attached, and its checksums
+/// signed? A release whose build failed or is still running, or one without
+/// a signature, counts as "not available yet" and is never offered.
 fn has_app(r: &serde_json::Value) -> bool {
     match r["assets"].as_array() {
-        Some(a) => a.iter().any(|x| x["name"].as_str() == Some(ASSET)),
+        Some(a) => {
+            let has = |n: &str| a.iter().any(|x| x["name"].as_str() == Some(n));
+            has(ASSET) && has(crate::signing::SUMS) && has(crate::signing::SUMS_SIG)
+        }
         None => true, // an answer without asset details: don't block on it
     }
 }
@@ -341,6 +345,28 @@ pub fn verify_checksum(file: &Path, sha_text: &str) -> Res<()> {
     }
 }
 
+/// Check a download before installing it: the signature on SHA256SUMS must be
+/// valid for one of `keys` and made for `tag`, and the download must match the
+/// checksum SHA256SUMS lists for it.
+pub fn verify_download(
+    bin: &Path,
+    sums: &[u8],
+    sig: &str,
+    keys: &[minisign_verify::PublicKey],
+    tag: &str,
+) -> Res<()> {
+    crate::signing::verify(sums, sig, keys, tag)?;
+    let text = String::from_utf8_lossy(sums);
+    let want = crate::signing::checksum_for(&text, ASSET).ok_or_else(|| {
+        "The release's checksum list doesn't include the app, so it wasn't installed.".to_string()
+    })?;
+    if sha256_hex(bin)? == want {
+        Ok(())
+    } else {
+        Err("The download doesn't match its checksum, so it wasn't installed.".into())
+    }
+}
+
 /// Download, verify and install `tag`. The version being replaced is kept so
 /// the user can go back. Returns the path that was replaced.
 pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathBuf> {
@@ -356,13 +382,26 @@ pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathB
     util::ensure_private_dir(&dir)?;
     let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let bin = dir.join(ASSET);
-    let sha_file = dir.join(format!("{ASSET}.sha256"));
+    let sums_file = dir.join(crate::signing::SUMS);
+    let sig_file = dir.join(crate::signing::SUMS_SIG);
     let direct = fetch(&format!("{base}/{ASSET}"), Some(&bin), 300)
-        .and_then(|_| fetch(&format!("{base}/{ASSET}.sha256"), Some(&sha_file), 60));
+        .and_then(|_| {
+            fetch(
+                &format!("{base}/{}", crate::signing::SUMS),
+                Some(&sums_file),
+                60,
+            )
+        })
+        .and_then(|_| {
+            fetch(
+                &format!("{base}/{}", crate::signing::SUMS_SIG),
+                Some(&sig_file),
+                60,
+            )
+        });
     if let Err(e) = direct {
         // A private repo: download through the user's GitHub sign-in instead.
         let d = dir.display().to_string();
-        let pattern = format!("{ASSET}*");
         let o = proc::run(
             "gh",
             &[
@@ -372,7 +411,9 @@ pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathB
                 "--repo",
                 repo,
                 "--pattern",
-                &pattern,
+                ASSET,
+                "--pattern",
+                "SHA256SUMS*",
                 "--dir",
                 &d,
                 "--clobber",
@@ -383,13 +424,13 @@ pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathB
             return Err(format!("The download failed. {}", explain_fetch_error(&e)));
         }
     }
-    if !sha_file.exists() {
-        return Err("The release has no checksum file, so it wasn't installed.".into());
-    }
+    let sums = std::fs::read(&sums_file)
+        .map_err(|_| "The release has no checksum list, so it wasn't installed.".to_string())?;
+    let sig = std::fs::read_to_string(&sig_file)
+        .map_err(|_| "The release isn't signed, so it wasn't installed.".to_string())?;
     log.info("update", &format!("Downloaded StowLock {tag}"));
-    let sha = std::fs::read_to_string(&sha_file)
-        .map_err(|_| "The release has no checksum file, so it wasn't installed.".to_string())?;
-    verify_checksum(&bin, &sha)?;
+    verify_download(&bin, &sums, &sig, &crate::signing::trusted_keys(), tag)?;
+    log.info("update", "Checksum and signature verified");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
         .ctx("making it executable")?;
     keep_previous(paths, &exe, APP_VERSION)?;
@@ -458,12 +499,49 @@ mod tests {
     fn releases_without_the_app_are_never_offered() {
         let json = r#"[
             {"tag_name":"v9.0.1","prerelease":false,"draft":false,"assets":[{"name":"stowlock-linux-x86_64.sha256"}]},
-            {"tag_name":"v9.0.0","prerelease":false,"draft":false,"assets":[{"name":"stowlock-linux-x86_64"},{"name":"stowlock-linux-x86_64.sha256"}]}
+            {"tag_name":"v9.0.0","prerelease":false,"draft":false,"assets":[{"name":"stowlock-linux-x86_64"},{"name":"stowlock-linux-x86_64.sha256"},{"name":"SHA256SUMS"},{"name":"SHA256SUMS.minisig"}]}
         ]"#;
         assert_eq!(
             pick_from_releases(json, "0.1.0", false).unwrap().tag,
             "v9.0.0"
         );
+    }
+
+    #[test]
+    fn unsigned_releases_are_not_available_yet() {
+        let json = r#"[
+            {"tag_name":"v9.0.1","prerelease":false,"draft":false,"assets":[{"name":"stowlock-linux-x86_64"},{"name":"stowlock-linux-x86_64.sha256"}]}
+        ]"#;
+        assert!(pick_from_releases(json, "0.1.0", false).is_none());
+    }
+
+    #[test]
+    fn downloads_are_checked_against_signed_checksums() {
+        use crate::signing::test_keys::TestKey;
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join(ASSET);
+        std::fs::write(&bin, b"new stowlock").unwrap();
+        let key = TestKey::new();
+        let keys = [key.public()];
+        let sums = format!("{}  {ASSET}\n", sha256_hex(&bin).unwrap());
+        let sig = key.sign(sums.as_bytes(), "StowLock v9.0.0");
+        assert!(verify_download(&bin, sums.as_bytes(), &sig, &keys, "v9.0.0").is_ok());
+        // A swapped download fails the checksum, even with a good signature.
+        std::fs::write(&bin, b"tampered").unwrap();
+        let e = verify_download(&bin, sums.as_bytes(), &sig, &keys, "v9.0.0").unwrap_err();
+        assert!(e.contains("doesn't match its checksum"), "{e}");
+        // A checksum list edited to match the tampered file fails the signature.
+        let forged = format!("{}  {ASSET}\n", sha256_hex(&bin).unwrap());
+        assert!(verify_download(&bin, forged.as_bytes(), &sig, &keys, "v9.0.0").is_err());
+        // The built-in keys don't trust a test key.
+        assert!(verify_download(
+            &bin,
+            forged.as_bytes(),
+            &key.sign(forged.as_bytes(), "StowLock v9.0.0"),
+            &crate::signing::trusted_keys(),
+            "v9.0.0"
+        )
+        .is_err());
     }
 
     #[test]

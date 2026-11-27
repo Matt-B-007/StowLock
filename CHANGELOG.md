@@ -4,6 +4,19 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.1.0-beta.9] - 2026-11-26
+
+The first signed release. From here on, StowLock only installs updates that are signed with its own key.
+
+### Added
+- **Signed updates.** Every release's checksum list (`SHA256SUMS`) is signed with minisign in the release workflow, which fails before building if the signing secret is missing and checks the signatures against both public keys before anything is published. StowLock builds in two public keys, a primary and an offline backup, and accepts a signature from either.
+- **StowLock refuses an update unless the checksum and the signature are both valid,** and the signature was made for that exact version (so an older signed release can't be passed off as a newer one). A release without a signature counts as "not available yet". Going back to the previous version still works, because it uses the copy kept on your computer.
+- The self-test also checks that both signing keys are built in and that an unsigned download is refused.
+
+### Notes
+- This release is installed by the previous version's checksum-only updater; the signature check starts with the next release.
+- The old `stowlock-linux-x86_64.sha256` file is still published (now signed too), so versions up to 0.1.0-beta.8 and the one-line installer keep working. It will stay until no supported version needs it; the cut-off will be noted here.
+
 ## [0.1.0-beta.8] - 2026-11-26
 
 ### Changed
