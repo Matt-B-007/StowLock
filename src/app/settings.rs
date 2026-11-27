@@ -104,6 +104,11 @@ impl App {
                     "Like GitHub's clean machine: a fresh home folder, without your desktop session",
                 )
                 .on_hover_text("Tests don't see your settings, app data or running desktop, as on GitHub. Tool caches are kept, so it stays fast.");
+                ui.checkbox(
+                    &mut self.config.github_fonts,
+                    "Only GitHub's fonts: run checks with just the DejaVu fonts GitHub's machine has",
+                )
+                .on_hover_text("Text that only fits with your own fonts fails here too, before you push. Fonts a project bundles and loads itself still work.");
                 let act_ready = proc::which("act").is_some() && proc::which("docker").is_some();
                 ui.add_enabled_ui(act_ready, |ui| {
                     ui.checkbox(

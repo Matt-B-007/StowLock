@@ -584,6 +584,7 @@ pub fn run(real: &AppPaths, online: bool) -> SelfTestReport {
                 match_github: false,
                 exact: false,
                 clean_home: false,
+                github_fonts: false,
                 timeout_secs: 60,
                 cancel: Default::default(),
                 pass_env: false,

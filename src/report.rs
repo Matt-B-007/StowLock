@@ -547,7 +547,10 @@ pub fn project_fix_prompt(summary: &str, output: &[String]) -> String {
         .take(40)
         .collect();
     let machine = summary.contains(crate::preflight::MACHINE_SPECIFIC);
-    let mut p = String::from(if machine {
+    let fonts = summary.contains(crate::preflight::FONT_SPECIFIC);
+    let mut p = String::from(if fonts {
+        "My project's tests fail when they're run with only the fonts GitHub's Ubuntu machine has (DejaVu), so they'd fail on GitHub too. Text that fits with my own fonts doesn't fit with those.\n"
+    } else if machine {
         "Some of my project's tests fail only on my own computer, not on GitHub's clean machine. The output shows they depend on things on my computer (a running copy of the app, my home folder or desktop settings).\n"
     } else {
         "My project's tests failed when StowLock checked it before pushing to GitHub.\n"
@@ -561,7 +564,9 @@ pub fn project_fix_prompt(summary: &str, output: &[String]) -> String {
             p.push_str(&format!("  {f}\n"));
         }
     }
-    if machine {
+    if fonts {
+        p.push_str("Fix it so the result doesn't depend on which fonts are installed: bundle the font(s) the app uses (an open-licence font, with its licence next to the others) and load them at startup before any window is built, so the app and its tests get them the same way. Let text that might not fit shorten with the whole text in a tooltip, or give it room. Don't loosen or skip the check. Prove it by running the tests with fontconfig limited to DejaVu (FONTCONFIG_FILE pointing to a fonts.conf that lists only a folder of DejaVu fonts). Give me the updated project as a zip.\n");
+    } else if machine {
         p.push_str("Change the tests so they don't depend on the real machine: give them fakes or fixed values (for example a fake process list or a fixed effects setting). Don't change how the app behaves. Give me the updated project as a zip.\n");
     } else {
         p.push_str(
@@ -1296,6 +1301,20 @@ mod tests {
                 .any(|l| l.contains("Check Qt libraries") || l.contains("missing libraries")),
             "{last:?}"
         );
+    }
+
+    #[test]
+    fn font_failures_ask_for_bundled_fonts() {
+        let p = project_fix_prompt(
+            &format!(
+                "GitHub step \"Tests\" failed · 1 failed · {}",
+                crate::preflight::FONT_SPECIFIC
+            ),
+            &["E  ('tile', 'text cut off', 'tilename', 'Broadcast', 87, 75)".to_string()],
+        );
+        assert!(p.contains("bundle the font"), "{p}");
+        assert!(p.contains("Don't loosen"), "{p}");
+        assert!(!p.contains("so these tests pass"), "{p}");
     }
 
     #[test]

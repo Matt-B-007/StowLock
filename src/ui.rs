@@ -39,14 +39,14 @@ const fn rgb(hex: u32) -> Color32 {
 /// buttons carry ink text. Every text colour meets 4.5:1 contrast on every
 /// background it's used on (the tests below check).
 const DARK: Pal = Pal {
-    bg: rgb(0x0F141B),
-    side: rgb(0x0B0F15),
-    card: rgb(0x151B24),
-    control: rgb(0x1B2330),
-    hover: rgb(0x232D3B),
-    border: rgb(0x2A3444),
+    bg: rgb(0x0C1016),
+    side: rgb(0x080B10),
+    card: rgb(0x131922),
+    control: rgb(0x1A212C),
+    hover: rgb(0x212A37),
+    border: rgb(0x263040),
     text: rgb(0xE8EDF4),
-    muted: rgb(0x9DA9BA),
+    muted: rgb(0x9AA6B8),
     accent: rgb(0x34D399),
     accent_btn: rgb(0x34D399),
     on_accent: rgb(0x0C1016),
@@ -59,13 +59,13 @@ const DARK: Pal = Pal {
 /// House Standard v1.3, light.
 const LIGHT: Pal = Pal {
     bg: rgb(0xF5F7FA),
-    side: rgb(0xECF0F5),
+    side: rgb(0xEDF1F5),
     card: rgb(0xFFFFFF),
-    control: rgb(0xF0F3F7),
-    hover: rgb(0xE3E8EF),
-    border: rgb(0xDDE3EB),
-    text: rgb(0x0F1622),
-    muted: rgb(0x536175),
+    control: rgb(0xF1F4F8),
+    hover: rgb(0xE9EEF4),
+    border: rgb(0xDCE3EB),
+    text: rgb(0x0F1620),
+    muted: rgb(0x556274),
     accent: rgb(0x047857),
     accent_btn: rgb(0x047857),
     on_accent: rgb(0xFFFFFF),
@@ -279,8 +279,9 @@ pub fn apply_theme(ctx: &egui::Context, light: bool) {
     v.hyperlink_color = p.accent;
     v.selection.bg_fill = p.accent_btn.linear_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0_f32, p.accent);
-    v.window_corner_radius = CornerRadius::same(14);
-    v.menu_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(16);
+    v.window_stroke = Stroke::new(1.0_f32, p.accent.gamma_multiply(0.18));
+    v.menu_corner_radius = CornerRadius::same(8);
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -288,7 +289,7 @@ pub fn apply_theme(ctx: &egui::Context, light: bool) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(10);
+        w.corner_radius = CornerRadius::same(8);
     }
     v.widgets.noninteractive.bg_fill = p.card;
     v.widgets.noninteractive.weak_bg_fill = p.card;
@@ -333,16 +334,53 @@ pub fn apply_theme(ctx: &egui::Context, light: bool) {
 
 /// A rounded card with generous padding.
 pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
-    egui::Frame::new()
+    card_active(ui, false, add)
+}
+
+/// The accent at a given strength (0–1), for edges and glows.
+pub fn accent_alpha(strength: f32) -> Color32 {
+    ACCENT().gamma_multiply(strength)
+}
+
+/// A card. Its edge is the accent at low strength (like the logo's edge);
+/// when it's the active card, or holds the focused control, small accent
+/// brackets mark its corners (the family's sci-fi detail).
+pub fn card_active<R>(ui: &mut Ui, active: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let out = egui::Frame::new()
         .fill(CARD())
-        .stroke(Stroke::new(1.0_f32, BORDER()))
-        .corner_radius(CornerRadius::same(14))
+        .stroke(Stroke::new(1.0_f32, accent_alpha(0.18)))
+        .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::same(20))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
-        })
-        .inner
+        });
+    let rect = out.response.rect;
+    let ctx = ui.ctx().clone();
+    let focused_inside = ctx
+        .memory(|m| m.focused())
+        .and_then(|id| ctx.read_response(id))
+        .is_some_and(|r| rect.contains_rect(r.rect));
+    if active || focused_inside {
+        corner_brackets(ui.painter(), rect);
+    }
+    out.inner
+}
+
+/// Four small L-shaped brackets just inside a card's rounded corners.
+fn corner_brackets(p: &egui::Painter, r: egui::Rect) {
+    let s = Stroke::new(2.0_f32, ACCENT());
+    let (inset, len) = (5.0, 14.0);
+    let r = r.shrink(inset);
+    for (corner, dx, dy) in [
+        (r.left_top(), 1.0, 1.0),
+        (r.right_top(), -1.0, 1.0),
+        (r.left_bottom(), 1.0, -1.0),
+        (r.right_bottom(), -1.0, -1.0),
+    ] {
+        p.line_segment([corner, corner + Vec2::new(dx * len, 0.0)], s);
+        p.line_segment([corner, corner + Vec2::new(0.0, dy * len)], s);
+    }
 }
 
 /// A quieter inset panel inside a card.
@@ -412,9 +450,27 @@ pub fn primary(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
         egui::Button::new(semibold(text, 14.5).color(if enabled { ON_ACCENT() } else { MUTED() }))
             .fill(if enabled { ACCENT_BTN() } else { CONTROL() })
             .stroke(Stroke::NONE)
-            .corner_radius(CornerRadius::same(10))
+            .corner_radius(CornerRadius::same(8))
             .min_size(Vec2::new(150.0, 40.0));
     ui.add_enabled(enabled, btn)
+}
+
+/// The window's single main action: a primary button with a soft accent
+/// glow (only ever one at a time).
+pub fn primary_glow(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
+    let behind = ui.painter().add(egui::Shape::Noop);
+    let r = primary(ui, text, enabled);
+    if enabled {
+        let glow = egui::epaint::Shadow {
+            offset: [0, 0],
+            blur: 12,
+            spread: 0,
+            color: accent_alpha(0.35),
+        };
+        ui.painter()
+            .set(behind, glow.as_shape(r.rect, CornerRadius::same(8)));
+    }
+    r
 }
 
 /// A normal outlined button with an optional icon.
@@ -439,7 +495,7 @@ pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize, width: f32) -> 
     egui::Frame::new()
         .fill(BG())
         .stroke(Stroke::new(1.0_f32, BORDER()))
-        .corner_radius(CornerRadius::same(10))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(3))
         .show(ui, |ui| {
             ui.set_width(width - 8.0);
@@ -492,7 +548,7 @@ pub fn nav_item(
     let painter = ui.painter_at(rect);
     painter.rect_filled(
         rect,
-        CornerRadius::same(10),
+        CornerRadius::same(8),
         if hovered && !on { pal().hover } else { fill },
     );
     let c = if hovered { TEXT() } else { color };
@@ -704,38 +760,37 @@ mod tests {
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
     }
 
+    /// House Standard v1.3: every text colour on every surface, both themes
+    /// (text ≥ 12.3:1, muted ≥ 5.0:1, accent and status ≥ 4.5:1), plus the
+    /// ink or white on filled accent buttons.
     #[test]
     fn every_text_colour_is_readable_in_both_themes() {
         for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
-            for (fg, fg_name) in [
-                (p.text, "text"),
-                (p.muted, "muted"),
-                (p.accent, "accent"),
-                (p.success, "success"),
-                (p.warning, "warning"),
-                (p.error, "error"),
+            for (fg, fg_name, min) in [
+                (p.text, "text", 12.3),
+                (p.muted, "muted", 5.0),
+                (p.accent, "accent", 4.5),
+                (p.success, "success", 4.5),
+                (p.warning, "warning", 4.5),
+                (p.error, "error", 4.5),
             ] {
                 for (bg, bg_name) in [
                     (p.bg, "bg"),
+                    (p.side, "sidebar"),
                     (p.card, "card"),
-                    (p.side, "side"),
                     (p.control, "control"),
+                    (p.hover, "hover"),
                 ] {
                     let c = contrast(fg, bg);
-                    assert!(c >= 4.5, "{name}: {fg_name} on {bg_name} is {c:.2}:1");
+                    assert!(c >= min, "{name}: {fg_name} on {bg_name} is {c:.2}:1");
                 }
             }
-            assert!(
-                contrast(p.on_accent, p.accent_btn) >= 4.5,
-                "{name}: button text"
-            );
+            let button = if name == "dark" { 7.2 } else { 5.1 };
+            let c = contrast(p.on_accent, p.accent_btn);
+            assert!(c >= button, "{name}: filled button text is {c:.2}:1");
             assert!(
                 contrast(p.accent, p.accent_soft) >= 4.5,
                 "{name}: selected nav item"
-            );
-            assert!(
-                contrast(p.text, p.hover) >= 4.5,
-                "{name}: text on a hovered row"
             );
         }
     }

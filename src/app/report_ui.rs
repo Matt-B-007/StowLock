@@ -145,7 +145,7 @@ impl App {
                 ui.label(ui::muted("Preview: exactly what gets shared.").size(12.5));
                 egui::Frame::new()
                     .fill(ui::BG())
-                    .corner_radius(egui::CornerRadius::same(10))
+                    .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());

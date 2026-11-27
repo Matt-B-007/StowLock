@@ -125,6 +125,8 @@ pub struct Config {
     pub exact_github_checks: bool,
     /// Run GitHub steps in a fresh home folder without the desktop session.
     pub clean_test_home: bool,
+    /// Run GitHub steps with only the fonts GitHub's machine has (DejaVu).
+    pub github_fonts: bool,
     pub report_retention_days: u32,
     /// Advanced: where StowLock checks for its own updates.
     pub update_repo: String,
@@ -157,6 +159,7 @@ impl Default for Config {
             match_github_checks: true,
             exact_github_checks: false,
             clean_test_home: true,
+            github_fonts: true,
             report_retention_days: 30,
             update_repo: UPDATE_REPO.into(),
             tour_seen: false,

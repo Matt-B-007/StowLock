@@ -2,7 +2,9 @@
 //! The window icon, drawn in code from the same shapes as
 //! `assets/stowlock.svg` (so no image libraries are needed).
 
-const BG: [u8; 3] = [0x0F, 0x16, 0x20];
+const BG: [u8; 3] = [0x0C, 0x10, 0x16];
+/// The edge: the accent at 35 % over the background (House Standard v1.3).
+const EDGE: [u8; 3] = [0x1A, 0x54, 0x44];
 const SKY: [u8; 3] = [0x38, 0xBD, 0xF8];
 const EMERALD: [u8; 3] = [0x34, 0xD3, 0x99];
 
@@ -37,6 +39,10 @@ fn in_keyhole(x: f32, y: f32) -> bool {
 fn sample(x: f32, y: f32) -> Option<[u8; 3]> {
     if !in_rrect(x, y, 0.0, 0.0, 256.0, 256.0, 56.0) {
         return None;
+    }
+    // A thin edge (1 px at 64 px and up; it stays visible when small).
+    if !in_rrect(x, y, 4.0, 4.0, 248.0, 248.0, 52.0) {
+        return Some(EDGE);
     }
     if in_rrect(x, y, 40.0, 44.0, 176.0, 172.0, 28.0) {
         let dark = in_rect(x, y, 40.0, 96.0, 176.0, 12.0) || in_keyhole(x, y);

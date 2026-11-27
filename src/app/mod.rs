@@ -159,6 +159,12 @@ struct SignInUi {
 #[derive(Clone)]
 struct Session {
     zip: Option<PathBuf>,
+    /// The loaded zip's size, time and fingerprint.
+    zip_info: Option<crate::zipinfo::ZipInfo>,
+    /// It's byte for byte the zip staged last time for this project.
+    same_zip: bool,
+    /// The browser saved a newer copy of this download beside it.
+    newer_copy: Option<PathBuf>,
     slug: String,
     owner: String,
     mode: Mode,
@@ -210,6 +216,9 @@ impl Session {
     fn new(config: &Config) -> Self {
         Session {
             zip: None,
+            zip_info: None,
+            same_zip: false,
+            newer_copy: None,
             slug: String::new(),
             owner: String::new(),
             mode: Mode::New,

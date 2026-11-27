@@ -273,13 +273,14 @@ impl App {
             (ui::CARD(), BORDER())
         };
         let mut pick = false;
+        let mut use_newer: Option<PathBuf> = None;
         egui::Frame::new()
             .fill(fill)
             .stroke(egui::Stroke::new(
                 if hovering { 2.0_f32 } else { 1.0 },
                 stroke,
             ))
-            .corner_radius(egui::CornerRadius::same(14))
+            .corner_radius(egui::CornerRadius::same(16))
             .inner_margin(egui::Margin::same(if has_zip { 16 } else { 28 }))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -346,19 +347,52 @@ impl App {
                                     }
                                     m
                                 } else {
-                                    format!("{sub} · drop another zip here to replace it")
+                                    match &self.session.zip_info {
+                                        Some(i) => format!("{} · {sub}", i.describe()),
+                                        None => sub.clone(),
+                                    }
                                 };
-                                ui.add(egui::Label::new(ui::muted(meta).size(13.0)).truncate());
+                                ui.add(egui::Label::new(ui::muted(meta).size(13.0)).truncate())
+                                    .on_hover_text(&sub);
                             });
                         });
                     });
+                    // Make sure it's the zip you meant.
+                    if self.session.stage.is_none() {
+                        if let Some(newer) = self.session.newer_copy.clone() {
+                            ui::banner(ui, WARNING(), |ui| {
+                                ui.add(
+                                    egui::Label::new(format!(
+                                        "There's a newer copy of this download beside it: {}",
+                                        newer
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default()
+                                    ))
+                                    .wrap(),
+                                );
+                                if ui::button(ui, ui::icon::PACKAGE, "Use the newer copy").clicked() {
+                                    use_newer = Some(newer.clone());
+                                }
+                            });
+                        } else if self.session.same_zip {
+                            ui::banner(ui, WARNING(), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        "This is the same zip as last time (identical contents). If you downloaded a fixed one, choose it instead.",
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
+                    }
                 } else {
                     ui.vertical_centered(|ui| {
                         let (r, _) =
                             ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
                         ui.painter().rect_filled(
                             r,
-                            egui::CornerRadius::same(14),
+                            egui::CornerRadius::same(16),
                             ui::ACCENT_SOFT(),
                         );
                         ui.painter().text(
@@ -385,6 +419,9 @@ impl App {
             });
         if pick {
             self.pick_zip();
+        }
+        if let Some(z) = use_newer {
+            self.load_zip(z);
         }
         if !has_zip {
             ui.add_space(8.0);
@@ -935,7 +972,8 @@ ui::named(cb.response, "License");
     pub(super) fn results_card(&mut self, ui: &mut egui::Ui) {
         let steps = self.log.steps();
         let Some(st) = self.session.stage.clone() else {
-            ui::card(ui, |ui| {
+            let working = self.busy.is_some();
+            ui::card_active(ui, working, |ui| {
                 ui::section_title(ui, "PIPELINE");
                 ui::stepper(ui, &STEPS, &steps, &WAITING);
                 if self.busy.is_some() {
@@ -1004,7 +1042,8 @@ ui::named(cb.response, "License");
         });
         ui.add_space(8.0);
         // ---- checks
-        ui::card(ui, |ui| {
+        let working = self.busy.is_some();
+        ui::card_active(ui, working, |ui| {
             ui::section_title(ui, "CHECKS");
             // Text here can't be selected with the mouse (that would copy it
             // unhidden): the Copy buttons hide private things first.

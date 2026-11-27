@@ -4,6 +4,28 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.2.0-beta.2] - 2026-11-27
+
+Checks that catch font problems before GitHub does, a clear view of which zip you loaded, and the exact House Standard v1.3 colours.
+
+### Added
+- **Only GitHub's fonts** (Settings → Checks, on by default). GitHub steps run with just the DejaVu fonts GitHub's Ubuntu machine has, with the same fallbacks: any other font name becomes DejaVu Sans. Text that only fits with your own fonts now fails here too, before you push. Fonts a project bundles and loads itself still work, as they do on GitHub.
+- **Font failures are named.** When a failure looks like text not fitting ("text cut off" and similar) under GitHub's fonts, the checks card says "looks like a font difference", explains why, and Copy for AI asks the project to bundle its fonts and let text shorten with a tooltip.
+- **DejaVu fonts in Your tools,** with Install missing tools when they're not installed (`ttf-dejavu`).
+- **Which zip you loaded:** the Stage card shows the zip's size and when it was saved, and the log records them too.
+- **"This is the same zip as last time"** when the zip you load is byte for byte the one you last staged for that project.
+- **"There's a newer copy of this download beside it"** when the browser saved a later copy, such as `name(1).zip`, with a button to use it.
+
+### Changed
+- **House Standard v1.3 colours, exactly:** the navy neutrals for both themes from the colour table. StowLock's accent stays emerald.
+- **The contrast test checks every text colour on every surface** (background, sidebar, card, control and hover) in both themes: text at least 12.3:1, muted at least 5.0:1, accent and status colours at least 4.5:1. It also checks filled buttons: ink at least 7.2:1 in dark, white at least 5.1:1 in light.
+- **Family details:**
+  - Cards have a faint emerald edge.
+  - The card that's working, or holds the control you're typing in, gets small emerald corner brackets.
+  - The single main action has a soft glow.
+  - Corners are 8, 12 and 16 px only, and pop-ups have the same faint edge.
+- **The icon's background is #0C1016 with a thin emerald edge at 35 %.**
+
 ## [0.2.0-beta.1] - 2026-11-27
 
 The family look, keyboard shortcuts and a tour, a newer egui underneath, and checks that behave more like GitHub.

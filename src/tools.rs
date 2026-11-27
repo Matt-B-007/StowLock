@@ -89,6 +89,15 @@ pub fn survey() -> Vec<ToolInfo> {
             other_fix: None,
         });
     }
+    // DejaVu: the fonts GitHub's machine has, for "Only GitHub's fonts".
+    let dejavu = std::path::Path::new("/usr/share/fonts");
+    out.push(ToolInfo {
+        name: "DejaVu fonts",
+        package: "ttf-dejavu",
+        why: "checks with only the fonts GitHub's machine has",
+        version: crate::preflight::has_dejavu(dejavu).then(|| "installed".to_string()),
+        other_fix: None,
+    });
     out
 }
 

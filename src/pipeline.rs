@@ -627,6 +627,7 @@ pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
             match_github: ctx.config.match_github_checks,
             exact: ctx.config.exact_github_checks,
             clean_home: ctx.config.clean_test_home,
+            github_fonts: ctx.config.github_fonts,
         };
         let r = preflight::run_tests(dir, stack, &env);
         let status = match r.status {

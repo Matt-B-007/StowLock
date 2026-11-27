@@ -87,7 +87,7 @@ impl App {
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let ok = busy.is_none() && name_ok && s.zip.is_some();
-                            if ui::primary(ui, "Archive Zip", ok).clicked() {
+                            if ui::primary_glow(ui, "Archive Zip", ok).clicked() {
                                 self.archive_note_seen = true;
                                 self.archive_only();
                             }
@@ -119,7 +119,7 @@ impl App {
                                     || !s.local_exists
                                     || s.local_is_ours
                                     || s.replace_local);
-                            if ui::primary(ui, "Stage & check", ok).clicked() {
+                            if ui::primary_glow(ui, "Stage & check", ok).clicked() {
                                 self.stage();
                             }
                         });
@@ -203,7 +203,7 @@ impl App {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if pushed {
-                            if ui::primary(ui, "Stage another zip", busy.is_none()).clicked() {
+                            if ui::primary_glow(ui, "Stage another zip", busy.is_none()).clicked() {
                                 self.pick_zip();
                             }
                             if ui::button(ui, ui::icon::EXTERNAL, "View on GitHub").clicked() {
@@ -213,7 +213,7 @@ impl App {
                             return;
                         }
                         let ok = busy.is_none() && blockers.is_empty();
-                        if ui::primary(ui, &ui::with_icon(ui::icon::UPLOAD, "Push to GitHub…"), ok).clicked() {
+                        if ui::primary_glow(ui, &ui::with_icon(ui::icon::UPLOAD, "Push to GitHub…"), ok).clicked() {
                             self.session.confirm = true;
                             self.session.confirm_at = Some(std::time::Instant::now());
                             self.session.public_ack = false;
@@ -258,7 +258,7 @@ impl App {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
                 ui.painter()
-                    .rect_filled(r, egui::CornerRadius::same(10), ui::ACCENT_SOFT());
+                    .rect_filled(r, egui::CornerRadius::same(8), ui::ACCENT_SOFT());
                 ui.painter().text(
                     r.center(),
                     egui::Align2::CENTER_CENTER,
@@ -475,7 +475,7 @@ impl App {
                         && (!public_new || self.session.public_ack)
                         && (older_tag.is_none() || self.session.older_ack);
                     let clicked =
-                        ui::primary(ui, &ui::with_icon(ui::icon::UPLOAD, &label), ready).clicked();
+                        ui::primary_glow(ui, &ui::with_icon(ui::icon::UPLOAD, &label), ready).clicked();
                     let keyed =
                         ready && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
                     if clicked || keyed {

@@ -135,7 +135,24 @@ fn click_through_the_app() {
     assert!(h
         .query_by_label_contains("Rust 1.101.0 is available")
         .is_none());
-    h.state_mut().load_zip(zip);
+    // A browser's second copy of the same download, saved later: StowLock
+    // offers it, so an older copy isn't checked by mistake.
+    let copy = zip.with_file_name("demo-app-v0.2.0(1).zip");
+    std::fs::copy(&zip, &copy).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    h.state_mut().load_zip(zip.clone());
+    steps(&mut h, 3);
+    assert!(h.query_by_label_contains("saved today").is_some());
+    click_button(&mut h, "Use the newer copy");
+    assert_eq!(h.state().session.zip.as_deref(), Some(copy.as_path()));
+    std::fs::remove_file(&copy).unwrap();
+    h.state_mut().load_zip(zip.clone());
     steps(&mut h, 3);
     // The version comes from the zip: no typing.
     assert_eq!(h.state().session.tag, "v0.2.0");

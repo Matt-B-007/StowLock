@@ -167,6 +167,12 @@ impl App {
         s.owner = self.env.login.clone().unwrap_or_default();
         s.description = format!("{}, a vibe-coded project", detect::title_from_slug(&s.slug));
         s.zip = Some(zip.clone());
+        s.zip_info = crate::zipinfo::read(&zip);
+        s.same_zip = s
+            .zip_info
+            .as_ref()
+            .is_some_and(|i| crate::zipinfo::same_as_last(&self.paths, &s.slug, &i.sha));
+        s.newer_copy = crate::zipinfo::newer_copy(&zip);
         s.found_version = detect::detect_version(&zip, &self.config.tag_prefix);
         // Fill in the version (and Stable/Beta) from the zip's own files.
         if let Some(fv) = &s.found_version {
@@ -183,8 +189,17 @@ impl App {
         self.session = s;
         self.error = None;
         self.log.begin_run(&label);
+        let about = self
+            .session
+            .zip_info
+            .as_ref()
+            .map(|i| format!(" ({})", i.describe()))
+            .unwrap_or_default();
         self.log
-            .info("intake", &format!("Loaded {}", util::tilde(&zip)));
+            .info("intake", &format!("Loaded {}{about}", util::tilde(&zip)));
+        if self.session.same_zip {
+            self.toast("This is the same zip as last time.");
+        }
         self.tab = Tab::Stage;
         self.recompute_mode();
     }
@@ -331,6 +346,9 @@ impl App {
             return;
         };
         self.session.review_when_ready = true;
+        if let Some(i) = &self.session.zip_info {
+            crate::zipinfo::remember(&self.paths, &self.session.slug, &i.sha);
+        }
         let s = &self.session;
         let req = StageRequest {
             zip,
