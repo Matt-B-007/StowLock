@@ -4,6 +4,34 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.1.0-beta.11] - 2026-11-27
+
+Fixes from real use, one-click tool installs, and a sturdier core.
+
+### Fixed
+- **Checks no longer reuse an old build of your project.** Each check starts with a fresh Python environment, as GitHub does (pip's download cache keeps it quick). A cached environment could keep an older build of a project, so a test comparing versions failed only here.
+- **Your installed programs no longer stand in for the project being checked.** During GitHub steps, `~/.local/bin` and `~/.cargo/bin` come after the system's folders, so an installed copy of an app can't be found before the freshly built one. StowLock's own tools folder comes last, so a copy it built earlier never hides the version you installed.
+- **The daily Rust check reads rustup's answer whatever its wording, capitals or colours** (it said "Couldn't check Rust" with rustup 1.29).
+- **The real missing tool is named.** When a check script prints a `sudo pacman -S …` line, those packages are named, never an earlier "Install Rust" step.
+- **Reports show a check script's whole missing-tools list,** and call a step that only couldn't run here "Couldn't run here", not a failing command.
+- Setting up Rust for the first time says "Rust set up (1.100.0)".
+- **A possible secret the scan finds isn't reported as a StowLock bug:** it's in the project's files, so the report no longer offers a "fix StowLock" AI prompt for it.
+- **StowLock's own source must pass its own secret scan** (a permanent test). A redaction test held a token-shaped example and blocked the push of this very release.
+
+### Added
+- **Your tools,** in Health: what the family's checks use (Rust through rustup, shellcheck, cargo-audit, cargo-deny, minisign, git, gh), which are installed, and their versions.
+- **Install missing tools:** one button, in Your tools and on checks that couldn't run, that installs exactly what's missing with pacman after you approve your desktop's normal password prompt. Without a password prompt, it shows the command to copy instead.
+- **Desktop notifications** when a push or GitHub's build finishes, while StowLock isn't the window in front (Settings → Updates; on by default).
+- **`stowlock --report`** saves a bug report to a file (private things hidden), for when the window won't open.
+- **The one-line installer has the standard options:** `--beta` (the default for now), `--stable`, `--version X`, `--uninstall`, `--no-launch` and `--from-source`. It checks the release's signature too, when minisign is installed. Without options it now opens StowLock when it's done. `STOWLOCK_CHANNEL` still works.
+- **"Closed unexpectedly" is noticed even when nothing could be recorded** (the system stopped StowLock, it ran out of memory, the power went). The notice has Report and Dismiss. Crash reports from the last 10 sessions are kept.
+
+### Changed
+- **Updates no longer need curl.** StowLock downloads with its own HTTPS client, which uses your system's certificates and proxy settings (including `NO_PROXY`) and retries passing network problems. If the system's DNS doesn't answer, it asks a DNS-over-HTTPS service (1.1.1.1, then 8.8.8.8), sending only the host name. Private repos still update through your gh sign-in.
+- **A new version must pass `--self-test --quick`** (it starts, loads its resources and reads settings, in seconds) before it replaces the current one. CI checks this on every push.
+- **Settings have a version number and migrate themselves** when a future version changes them. A backup is kept at most every 15 minutes (the newest 5), and a damaged settings file falls back to the newest backup.
+- **Bug report placeholders follow the House Standard:** `~`, `<user>`, `<host>`, `<ip>`, `<mac>`, `<secret>`, `<steamid>`, plus StowLock's own `<email>`, `<repo-N>`, `<account-N>`, `<workspace>` and `<serial>`. Windows-style home paths (`Z:\home\…`) are hidden too, and version numbers are never mistaken for IP addresses.
+
 ## [0.1.0-beta.10] - 2026-11-27
 
 Checks that tell the truth, re-runs from StowLock, and safer releases.

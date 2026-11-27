@@ -69,28 +69,29 @@ fn first_version(text: &str) -> Option<String> {
         .map(|w| w.to_string())
 }
 
-/// Read `rustup check` output for the stable toolchain:
-///   stable-x86_64-unknown-linux-gnu - Update available : 1.100.0 (… 2026-11-09) -> 1.101.0 (… 2026-12-18)
+/// Read `rustup check` output for the stable toolchain, whatever its exact
+/// wording, capitals or colours:
+///   stable-x86_64-unknown-linux-gnu - Update available : 1.100.0 (… 2026-11-09) -> 1.101.0 (…)
 ///   stable-x86_64-unknown-linux-gnu - Up to date : 1.100.0 (… 2026-11-09)
 pub fn parse_check(output: &str) -> Option<RustState> {
-    let line = output
-        .lines()
-        .find(|l| l.trim_start().starts_with("stable-"))?;
-    let (_, rest) = line.split_once(" - ")?;
-    if rest.starts_with("Update available") {
-        let (_, vers) = rest.split_once(':')?;
-        let (have, newest) = vers.split_once("->")?;
-        Some(RustState::UpdateAvailable {
-            have: first_version(have)?,
-            newest: first_version(newest)?,
-        })
-    } else if rest.starts_with("Up to date") {
-        let (_, v) = rest.split_once(':')?;
-        Some(RustState::UpToDate {
-            version: first_version(v)?,
-        })
+    let text = crate::util::strip_ansi(output);
+    let ver = regex::Regex::new(r"\b(\d+\.\d+\.\d+)\b").unwrap();
+    let line = text.lines().find(|l| {
+        let l = l.to_ascii_lowercase();
+        l.contains("stable") && (l.contains("up to date") || l.contains("update available"))
+    })?;
+    let lower = line.to_ascii_lowercase();
+    let found: Vec<String> = ver.captures_iter(line).map(|c| c[1].to_string()).collect();
+    if lower.contains("update available") {
+        let (have, newest) = match found.as_slice() {
+            [a, .., b] => (a.clone(), b.clone()),
+            _ => return None,
+        };
+        Some(RustState::UpdateAvailable { have, newest })
     } else {
-        None
+        Some(RustState::UpToDate {
+            version: found.first()?.clone(),
+        })
     }
 }
 
@@ -131,7 +132,8 @@ pub fn check(paths: &AppPaths) -> RustState {
 
 /// `rustup update stable` (or set stable as the default when there's none).
 /// Updating replaces the old stable in place, so no old copy is left behind.
-pub fn update(state: &RustState) -> Res<String> {
+/// Returns the version and what happened ("Rust set up (1.100.0)").
+pub fn update(state: &RustState) -> Res<(String, String)> {
     let opts = Opts::default_timeout().with_timeout(900);
     let args: &[&str] = if *state == RustState::NoDefault {
         &["default", "stable"]
@@ -146,7 +148,13 @@ pub fn update(state: &RustState) -> Res<String> {
         ));
     }
     let v = proc::run("rustc", &["--version"], &Opts::default_timeout());
-    Ok(first_version(&v.stdout).unwrap_or_else(|| "the newest version".into()))
+    let version = first_version(&v.stdout).unwrap_or_else(|| "the newest version".into());
+    let what = if *state == RustState::NoDefault {
+        format!("Rust set up ({version})")
+    } else {
+        format!("Rust updated to {version}")
+    };
+    Ok((version, what))
 }
 
 #[cfg(test)]
@@ -171,6 +179,23 @@ mod tests {
             })
         );
         assert_eq!(parse_check("error: no toolchains installed"), None);
+        // Other wordings, capitals and colour codes still read.
+        let out = "\x1b[1mstable-x86_64-unknown-linux-gnu\x1b[0m - \x1b[32mup to date\x1b[0m: 1.100.0 (0ef1bc386 2026-11-09)\n";
+        assert_eq!(
+            parse_check(out),
+            Some(RustState::UpToDate {
+                version: "1.100.0".into()
+            })
+        );
+        let out =
+            "stable-x86_64-unknown-linux-gnu (default) - update available: 1.100.0 → 1.101.0\n";
+        assert_eq!(
+            parse_check(out),
+            Some(RustState::UpdateAvailable {
+                have: "1.100.0".into(),
+                newest: "1.101.0".into()
+            })
+        );
     }
 
     #[test]

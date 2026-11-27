@@ -475,7 +475,7 @@ mod tests {
         l.info("push", &format!("token is {tok}"));
         let file = std::fs::read_to_string(&f).unwrap();
         assert!(!file.contains(&tok));
-        assert!(file.contains("[REDACTED]"));
+        assert!(file.contains("<secret>"));
         assert!(!l.text().contains(&tok));
     }
 

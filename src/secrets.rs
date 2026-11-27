@@ -41,10 +41,10 @@ fn extra_redactions() -> &'static Vec<Regex> {
 pub fn redact_secrets(text: &str) -> String {
     let mut s = text.to_string();
     for (_, re) in compiled() {
-        s = re.replace_all(&s, "[REDACTED]").into_owned();
+        s = re.replace_all(&s, "<secret>").into_owned();
     }
     for re in extra_redactions() {
-        s = re.replace_all(&s, "[REDACTED]").into_owned();
+        s = re.replace_all(&s, "<secret>").into_owned();
     }
     s
 }
@@ -184,5 +184,30 @@ mod tests {
     fn redacts_bearer_and_token_params() {
         let s = redact_secrets("Authorization: Bearer abc123 url?token=zzz");
         assert!(!s.contains("abc123") && !s.contains("zzz"));
+    }
+}
+
+#[cfg(test)]
+mod own_source {
+    /// StowLock's own files must pass its own secret scan (a test once held
+    /// a token-shaped string and blocked the push of a release).
+    #[test]
+    fn stowlocks_own_source_has_no_secrets() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![];
+        for e in walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            n != "target" && n != ".git"
+        }) {
+            let e = e.unwrap();
+            if e.file_type().is_file() {
+                files.push(e.path().strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+        let hits = super::scan_files(root, &files);
+        assert!(
+            hits.is_empty(),
+            "token-shaped text in StowLock's own files: {hits:?}"
+        );
     }
 }

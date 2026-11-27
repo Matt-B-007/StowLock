@@ -92,6 +92,8 @@ impl AppPaths {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    /// Which settings layout this file uses (migrated on load when older).
+    pub settings_version: u32,
     pub workspace_dir: String,
     pub default_private: bool,
     pub archive_after_push: bool,
@@ -109,6 +111,8 @@ pub struct Config {
     pub check_for_updates: bool,
     /// Check once a day whether a newer stable Rust is out (needs rustup).
     pub rust_update_check: bool,
+    /// Tell me when a push or GitHub's build finishes (when StowLock isn't in front).
+    pub desktop_notifications: bool,
     /// "stable", "beta", or "" = Beta when this build is itself a beta.
     pub update_channel: String,
     /// The user's own words to hide in bug reports.
@@ -129,6 +133,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            settings_version: SETTINGS_VERSION,
             workspace_dir: "~/GitHub_Projects".into(),
             default_private: true,
             archive_after_push: true,
@@ -143,6 +148,7 @@ impl Default for Config {
             tag_prefix: "v".into(),
             check_for_updates: true,
             rust_update_check: true,
+            desktop_notifications: true,
             update_channel: String::new(),
             report_hide_words: Vec::new(),
             theme: String::new(),
@@ -155,24 +161,106 @@ impl Default for Config {
     }
 }
 
-impl Config {
-    pub fn load(paths: &AppPaths) -> Config {
-        match std::fs::read_to_string(paths.config_file()) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|_| {
-                let aside = paths
-                    .config_file()
-                    .with_extension(format!("corrupt-{}", util::now_stamp()));
-                let _ = std::fs::rename(paths.config_file(), aside);
-                Config::default()
-            }),
-            Err(_) => Config::default(),
+/// The settings layout this build writes. Raise it (and add a step to
+/// `migrate`) whenever a setting is renamed or its meaning changes.
+pub const SETTINGS_VERSION: u32 = 1;
+/// Keep a backup of the settings at most this often, and this many of them.
+const BACKUP_EVERY_SECS: u64 = 15 * 60;
+const BACKUPS_KEPT: usize = 5;
+
+/// Bring an older settings file up to date, one version at a time.
+fn migrate(mut t: toml::Table) -> toml::Table {
+    let mut v = t
+        .get("settings_version")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+    while v < SETTINGS_VERSION {
+        #[allow(clippy::single_match)]
+        match v {
+            // 0 → 1: files from before versioning; every setting kept as is.
+            0 => {}
+            _ => {}
         }
+        v += 1;
+    }
+    t.insert(
+        "settings_version".into(),
+        toml::Value::Integer(SETTINGS_VERSION as i64),
+    );
+    t
+}
+
+fn parse(text: &str) -> Option<Config> {
+    let table: toml::Table = toml::from_str(text).ok()?;
+    migrate(table).try_into().ok()
+}
+
+impl Config {
+    fn backup_dir(paths: &AppPaths) -> PathBuf {
+        paths.config_dir.join("backups")
+    }
+
+    /// The settings backups, newest first.
+    pub fn backups(paths: &AppPaths) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(Self::backup_dir(paths))
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        v.retain(|p| p.extension().is_some_and(|e| e == "toml"));
+        v.sort();
+        v.reverse();
+        v
+    }
+
+    pub fn load(paths: &AppPaths) -> Config {
+        let Ok(text) = std::fs::read_to_string(paths.config_file()) else {
+            return Config::default();
+        };
+        if let Some(c) = parse(&text) {
+            return c;
+        }
+        // Damaged: set it aside, and use the newest backup that still reads.
+        let aside = paths
+            .config_file()
+            .with_extension(format!("corrupt-{}", util::now_stamp()));
+        let _ = std::fs::rename(paths.config_file(), aside);
+        Self::backups(paths)
+            .iter()
+            .find_map(|b| parse(&std::fs::read_to_string(b).ok()?))
+            .unwrap_or_default()
     }
 
     pub fn save(&self, paths: &AppPaths) -> Res<()> {
         let text = toml::to_string_pretty(self).ctx("encoding settings")?;
         util::ensure_private_dir(&paths.config_dir)?;
+        self.backup_if_due(paths);
+        // Written to a temporary file, then renamed over the old one.
         util::atomic_write(&paths.config_file(), text.as_bytes())
+    }
+
+    /// Copy the current settings file to backups/ (at most every 15 minutes,
+    /// keeping the newest 5).
+    fn backup_if_due(&self, paths: &AppPaths) {
+        let current = paths.config_file();
+        if !current.exists() {
+            return;
+        }
+        let dir = Self::backup_dir(paths);
+        let backups = Self::backups(paths);
+        let recent = backups
+            .first()
+            .and_then(|b| b.metadata().ok()?.modified().ok());
+        let due = recent
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age.as_secs() >= BACKUP_EVERY_SECS);
+        if !due || util::ensure_private_dir(&dir).is_err() {
+            return;
+        }
+        let name = format!("config-{}.toml", util::now_stamp_secs());
+        if std::fs::copy(&current, dir.join(name)).is_ok() {
+            for old in Self::backups(paths).iter().skip(BACKUPS_KEPT) {
+                let _ = std::fs::remove_file(old);
+            }
+        }
     }
 
     pub fn workspace(&self) -> PathBuf {
@@ -227,5 +315,24 @@ mod tests {
         let partial = Config::load(&paths);
         assert!(!partial.default_private);
         assert_eq!(partial.archive_mode, "move");
+    }
+
+    #[test]
+    fn old_settings_are_migrated_and_backups_rotate() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = AppPaths::under(d.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        // A file from before versioning: settings kept, version stamped.
+        std::fs::write(paths.config_file(), "workspace_dir = \"~/Projects\"\n").unwrap();
+        let c = Config::load(&paths);
+        assert_eq!(c.workspace_dir, "~/Projects");
+        assert_eq!(c.settings_version, SETTINGS_VERSION);
+        // Saving keeps one backup, not one per save.
+        c.save(&paths).unwrap();
+        c.save(&paths).unwrap();
+        assert_eq!(Config::backups(&paths).len(), 1);
+        // A damaged file falls back to the newest backup.
+        std::fs::write(paths.config_file(), "this is = = not toml").unwrap();
+        assert_eq!(Config::load(&paths).workspace_dir, "~/Projects");
     }
 }

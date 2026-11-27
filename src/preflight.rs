@@ -337,6 +337,20 @@ fn real_failure(block: &str) -> bool {
         .any(|w| block.contains(w))
 }
 
+/// The package names in a `sudo pacman -S --needed …` command.
+pub fn pacman_packages(cmd: &str) -> Vec<String> {
+    cmd.split_whitespace()
+        .skip_while(|w| !w.starts_with("-S"))
+        .skip(1)
+        .filter(|w| !w.starts_with('-'))
+        .filter(|w| {
+            w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
+        })
+        .map(|w| w.to_string())
+        .collect()
+}
+
 /// The `sudo pacman -S …` command a check script suggests, if any.
 fn pacman_line(output: &str) -> Option<String> {
     output.lines().find_map(|l| {
@@ -492,7 +506,10 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
     // Tools StowLock installed for checks: its Python environment and its
     // shared Cargo tools folder, searched before the system's.
     let tools_root = tools_dir(dir, env);
-    let mut tool_paths: Vec<PathBuf> = vec![tools_root.join("bin")];
+    // The project's Python environment comes first (its packages), then the
+    // system's own tools, and StowLock's tools folder only as a fallback, so a
+    // copy StowLock built earlier never hides the version you installed.
+    let mut tool_paths: Vec<PathBuf> = Vec::new();
     let mut ran = 0usize;
     let (home_env, session_vars) = if env.clean_home {
         clean_home(dir, env).unwrap_or_default()
@@ -514,6 +531,10 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             // pip installs go into StowLock's own environment, never system-wide.
             if py_env.is_empty() {
                 let venv = python_env_dir(dir, env);
+                // A fresh environment every check, as on GitHub, so nothing
+                // built by an earlier check (an older version of the project)
+                // can stand in. pip's download cache keeps this quick.
+                let _ = std::fs::remove_dir_all(&venv);
                 if !venv.join("bin").join("python").exists() {
                     let v = venv.display().to_string();
                     let o = run_step_with(dir, "python3", &["-m", "venv", &v], env, &[]);
@@ -555,7 +576,14 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         let path = tool_paths
             .iter()
             .map(|p| p.display().to_string())
-            .chain(std::iter::once(proc::full_path()))
+            .chain(std::iter::once(if env.clean_home {
+                proc::checks_path()
+            } else {
+                proc::full_path()
+            }))
+            .chain(std::iter::once(
+                tools_root.join("bin").display().to_string(),
+            ))
             .collect::<Vec<_>>()
             .join(":");
         step_env.push(("PATH".into(), path));
@@ -602,7 +630,20 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             o.code == Some(3) && (step.run.contains("check.sh") || missing_evidence);
         if tools_missing_exit {
             let (tool, own_hint) = named_missing_tool(&out);
+            let packages = pacman_line(&out)
+                .map(|l| pacman_packages(&l))
+                .unwrap_or_default();
+            // The script's own list names tools, never the project's code:
+            // keep all of it in the log (and so in bug reports).
+            for l in out.lines().filter(|l| !l.trim().is_empty()).take(20) {
+                env.log.warn("tests", &format!("  {}", l.trim()));
+            }
             let shown = match (&tool, needs) {
+                _ if !packages.is_empty() => packages
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 (Some(t), _) => format!("`{t}`"),
                 (None, Some(sk)) => format!("what \"{}\" installs on GitHub", sk.name),
                 (None, None) => "tools that aren't installed here".to_string(),
@@ -1445,6 +1486,12 @@ mod tests {
             r.hint.as_deref(),
             Some("sudo pacman -S --needed cargo-audit rustup")
         );
+        // Named from the script's own pacman line, not guessed.
+        assert!(
+            r.summary.contains("`cargo-audit`, `rustup`"),
+            "{}",
+            r.summary
+        );
         // The list shows in full.
         assert!(
             r.tail.contains("- cargo-audit") && r.tail.contains("- rustup"),
@@ -1551,5 +1598,90 @@ mod tests {
         let r = run_tests(d.path(), Stack::Rust, &env(&log));
         assert_eq!(r.status, TestStatus::Failed, "{}", r.summary);
         assert_eq!(r.hint, None, "{:?}", r.hint);
+    }
+
+    #[test]
+    fn exit_3_names_the_scripts_packages_not_an_earlier_step() {
+        // Like the report: an "Install Rust" step only GitHub runs comes
+        // first, but the script says the missing tool is shellcheck.
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Install Rust (pinned)\n        run: rustup toolchain install stable\n      - name: Run scripts/check.sh\n        run: sh scripts/check.sh\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.path().join("scripts")).unwrap();
+        std::fs::write(
+            d.path().join("scripts/check.sh"),
+            "echo 'Missing tools:'\necho '    sudo pacman -S --needed shellcheck'\nexit 3\n",
+        )
+        .unwrap();
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert!(r.summary.contains("needs `shellcheck`"), "{}", r.summary);
+        assert!(!r.summary.contains("Install Rust"), "{}", r.summary);
+    }
+
+    #[test]
+    fn reads_package_names_from_a_pacman_command() {
+        assert_eq!(
+            pacman_packages("sudo pacman -S --needed shellcheck cargo-audit"),
+            ["shellcheck", "cargo-audit"]
+        );
+        assert_eq!(pacman_packages("sudo pacman -Syu"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn each_check_gets_a_fresh_python_environment() {
+        if proc::run(
+            "python3",
+            &["-c", "import venv, ensurepip"],
+            &Opts::default_timeout(),
+        )
+        .code
+            != Some(0)
+        {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pip install -r requirements.txt\n      - name: Nothing left from last time\n        run: test ! -e \"$VIRTUAL_ENV/stale-from-last-check\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.path().join("requirements.txt"), "# none\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().to_path_buf());
+        e.timeout_secs = 300;
+        assert_eq!(
+            run_tests(d.path(), Stack::Python, &e).status,
+            TestStatus::Passed
+        );
+        // Something an earlier check left in the environment…
+        std::fs::write(
+            cache.path().join("stowlock-venv/stale-from-last-check"),
+            "old build",
+        )
+        .unwrap();
+        // …is gone by the next check.
+        let r = run_tests(d.path(), Stack::Python, &e);
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+    }
+
+    #[test]
+    fn installed_programs_come_last_in_checks() {
+        let home = crate::util::home_dir();
+        let p = proc::checks_path();
+        let parts: Vec<&str> = p.split(':').collect();
+        let local = home.join(".local/bin").display().to_string();
+        let i = parts.iter().position(|s| *s == local).unwrap();
+        let usr = parts.iter().position(|s| *s == "/usr/bin").unwrap();
+        assert!(usr < i, "{p}");
     }
 }

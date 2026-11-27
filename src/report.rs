@@ -77,6 +77,15 @@ fn serial_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"(?i)serial(\s*(number|no\.?))?\s*[:=]\s*\S+").unwrap())
 }
+fn steamid_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b7656119\d{10}\b").unwrap())
+}
+/// Windows-style home folders (Z:\home\matt under Wine/Proton, C:\Users\matt).
+fn windows_home_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?i)\b[a-z]:\\(?:home|users)\\[^\\\s]+").unwrap())
+}
 fn gh_url_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
@@ -130,6 +139,7 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
     if !rc.home.is_empty() {
         s = s.replace(&rc.home, "~");
     }
+    s = windows_home_re().replace_all(&s, "~").into_owned();
     // Protect the app's own name (a user's repo may share it).
     for (i, k) in KEEP.iter().enumerate() {
         s = s.replace(k, &format!("\u{2}APP{i}\u{2}"));
@@ -249,8 +259,8 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
     for (i, login) in kept.iter().enumerate() {
         s = s.replace(&format!("\u{1}KEPT{i}\u{1}"), login.as_str());
     }
-    s = mac_re().replace_all(&s, "[removed]").into_owned();
-    s = ipv6_re().replace_all(&s, "[removed]").into_owned();
+    s = mac_re().replace_all(&s, "<mac>").into_owned();
+    s = ipv6_re().replace_all(&s, "<ip>").into_owned();
     // Version numbers like shellcheck-py==0.11.0.1 or v1.2.3.4 look like IP
     // addresses; keep those.
     s = ip_re()
@@ -265,11 +275,13 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
             if version {
                 m.as_str().to_string()
             } else {
-                "[removed]".to_string()
+                "<ip>".to_string()
             }
         })
         .into_owned();
-    s = serial_re().replace_all(&s, "[removed]").into_owned();
+    s = serial_re().replace_all(&s, "serial: <serial>").into_owned();
+    // Steam account ids (17 digits starting 7656119); game and app ids stay.
+    s = steamid_re().replace_all(&s, "<steamid>").into_owned();
     for (i, k) in KEEP.iter().enumerate() {
         s = s.replace(&format!("\u{2}APP{i}\u{2}"), k);
     }
@@ -461,6 +473,12 @@ pub fn privacy_filter(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// Exit codes that mean "a tool is missing here", not a failure: 127 (command
+/// not found) and 3 (a House Standard check script's "only tools missing").
+pub fn couldnt_run(code: Option<i32>) -> bool {
+    matches!(code, Some(127) | Some(3))
+}
+
 /// The most recent failing test command and its lines (nothing from earlier
 /// runs), for the AI fix prompt.
 pub fn last_failure_block(lines: &[String]) -> Vec<String> {
@@ -635,8 +653,13 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
         }
     }
     if let Some((cmd, code)) = &input.failing_command {
+        let label = if couldnt_run(*code) {
+            "Couldn't run here (a tool is missing)"
+        } else {
+            "Failing command"
+        };
         s.push_str(&format!(
-            "\n**Failing command:** `{cmd}` (exit code {})\n",
+            "\n**{label}:** `{cmd}` (exit code {})\n",
             code.map(|c| c.to_string()).unwrap_or_else(|| "none".into())
         ));
     }
@@ -679,6 +702,11 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
             f.name == "Pre-flight tests"
                 && !crate::health::counts_against_stowlock(&f.name, &f.detail)
         });
+    // A secret the scan found is in the project's files, not a StowLock bug.
+    let stowlock_faults: Vec<&&Step> = stowlock_faults
+        .into_iter()
+        .filter(|f| !(f.name == "Secret scan" && f.detail.contains("possible secret")))
+        .collect();
     // Only when the latest check of the project failed (not an older one).
     let latest_check_failed = all_steps
         .iter()
@@ -717,7 +745,11 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
                 f.detail.lines().next().unwrap_or("")
             ));
         }
-        if let Some((cmd, code)) = &input.failing_command {
+        if let Some((cmd, code)) = input
+            .failing_command
+            .as_ref()
+            .filter(|(_, c)| !couldnt_run(*c))
+        {
             s.push_str(&format!("Failing command: {cmd} (exit {:?})\n", code));
         }
         s.push_str("Find the cause in the StowLock source, fix it without changing behaviour elsewhere, and add a regression test.\n```\n");
@@ -784,6 +816,90 @@ pub fn clear_logs_and_reports(paths: &AppPaths, log: &Logger) -> Res<usize> {
     Ok(n)
 }
 
+/// Crash reports kept (the House Standard: the last 10 sessions).
+const CRASHES_KEPT: usize = 10;
+
+/// The "StowLock is running" marker: written at start, removed on a clean
+/// exit. Still there at the next start means StowLock closed unexpectedly,
+/// even when nothing could be recorded (killed, out of memory, power cut).
+pub fn running_marker(paths: &AppPaths) -> PathBuf {
+    paths.state_dir.join("running")
+}
+
+/// Call when the window opens. Returns the version that closed unexpectedly
+/// last time without leaving a crash report, if any, and marks this run.
+pub fn mark_running(paths: &AppPaths) -> Option<String> {
+    let marker = running_marker(paths);
+    let unclean = std::fs::read_to_string(&marker).ok().and_then(|t| {
+        let mut it = t.split_whitespace();
+        let pid: u32 = it.next()?.parse().ok()?;
+        let version = it.next().unwrap_or("?").to_string();
+        // Still running (another copy that's handing over)? Not a crash.
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|c| c.trim().starts_with("stowlock"))
+            .unwrap_or(false);
+        (!alive).then_some(version)
+    });
+    let _ = util::ensure_private_dir(&paths.state_dir);
+    let _ = util::atomic_write(
+        &marker,
+        format!("{} {}", std::process::id(), crate::config::APP_VERSION).as_bytes(),
+    );
+    // A panic already wrote its own report: that one is shown instead.
+    unclean.filter(|_| !paths.crash_marker().exists())
+}
+
+/// Call on a clean exit.
+pub fn mark_stopped(paths: &AppPaths) {
+    let _ = std::fs::remove_file(running_marker(paths));
+}
+
+/// A report for a close nothing could record, with the last log lines, and
+/// the marker the next launch shows a notice for.
+pub fn record_unexpected_close(
+    paths: &AppPaths,
+    log: &Logger,
+    version: &str,
+    workspace: &std::path::Path,
+) {
+    let input = ReportInput {
+        title: "crash report".into(),
+        runs: log.runs(),
+        problem_lines: log.report_lines(40, 100).0,
+        log_lines: log.report_lines(40, 100).1,
+        panic: Some(format!(
+            "StowLock {version} closed unexpectedly and no error was recorded. The system may have stopped it, it may have run out of memory, or the computer lost power."
+        )),
+        ..Default::default()
+    };
+    let text = build_report(&input, &RedactContext::local(workspace));
+    if let Ok(p) = save_report(paths, "crash", &text) {
+        let _ = util::atomic_write(&paths.crash_marker(), p.display().to_string().as_bytes());
+    }
+    prune_crash_reports(paths);
+}
+
+/// Keep only the newest crash reports.
+pub fn prune_crash_reports(paths: &AppPaths) {
+    let Ok(rd) = std::fs::read_dir(paths.reports_dir()) else {
+        return;
+    };
+    let mut crashes: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("crash-"))
+        })
+        .collect();
+    crashes.sort();
+    crashes.reverse();
+    for old in crashes.iter().skip(CRASHES_KEPT) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
 /// Write a redacted crash report and a marker the next launch notices.
 pub fn install_panic_hook(paths: AppPaths, log: Logger, workspace: PathBuf) {
     let default = std::panic::take_hook();
@@ -815,6 +931,7 @@ pub fn install_panic_hook(paths: AppPaths, log: Logger, workspace: PathBuf) {
         if let Ok(p) = save_report(&paths, "crash", &text) {
             let _ = util::atomic_write(&paths.crash_marker(), p.display().to_string().as_bytes());
         }
+        prune_crash_reports(&paths);
         default(info);
     }));
 }
@@ -1231,5 +1348,67 @@ mod tests {
             &c,
         );
         assert_eq!(out, "Report: ~/.local/state/stowlock/r.md");
+    }
+
+    #[test]
+    fn a_missing_tool_isnt_called_a_failing_command() {
+        assert!(couldnt_run(Some(3)) && couldnt_run(Some(127)));
+        assert!(!couldnt_run(Some(1)) && !couldnt_run(None));
+    }
+
+    #[test]
+    fn an_unexpected_close_is_noticed_next_time() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = AppPaths::under(d.path());
+        let log = Logger::new(None);
+        // First start: nothing to report.
+        assert_eq!(mark_running(&paths), None);
+        // It never stopped cleanly; a dead process left the marker.
+        std::fs::write(running_marker(&paths), "4194300 0.1.0-beta.10").unwrap();
+        let v = mark_running(&paths).expect("noticed");
+        assert_eq!(v, "0.1.0-beta.10");
+        record_unexpected_close(&paths, &log, &v, d.path());
+        let report = std::fs::read_to_string(paths.crash_marker()).unwrap();
+        assert!(std::fs::read_to_string(report.trim())
+            .unwrap()
+            .contains("closed unexpectedly"));
+        // A clean stop leaves nothing behind.
+        mark_stopped(&paths);
+        assert!(!running_marker(&paths).exists());
+        // Only the newest 10 crash reports are kept.
+        for i in 0..14 {
+            std::fs::write(
+                paths.reports_dir().join(format!("crash-2026-01-{i:02}.md")),
+                "x",
+            )
+            .unwrap();
+        }
+        prune_crash_reports(&paths);
+        let n = std::fs::read_dir(paths.reports_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("crash-"))
+            .count();
+        assert_eq!(n, 10);
+    }
+
+    #[test]
+    fn placeholders_follow_the_house_standard() {
+        // Built at run time, so the source itself holds no token-shaped text
+        // (StowLock's own secret scan would rightly flag it).
+        let token = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123456789");
+        let out = redact(
+            &format!("steam 76561198012345678 app 1091500 at Z:\\home\\matt\\game, C:\\Users\\matt\\x; mac 00:1a:2b:3c:4d:5e ip 10.0.0.7 v0.11.0.1 token {token}"),
+            &rc(),
+        );
+        assert!(out.contains("steam <steamid>"), "{out}");
+        assert!(out.contains("app 1091500"), "game ids stay: {out}");
+        assert!(
+            out.contains("at ~\\game") && out.contains(", ~\\x"),
+            "{out}"
+        );
+        assert!(out.contains("<mac>") && out.contains("ip <ip>"), "{out}");
+        assert!(out.contains("v0.11.0.1"), "versions stay: {out}");
+        assert!(out.contains("<secret>") && !out.contains("ghp_"), "{out}");
     }
 }

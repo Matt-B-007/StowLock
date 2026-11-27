@@ -119,11 +119,14 @@ check_build() {
 }
 
 check_selftest() {
-    section "Self-test of the release build (--self-test)"
+    section "Self-test of the release build (--self-test --quick, then --self-test)"
     if [ ! -x "$BIN" ]; then
         echo "No release build at $BIN: run 'sh scripts/check.sh build' first."
         return 1
     fi
+    # The quick one first: the updater runs it before swapping a new version
+    # in, so every release must pass it.
+    "$BIN" --self-test --quick || return 1
     "$BIN" --self-test
 }
 

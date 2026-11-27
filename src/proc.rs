@@ -90,6 +90,37 @@ impl Opts {
 }
 
 /// PATH with the user's tool folders added (menu launches get a minimal PATH).
+/// PATH for GitHub steps on GitHub's terms: the system's folders first, and
+/// your own installed programs (~/.local/bin, ~/.cargo/bin) only at the end,
+/// so an installed copy of an app never stands in for the one being checked.
+/// A desktop notification (notify-send, which KDE, GNOME and the rest
+/// show). Nothing happens if notify-send isn't installed.
+pub fn notify(title: &str, body: &str) {
+    if which("notify-send").is_none() {
+        return;
+    }
+    let _ = spawn_detached(
+        "notify-send",
+        &["--app-name=StowLock", "--icon=stowlock", title, body],
+        &Opts::default(),
+    );
+}
+
+pub fn checks_path() -> String {
+    let home = crate::util::home_dir();
+    let mine = [
+        home.join(".local/bin").display().to_string(),
+        home.join(".cargo/bin").display().to_string(),
+    ];
+    let mut parts: Vec<String> = full_path()
+        .split(':')
+        .filter(|s| !mine.iter().any(|m| m == s))
+        .map(String::from)
+        .collect();
+    parts.extend(mine);
+    parts.join(":")
+}
+
 pub fn full_path() -> String {
     let home = crate::util::home_dir();
     let mut parts: Vec<String> = vec![

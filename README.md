@@ -45,7 +45,18 @@ Open a terminal and paste:
 curl -fsSL https://raw.githubusercontent.com/Matt-B-007/StowLock/main/install.sh | sh
 ```
 
-It downloads the newest release, checks it against its published checksum and installs it for your user (no password). StowLock then appears in your app menu and updates itself from **Settings → Updates**. Run the same command again any time to reinstall. Add `STOWLOCK_CHANNEL=stable` in front of `sh` for full releases only.
+It downloads the newest release, checks it against its published checksum (and its signature, if `minisign` is installed), installs it for your user (no password) and opens it. StowLock then appears in your app menu and updates itself from **Settings → Updates**. Run the same command again any time to reinstall.
+
+Options go after `sh -s --`, for example `… | sh -s -- --stable --no-launch`:
+
+| Option | What it does |
+|---|---|
+| `--beta` | The newest release, betas included (the default while StowLock is in beta) |
+| `--stable` | The newest full release only |
+| `--version X` | A specific version, for example `--version 0.1.0-beta.11` |
+| `--uninstall` | Remove StowLock (keeps your settings, history and projects) |
+| `--no-launch` | Don't open StowLock afterwards |
+| `--from-source` | Build it from the source code (needs git and Rust) |
 
 ### From the AUR (CachyOS, Arch)
 
@@ -83,6 +94,7 @@ cargo build --release
 - **Settings → Update channel:** **Stable** offers only full releases; **Beta** also offers betas. If you're running a beta, it starts on Beta. It never offers an older version.
 - The update notice shows **What's new** and an **Update** button. StowLock downloads the new version and installs it only if its checksum matches **and** the checksum list carries a valid signature from StowLock's signing key (minisign; the public keys are in `packaging/minisign/` and built into the app). A release without a valid signature is treated as not available yet. Then it swaps the new version in and restarts. No GitHub sign-in is needed for updates.
 - From a terminal: `stowlock --update`.
+- Before a new version replaces the current one, it must pass a quick start-up check (`stowlock --self-test --quick`); if it doesn't, nothing changes.
 - **Going back:** the version you had before an update is kept. Use **Settings → Go back to …**, or run `stowlock --rollback` if the window won't open. If a new version crashes, StowLock offers to go back the next time it starts.
 - If you open a newer copy while an older one is running, StowLock asks whether to switch.
 
@@ -111,6 +123,8 @@ StowLock never writes its own files into a project folder.
 ## Privacy
 
 - Nothing leaves your computer except what you push to GitHub, the sign-in, your repo list and a release check against this repository (no personal data). No tracking, analytics or automatic crash uploads.
+- If your computer's DNS doesn't answer during an update check, StowLock asks a DNS-over-HTTPS service (Cloudflare's 1.1.1.1, then Google's 8.8.8.8) for GitHub's address. Only the host name is sent, nothing about you or your projects.
+- Once a day it asks `rustup check` whether a newer Rust is out (turn it off in Settings → Updates).
 - StowLock never reads, stores or logs your GitHub token; sign-in is handled by `gh`.
 - Its folders are readable only by your account. Secrets are blanked out the moment they're written to the log, and logs and reports are deleted after 30 days.
 - Bug reports replace your username, GitHub account, organisations, repo and project names, emails, computer name, IP and MAC addresses and folder paths with placeholders, wherever they appear. Your project's file names and its own test output are left out (only pass/fail lines and failure messages stay).

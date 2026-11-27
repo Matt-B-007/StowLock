@@ -1,6 +1,6 @@
 [package]
 name = "stowlock"
-version = "0.1.0-beta.10"
+version = "0.1.0-beta.11"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Drop in a project zip, get a clean, tested GitHub repo, with old versions neatly archived."
@@ -25,6 +25,7 @@ regex = "1"
 sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 minisign-verify = "0.3.0"
+ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.31.1", features = ["eframe"] }

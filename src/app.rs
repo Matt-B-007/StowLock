@@ -98,10 +98,14 @@ enum Msg {
     CacheSize(u64),
     /// Check caches cleared: bytes freed, or why not.
     CachesCleared(Result<u64, String>),
+    /// The family's tools and whether they're installed (Health).
+    FamilyTools(Vec<crate::tools::ToolInfo>),
+    /// pacman finished installing tools; re-check the staged project after.
+    FamilyToolsInstalled(Result<String, String>, bool),
     /// What this computer's Rust is like (rustup check).
     Rust(crate::rustcheck::RustState),
-    /// `rustup update` finished: the new version, or why not.
-    RustUpdated(Result<String, String>),
+    /// `rustup update` finished: (version, what happened), or why not.
+    RustUpdated(Result<(String, String), String>),
     UpdateApplied(Result<PathBuf, String>),
     RolledBack(Result<(PathBuf, String), String>),
     SignIn(SignInEvent),
@@ -335,6 +339,9 @@ pub struct App {
     /// This computer's Rust (from the daily rustup check) and whether an update
     /// is running / was put off for now.
     rust: Option<crate::rustcheck::RustState>,
+    /// The family's tools (None until surveyed) and an install in progress.
+    tools: Option<Vec<crate::tools::ToolInfo>>,
+    tools_busy: bool,
     /// The check caches' size (None until measured).
     cache_size: Option<u64>,
     rust_busy: bool,
@@ -467,6 +474,8 @@ impl App {
             confirm_remove_tag: false,
             rust: None,
             cache_size: None,
+            tools: None,
+            tools_busy: false,
             rust_busy: false,
             rust_later: false,
             repo_lists: Default::default(),
@@ -979,6 +988,51 @@ impl App {
             let _ = manual;
             Self::send(&tx, &ctx, Msg::UpdateChecked(r));
         });
+    }
+
+    /// Look at which of the family's tools are installed (in the background).
+    fn survey_tools(&mut self) {
+        self.spawn_bg(|| Msg::FamilyTools(crate::tools::survey()));
+    }
+
+    /// Install packages with pacman through the desktop's password prompt.
+    fn install_tools(&mut self, packages: Vec<String>, recheck: bool) {
+        self.tools_busy = true;
+        let log = self.log.clone();
+        self.spawn_bg(move || {
+            Msg::FamilyToolsInstalled(crate::tools::install(&packages, &log), recheck)
+        });
+    }
+
+    /// The Install button (or, without a password prompt, the command).
+    fn install_button(&mut self, ui: &mut egui::Ui, packages: &[String], recheck: bool) {
+        if packages.is_empty() {
+            return;
+        }
+        if self.tools_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Installing (approve the password prompt)…");
+            });
+            return;
+        }
+        let label = format!("Install {}", packages.join(", "));
+        if ui::button_enabled(ui, self.busy.is_none(), ui::icon::DOWNLOAD, &label)
+            .on_hover_text(format!(
+                "Runs {} after you approve your password prompt",
+                crate::tools::pacman_command(packages)
+            ))
+            .clicked()
+        {
+            self.install_tools(packages.to_vec(), recheck);
+        }
+    }
+
+    /// A desktop notification, only while StowLock isn't the window in front.
+    fn notify(&self, title: &str, body: &str) {
+        if self.config.desktop_notifications && !self.was_focused {
+            proc::notify(title, body);
+        }
     }
 
     /// Ask rustup whether a newer stable Rust is out (in the background).
@@ -1620,15 +1674,33 @@ impl App {
                     Ok(b) => {
                         let passed = matches!(b, crate::github::Build::Passed { .. });
                         let failed = matches!(b, crate::github::Build::Failed { .. });
+                        let what = match &w.tag {
+                            Some(t) => format!("{}/{} {t}", w.owner, w.slug),
+                            None => format!("{}/{}", w.owner, w.slug),
+                        };
                         w.status = Some(b);
-                        if failed {
+                        let note = if failed {
                             self.log.warn("build", "GitHub's build failed");
-                        }
+                            Some((
+                                "GitHub's build failed",
+                                format!("{what}: open StowLock to see where, or re-run it."),
+                            ))
+                        } else if passed {
+                            Some((
+                                "GitHub's build passed",
+                                format!("{what} is built on GitHub."),
+                            ))
+                        } else {
+                            None
+                        };
                         // Pushing StowLock itself: offer the new version now.
                         let ours = format!("{}/{}", w.owner, w.slug)
                             .eq_ignore_ascii_case(&self.config.update_repo);
                         if passed && ours && w.tag.is_some() && self.pacman_pkg.is_none() {
                             self.check_updates(true);
+                        }
+                        if let Some((title, body)) = note {
+                            self.notify(title, &body);
                         }
                     }
                     Err(e) => self
@@ -1673,13 +1745,23 @@ impl App {
                         if let (false, Some(commit)) = (out.nothing_to_push, out.commit.clone()) {
                             self.watch_build(commit, out.tag.clone());
                         }
+                        self.notify(
+                            "Pushed to GitHub",
+                            &format!(
+                                "{}/{}: StowLock is watching GitHub's build.",
+                                self.session.owner, self.session.slug
+                            ),
+                        );
                         self.session.outcome = Some(out);
                         self.history = History::load(&self.paths);
                         self.health = HealthState::load(&self.paths);
                         self.refresh_projects();
                         self.refresh_env();
                     }
-                    Err(e) => self.fail(&e, "push"),
+                    Err(e) => {
+                        self.notify("The push didn't finish", "Open StowLock to see why.");
+                        self.fail(&e, "push");
+                    }
                 }
             }
             Msg::Archived(r) => {
@@ -1706,6 +1788,21 @@ impl App {
                 self.toast(&format!("Self-test: {}", r.summary_line()));
                 self.last_selftest = Some((*r, path));
             }
+            Msg::FamilyTools(t) => self.tools = Some(t),
+            Msg::FamilyToolsInstalled(r, recheck) => {
+                self.tools_busy = false;
+                match r {
+                    Ok(m) => {
+                        self.log.info("tools", &m);
+                        self.toast(&m);
+                        self.survey_tools();
+                        if recheck && self.session.stage.is_some() && self.busy.is_none() {
+                            self.recheck();
+                        }
+                    }
+                    Err(e) => self.fail(&e, "tools"),
+                }
+            }
             Msg::CacheSize(n) => self.cache_size = Some(n),
             Msg::CachesCleared(r) => match r {
                 Ok(n) => {
@@ -1724,9 +1821,9 @@ impl App {
             Msg::RustUpdated(r) => {
                 self.rust_busy = false;
                 match r {
-                    Ok(v) => {
-                        self.log.info("rust", &format!("Rust updated to {v}"));
-                        self.toast(&format!("Rust updated to {v}"));
+                    Ok((v, what)) => {
+                        self.log.info("rust", &what);
+                        self.toast(&what);
                         self.rust = Some(crate::rustcheck::RustState::UpToDate { version: v });
                     }
                     Err(e) => self.fail(&e, "rust"),
@@ -2369,6 +2466,10 @@ impl App {
                 &mut self.config.rust_update_check,
                 "Check for a newer Rust once a day (rustup)",
             );
+            ui.checkbox(
+                &mut self.config.desktop_notifications,
+                "Desktop notifications when a push or GitHub's build finishes (while StowLock isn't in front)",
+            );
             match &self.update {
                 UpdateState::Available(rel) => {
                     let label = rel.label();
@@ -2808,10 +2909,13 @@ impl App {
             ui::banner(ui, ERROR(), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("StowLock closed unexpectedly last time.");
-                    if ui.button("View report").clicked() {
+                    if ui::button(ui, ui::icon::BUG, "Report").clicked() {
+                        self.tab = Tab::Report;
+                    }
+                    if ui.button("View the crash report").clicked() {
                         let _ = proc::xdg_open(&p.display().to_string());
                     }
-                    if ui.small_button("✖").clicked() {
+                    if ui.button("Dismiss").clicked() {
                         self.crash_report = None;
                     }
                 });
@@ -3719,6 +3823,17 @@ impl App {
                             ).size(12.5))
                             .wrap(),
                         );
+                    }
+                    if let Some(h) = c
+                        .tests
+                        .hint
+                        .clone()
+                        .filter(|h| h.starts_with("sudo pacman -S"))
+                    {
+                        let packages = crate::preflight::pacman_packages(&h);
+                        ui.horizontal_wrapped(|ui| {
+                            self.install_button(ui, &packages, true);
+                        });
                     }
                     if let Some(h) = &c.tests.hint {
                         ui.horizontal_wrapped(|ui| {
@@ -4865,11 +4980,67 @@ impl App {
         }
     }
 
+    /// Health → Your tools: what the family's checks use, and one Install.
+    fn tools_card(&mut self, ui: &mut egui::Ui) {
+        if self.tools.is_none() && !self.tools_busy {
+            self.tools = Some(Vec::new()); // surveying
+            self.survey_tools();
+        }
+        let tools = self.tools.clone().unwrap_or_default();
+        ui::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(ui::semibold("Your tools", 15.0));
+                if ui.small_button("Check again").clicked() {
+                    self.survey_tools();
+                }
+            });
+            ui.label(ui::muted("What checks use on this computer. Missing ones mean some checks can't run here (GitHub still runs them).").size(12.5));
+            if tools.is_empty() {
+                ui.label(ui::muted("Looking…"));
+                return;
+            }
+            egui::Grid::new("tools")
+                .num_columns(3)
+                .spacing([14.0, 4.0])
+                .show(ui, |ui| {
+                    for t in &tools {
+                        ui.label(t.name);
+                        match (&t.version, t.other_fix) {
+                            (Some(v), _) => {
+                                ui.label(RichText::new(format!("✓ {v}")).color(SUCCESS()))
+                            }
+                            (None, Some(fix)) => {
+                                ui.label(RichText::new(format!("needs: {fix}")).color(WARNING()))
+                            }
+                            (None, None) => ui.label(RichText::new("missing").color(WARNING())),
+                        };
+                        ui.label(ui::muted(t.why).size(12.5));
+                        ui.end_row();
+                    }
+                });
+            let missing = crate::tools::missing_packages(&tools);
+            ui.horizontal_wrapped(|ui| {
+                self.install_button(ui, &missing, false);
+                if let Some(fix) = tools
+                    .iter()
+                    .find_map(|t| t.version.is_none().then_some(t.other_fix).flatten())
+                {
+                    ui.label(ui::mono(fix));
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(fix.to_string());
+                    }
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
     fn health_screen(&mut self, ui: &mut egui::Ui) {
         let mut run = false;
         {
             ui::title(ui, "Health", &self.health.summary());
             ui.add_space(8.0);
+            self.tools_card(ui);
             let cols = if ui.available_width() > 900.0 {
                 4
             } else if ui.available_width() > 560.0 {

@@ -21,6 +21,7 @@ mod icon;
 mod install;
 mod instance;
 mod logbook;
+mod net;
 mod pipeline;
 mod preflight;
 mod proc;
@@ -30,6 +31,7 @@ mod secrets;
 mod selftest;
 mod signing;
 mod state;
+mod tools;
 mod ui;
 mod uninstall;
 mod updater;
@@ -57,10 +59,65 @@ Usage:
       --yes-delete-projects      Confirm --everything without typing (scripts)
   stowlock --self-test [--online]
                                  Check every feature in a sandbox; exits 1 on failure
+  stowlock --self-test --quick   Seconds: can it start, load resources, read settings
+  stowlock --report              Save a bug report to a file (private things hidden)
   stowlock --update              Check for a newer version and install it
   stowlock --rollback            Go back to the version kept from before the last update
   stowlock --version             Print the version
 ";
+
+/// `--report`: the same redacted bug report as the app's, saved to a file
+/// (for when the window won't open).
+fn cli_report(paths: &AppPaths) -> Result<PathBuf, String> {
+    let config = config::Config::load(paths);
+    let tail: Vec<String> = std::fs::read_to_string(paths.log_file())
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .take(100)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(String::from)
+        .collect();
+    let problems: Vec<String> = tail
+        .iter()
+        .filter(|l| l.contains(" WARN ") || l.contains(" ERROR "))
+        .cloned()
+        .collect();
+    let input = report::ReportInput {
+        title: "bug report".into(),
+        env: report::collect_env(None, None),
+        health: health::HealthState::load(paths).lines(),
+        problem_lines: problems,
+        log_lines: tail,
+        ..Default::default()
+    };
+    let rc = report::RedactContext::local(&config.workspace());
+    let text = report::build_report(&input, &rc);
+    report::save_report(paths, "bug-report", &text)
+}
+
+/// Can this build start? Loads the fonts and draws a frame without a window,
+/// renders the icon, reads the settings and the signing keys.
+fn quick_self_test(paths: &AppPaths) -> Result<(), String> {
+    let ctx = eframe::egui::Context::default();
+    ui::install_fonts(&ctx);
+    let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+            ui.label(format!("StowLock {APP_VERSION} {}", ui::icon::REFRESH));
+        });
+    });
+    let rgba = icon::rgba(64);
+    if rgba.len() != 64 * 64 * 4 {
+        return Err("the app icon didn't render".into());
+    }
+    let _config = config::Config::load(paths);
+    if signing::trusted_keys().len() != 2 {
+        return Err("the update signing keys didn't load".into());
+    }
+    Ok(())
+}
 
 fn ask(prompt: &str) -> String {
     print!("{prompt}");
@@ -150,6 +207,19 @@ fn main() {
     if has("--uninstall") {
         std::process::exit(cli_uninstall(&args, &paths));
     }
+    if has("--report") {
+        match cli_report(&paths) {
+            Ok(p) => {
+                println!("Bug report saved: {}", util::tilde(&p));
+                println!("Private things are hidden. Nothing was sent; attach the file where you want help.");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Couldn't write the report: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if has("--install") {
         match install::install(&install::InstallPaths::detect()) {
             Ok(r) => {
@@ -224,6 +294,20 @@ fn main() {
             }
         }
         return;
+    }
+    if has("--self-test") && has("--quick") {
+        // Seconds, no network, no other tools: run by the updater before it
+        // swaps a new version in.
+        match quick_self_test(&paths) {
+            Ok(()) => {
+                println!("StowLock {APP_VERSION}: quick self-test passed (starts, resources load, settings read)");
+                return;
+            }
+            Err(e) => {
+                eprintln!("StowLock {APP_VERSION}: quick self-test failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if has("--self-test") {
         println!("StowLock {APP_VERSION} self-test (sandboxed; never touches your projects or GitHub)…\n");
@@ -304,6 +388,12 @@ fn main() {
     let config = Config::load(&paths);
     let log = logbook::Logger::new(Some(paths.log_file()));
     report::install_panic_hook(paths.clone(), log.clone(), config.workspace());
+    // Closed unexpectedly last time without a crash report (killed, out of
+    // memory, power cut)? Write one now, so the notice can show it.
+    if let Some(v) = report::mark_running(&paths) {
+        report::record_unexpected_close(&paths, &log, &v, &config.workspace());
+    }
+    let paths_at_exit = paths.clone();
 
     // --window-size WIDTHxHEIGHT: open at a given size (used for layout checks).
     let size = args
@@ -333,6 +423,7 @@ fn main() {
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, paths, log, guard, zip_arg)))),
     );
+    report::mark_stopped(&paths_at_exit);
     if let Err(e) = result {
         eprintln!("StowLock couldn't open its window: {e}");
         std::process::exit(1);

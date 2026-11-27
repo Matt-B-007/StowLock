@@ -103,29 +103,9 @@ pub fn pick_from_releases(json: &str, current: &str, beta: bool) -> Option<Relea
 /// Download a public URL to a file (or to text when `out` is None) with curl.
 /// No GitHub sign-in is needed, so updates work right after installing.
 fn fetch(url: &str, out: Option<&Path>, secs: u64) -> Res<String> {
-    if proc::which("curl").is_none() {
-        return Err(
-            "curl is needed to check for updates. Install it with: sudo pacman -S curl".into(),
-        );
-    }
-    let mut args = vec!["-fsSL", "--retry", "2", "-H", "User-Agent: StowLock"];
-    let out_s;
-    if let Some(o) = out {
-        out_s = o.display().to_string();
-        args.push("-o");
-        args.push(&out_s);
-    }
-    args.push(url);
-    let o = proc::run("curl", &args, &Opts::default_timeout().with_timeout(secs));
-    if o.ok() {
-        Ok(o.stdout)
-    } else {
-        let why = o.stderr.trim();
-        Err(if why.is_empty() {
-            "couldn't reach GitHub".to_string()
-        } else {
-            why.to_string()
-        })
+    match out {
+        Some(o) => crate::net::download(url, o, secs).map(|_| String::new()),
+        None => crate::net::get_text(url, secs),
     }
 }
 
@@ -185,10 +165,13 @@ pub fn explain_fetch_error(err: &str) -> String {
         "StowLock couldn't see its releases on GitHub. If the StowLock repository is private, sign in to GitHub (Settings) so updates can use your account.".into()
     } else if e.contains("403") || e.contains("429") || e.contains("rate limit") {
         "GitHub is limiting requests from your network right now. Try again in an hour.".into()
-    } else if e.contains("resolve host") || e.contains("connect") || e.contains("timed out") {
+    } else if e.contains("couldn't reach")
+        || e.contains("resolve")
+        || e.contains("dns")
+        || e.contains("connect")
+        || e.contains("timed out")
+    {
         "Couldn't reach GitHub. Check your internet connection and try again.".into()
-    } else if e.contains("curl is needed") {
-        err.to_string()
     } else {
         format!(
             "Couldn't check for updates ({}).",
@@ -377,10 +360,64 @@ pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathB
             "StowLock was installed from the AUR ({pkg}). Update it with your AUR helper, for example: paru -Syu"
         ));
     }
+    let base = format!("https://github.com/{repo}/releases/download/{tag}");
+    apply_to(
+        paths,
+        &base,
+        Some(repo),
+        tag,
+        &exe,
+        &crate::signing::trusted_keys(),
+        &starts_ok,
+        log,
+    )?;
+    Ok(exe)
+}
+
+/// Can the downloaded version start, load its resources and read settings?
+/// (`--self-test --quick`: seconds, no network.) Run before swapping it in.
+fn starts_ok(bin: &Path) -> Res<()> {
+    let o = proc::run(
+        &bin.display().to_string(),
+        &["--self-test", "--quick"],
+        &Opts::default_timeout().with_timeout(60),
+    );
+    if o.ok() {
+        Ok(())
+    } else {
+        let said = o.combined();
+        let why = said
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .unwrap_or_else(|| match o.code {
+                Some(c) => format!("it stopped with exit code {c}"),
+                None => "it didn't start".to_string(),
+            });
+        Err(format!(
+            "The new version didn't pass its start-up check, so it wasn't installed ({why})."
+        ))
+    }
+}
+
+/// Download `tag` from `base`, check it (signature, checksum, start-up), keep
+/// the current version for "Go back", and swap the new one in at `exe`.
+/// `gh_repo`: try the user's GitHub sign-in if the direct download fails.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_to(
+    paths: &AppPaths,
+    base: &str,
+    gh_repo: Option<&str>,
+    tag: &str,
+    exe: &Path,
+    keys: &[minisign_verify::PublicKey],
+    starts: &dyn Fn(&Path) -> Res<()>,
+    log: &Logger,
+) -> Res<()> {
     let dir = paths.update_dir();
     let _ = std::fs::remove_dir_all(&dir);
     util::ensure_private_dir(&dir)?;
-    let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let bin = dir.join(ASSET);
     let sums_file = dir.join(crate::signing::SUMS);
     let sig_file = dir.join(crate::signing::SUMS_SIG);
@@ -400,6 +437,9 @@ pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathB
             )
         });
     if let Err(e) = direct {
+        let Some(repo) = gh_repo else {
+            return Err(format!("The download failed. {}", explain_fetch_error(&e)));
+        };
         // A private repo: download through the user's GitHub sign-in instead.
         let d = dir.display().to_string();
         let o = proc::run(
@@ -429,15 +469,17 @@ pub fn apply(paths: &AppPaths, repo: &str, tag: &str, log: &Logger) -> Res<PathB
     let sig = std::fs::read_to_string(&sig_file)
         .map_err(|_| "The release isn't signed, so it wasn't installed.".to_string())?;
     log.info("update", &format!("Downloaded StowLock {tag}"));
-    verify_download(&bin, &sums, &sig, &crate::signing::trusted_keys(), tag)?;
+    verify_download(&bin, &sums, &sig, keys, tag)?;
     log.info("update", "Checksum and signature verified");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
         .ctx("making it executable")?;
-    keep_previous(paths, &exe, APP_VERSION)?;
-    swap_in(&bin, &exe)?;
+    starts(&bin)?;
+    log.info("update", "The new version passed its start-up check");
+    keep_previous(paths, exe, APP_VERSION)?;
+    swap_in(&bin, exe)?;
     let _ = std::fs::remove_dir_all(&dir);
     log.info("update", &format!("Installed StowLock {tag}"));
-    Ok(exe)
+    Ok(())
 }
 
 /// Start the new binary and let the caller exit.
@@ -632,5 +674,69 @@ mod tests {
         let bad = format!("{}  {ASSET}\n", "0".repeat(64));
         assert!(verify_checksum(&f, &bad).is_err());
         assert!(verify_checksum(&f, "nonsense").is_err());
+    }
+
+    #[test]
+    fn the_whole_update_cycle_without_curl() {
+        use crate::signing::test_keys::TestKey;
+        let d = tempfile::tempdir().unwrap();
+        let sb = crate::fixtures::Sandbox::new(&d.path().join("sb")).unwrap();
+        let paths = &sb.ctx.paths;
+        let log = Logger::new(None);
+        let exe = d.path().join("installed/stowlock");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"old version").unwrap();
+        let ours = TestKey::new();
+        let stranger = TestKey::new();
+        // A release folder on the local server, signed by `key`.
+        let site = d.path().join("site");
+        let publish = |tag: &str, body: &[u8], key: &TestKey| {
+            let dir = site.join(tag);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(ASSET), body).unwrap();
+            let sums = format!("{}  {ASSET}\n", sha256_hex(&dir.join(ASSET)).unwrap());
+            std::fs::write(dir.join("SHA256SUMS"), &sums).unwrap();
+            std::fs::write(
+                dir.join("SHA256SUMS.minisig"),
+                key.sign(sums.as_bytes(), &format!("StowLock {tag}")),
+            )
+            .unwrap();
+        };
+        publish("v9.0.0", b"new version", &ours);
+        publish("v9.0.1", b"evil version", &stranger);
+        publish("v9.0.2", b"broken version", &ours);
+        let srv = crate::net::test_server::serve(site.clone());
+        let keys = [ours.public()];
+        let fine = |_: &Path| -> Res<()> { Ok(()) };
+        let wont_start = |_: &Path| -> Res<()> { Err("didn't start".into()) };
+        let update = |tag: &str, starts: &dyn Fn(&Path) -> Res<()>| {
+            apply_to(
+                paths,
+                &format!("{srv}/{tag}"),
+                None,
+                tag,
+                &exe,
+                &keys,
+                starts,
+                &log,
+            )
+        };
+
+        // 1. A signed release installs, and the old version is kept.
+        update("v9.0.0", &fine).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new version");
+        // 2. Signed by someone else: refused, nothing changes.
+        let e = update("v9.0.1", &fine).unwrap_err();
+        assert!(e.contains("signing keys"), "{e}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new version");
+        // 3. Genuine, but it doesn't start: refused, nothing changes.
+        let e = update("v9.0.2", &wont_start).unwrap_err();
+        assert!(e.contains("didn't start"), "{e}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new version");
+        // 4. A release that isn't there: a clear message, nothing changes.
+        assert!(update("v9.9.9", &fine).is_err());
+        // 5. Go back to the version from before the update.
+        rollback(paths, &exe, &log).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old version");
     }
 }
