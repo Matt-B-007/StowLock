@@ -298,8 +298,14 @@ pub fn collect_env(signed_in: Option<bool>, secure: Option<bool>) -> EnvInfo {
         ("go", vec!["version"]),
     ] {
         let o = proc::run(name, &args, &Opts::default_timeout().with_timeout(10));
+        let text = o.combined();
         let v = if o.ok() {
-            o.combined().lines().next().unwrap_or("").to_string()
+            text.lines().next().unwrap_or("").to_string()
+        } else if text.contains("could not choose a version") || text.contains("no default") {
+            // rustup is installed, but has no Rust version chosen yet.
+            "rustup has no Rust version yet (run: rustup default stable)".into()
+        } else if proc::which(name).is_some() {
+            format!("installed, but '{name} {}' failed", args.join(" "))
         } else {
             "not installed".into()
         };
@@ -679,14 +685,20 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
         .rev()
         .find(|st| st.name == "Pre-flight tests")
         .is_some_and(|st| st.status == StepStatus::Failed);
-    if !project_tests.is_empty() && latest_check_failed {
+    // The latest failed check, and only the step that failed in it. No prompt
+    // without failure output: an AI would only go looking for a problem that
+    // isn't there.
+    let last = last_failure_block(&privacy_filter(&input.problem_lines));
+    let has_output = last
+        .iter()
+        .skip(1)
+        .any(|l| !split_line(l).1.trim().starts_with('['));
+    if !project_tests.is_empty() && latest_check_failed && has_output {
         s.push_str("\n## AI fix prompt (for your project)\n\n```text\n");
-        // The latest failed check, and only the step that failed in it.
         let summary = project_tests
             .last()
             .map(|t| t.detail.lines().next().unwrap_or(""))
             .unwrap_or("");
-        let last = last_failure_block(&privacy_filter(&input.problem_lines));
         s.push_str(&project_fix_prompt(summary, &last));
         s.push_str("```\n");
     }

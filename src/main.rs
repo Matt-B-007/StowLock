@@ -25,6 +25,7 @@ mod pipeline;
 mod preflight;
 mod proc;
 mod report;
+mod rustcheck;
 mod secrets;
 mod selftest;
 mod signing;

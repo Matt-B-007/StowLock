@@ -19,6 +19,9 @@ pub struct PlanStep {
     /// Installs Python packages with pip: run here in StowLock's own
     /// throwaway environment, never system-wide.
     pub python_deps: bool,
+    /// Installs Cargo tools (cargo-audit, say): run here into StowLock's own
+    /// tools folder, skipping any tool this computer already has.
+    pub cargo_tools: bool,
 }
 
 /// A step only GitHub can run, and why.
@@ -32,6 +35,9 @@ pub struct Skipped {
     /// How many steps to run here came before it (so a later failure can
     /// tell it may depend on this skipped step).
     pub before: usize,
+    /// Part of a job that runs only on GitHub as a whole (another system or
+    /// a container): listed, but not counted as a step that could run here.
+    pub whole_job: bool,
 }
 
 impl Skipped {
@@ -53,8 +59,21 @@ pub struct Plan {
 
 impl Plan {
     /// Steps counted for "Ran 5 of 6 GitHub steps here".
+    /// Steps in the jobs that could run here (jobs that run only on GitHub,
+    /// like an Arch container, are named separately by `github_only_jobs`).
     pub fn total(&self) -> usize {
-        self.steps.len() + self.skipped.len()
+        self.steps.len() + self.skipped.iter().filter(|s| !s.whole_job).count()
+    }
+
+    /// Jobs that run only on GitHub as a whole, by name.
+    pub fn github_only_jobs(&self) -> Vec<String> {
+        let mut jobs: Vec<String> = Vec::new();
+        for sk in self.skipped.iter().filter(|s| s.whole_job) {
+            if !jobs.contains(&sk.job) {
+                jobs.push(sk.job.clone());
+            }
+        }
+        jobs
     }
 }
 
@@ -293,6 +312,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                 why: "couldn't be read".into(),
                 run: None,
                 before: plan.steps.len(),
+                whole_job: false,
             });
             continue;
         };
@@ -336,6 +356,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                             why: why.to_string(),
                             run: None,
                             before,
+                            whole_job: true,
                         });
                     }
                 }
@@ -371,6 +392,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                             why: "a GitHub Action (runs only on GitHub)".into(),
                             run: None,
                             before: plan.steps.len(),
+                            whole_job: false,
                         });
                     }
                     continue;
@@ -398,13 +420,29 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                 // A GitHub-only step that installs tools with pip (shellcheck-py,
                 // say): install the same packages here, in StowLock's own Python
                 // environment, so the checks that need them can run too.
-                if let Some(pip) = why
-                    .filter(|w| !w.starts_with("only runs") && *w != "uses PowerShell")
-                    .and_then(|_| pip_lines(run))
-                {
-                    let mut env = wf_env.clone();
-                    env.extend(job_env.clone());
-                    env.extend(env_of(st));
+                let mut step_env = wf_env.clone();
+                step_env.extend(job_env.clone());
+                step_env.extend(env_of(st));
+                let convertible =
+                    why.filter(|w| !w.starts_with("only runs") && *w != "uses PowerShell");
+                if let Some(cargo) = convertible.and_then(|_| cargo_lines(run, &step_env)) {
+                    if !plan.steps.iter().any(|p| p.run == cargo) {
+                        plan.steps.push(PlanStep {
+                            job: job_name.clone(),
+                            name: format!("{step_name} (here: StowLock's own tools folder)"),
+                            run: cargo,
+                            python_deps: false,
+                            cargo_tools: true,
+                            env: step_env.clone(),
+                            workdir: None,
+                        });
+                    }
+                    if pip_lines(run, &step_env).is_none() {
+                        continue;
+                    }
+                }
+                if let Some(pip) = convertible.and_then(|_| pip_lines(run, &step_env)) {
+                    let env = step_env.clone();
                     // Anything else the step does (apt-get, say) still only runs on GitHub.
                     let other = run.lines().map(str::trim).any(|l| {
                         !(l.is_empty()
@@ -412,6 +450,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                             || l.contains("pip install")
                             || l.contains("pip3 install")
                             || l.contains(" -m venv ")
+                            || l.contains("cargo install ")
                             || l.to_ascii_lowercase().contains("github_path")
                             || l.starts_with("echo "))
                     });
@@ -422,6 +461,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                             why: why.unwrap_or_default().into(),
                             run: Some(run.to_string()),
                             before: plan.steps.len(),
+                            whole_job: false,
                         });
                     }
                     if !plan.steps.iter().any(|p| p.run == pip) {
@@ -430,6 +470,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                             name: format!("{step_name} (here: StowLock's own Python environment)"),
                             run: pip,
                             python_deps: true,
+                            cargo_tools: false,
                             env,
                             workdir: None,
                         });
@@ -443,6 +484,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                         why: why.into(),
                         run: Some(run.to_string()),
                         before: plan.steps.len(),
+                        whole_job: false,
                     });
                     continue;
                 }
@@ -463,6 +505,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                     name: step_name,
                     run: run.to_string(),
                     python_deps: is_python_install(run),
+                    cargo_tools: false,
                     env,
                     workdir,
                 });
@@ -479,10 +522,11 @@ pub fn plan(dir: &Path) -> Option<Plan> {
 /// environment: "/tmp/tools/bin/pip install shellcheck-py==0.11.0.1" becomes
 /// "pip install shellcheck-py==0.11.0.1". None when there are none, or when
 /// they depend on GitHub's own values.
-pub fn pip_lines(run: &str) -> Option<String> {
+pub fn pip_lines(run: &str, env: &[(String, String)]) -> Option<String> {
     let mut out = Vec::new();
     for line in run.lines() {
-        let l = line.trim();
+        let filled = fill_env(line.trim(), env);
+        let l = filled.as_str();
         if l.starts_with('#') || l.contains("${{") {
             continue;
         }
@@ -498,6 +542,63 @@ pub fn pip_lines(run: &str) -> Option<String> {
             .collect();
         if !args.is_empty() {
             out.push(format!("pip install {}", args.join(" ")));
+        }
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+/// Fill in `${{ env.NAME }}` from the workflow's own values. Anything else in
+/// `${{ }}` (secrets, matrix, github.*) is left as it is, so the line is skipped.
+pub fn fill_env(line: &str, env: &[(String, String)]) -> String {
+    let re = regex::Regex::new(r"\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}").unwrap();
+    re.replace_all(line, |c: &regex::Captures| {
+        env.iter()
+            .find(|(k, _)| k == &c[1])
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| c[0].to_string())
+    })
+    .into_owned()
+}
+
+/// The `cargo install` lines in a step, rewritten so a tool this computer
+/// already has (from pacman, say) isn't built again:
+/// "cargo install cargo-audit --locked" becomes
+/// "command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked".
+pub fn cargo_lines(run: &str, env: &[(String, String)]) -> Option<String> {
+    let mut out = Vec::new();
+    for line in run.lines() {
+        let filled = fill_env(line.trim(), env);
+        let l = filled.as_str();
+        if l.starts_with('#') || l.contains("${{") {
+            continue;
+        }
+        let Some(i) = l.find("cargo install ") else {
+            continue;
+        };
+        let args: Vec<&str> = l[i + 14..]
+            .split_whitespace()
+            .take_while(|a| !matches!(*a, "&&" | "||" | ";" | "|"))
+            .collect();
+        // The first argument that isn't an option (or an option's value).
+        let mut tool = None;
+        let mut skip_next = false;
+        for a in &args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if a.starts_with('-') {
+                skip_next = matches!(*a, "--version" | "--git" | "--root" | "--features" | "-F");
+                continue;
+            }
+            tool = Some(a.split('@').next().unwrap_or(a));
+            break;
+        }
+        if let Some(t) = tool {
+            out.push(format!(
+                "command -v {t} >/dev/null 2>&1 || cargo install {}",
+                args.join(" ")
+            ));
         }
     }
     (!out.is_empty()).then(|| out.join("\n"))
@@ -624,7 +725,9 @@ jobs:
         ] {
             assert!(why.iter().any(|x| x.contains(w)), "missing: {w} in {why:?}");
         }
-        assert_eq!(p.total(), 7);
+        // The macOS job runs only on GitHub: named, not counted as a step.
+        assert_eq!(p.total(), 6);
+        assert_eq!(p.github_only_jobs(), ["mac"]);
     }
 
     #[test]
@@ -681,6 +784,7 @@ jobs:
                 "sh scripts/check.sh build",
                 "sh scripts/check.sh selftest",
                 "sh scripts/check.sh shell",
+                "sh scripts/check.sh sign",
             ],
             "{plan:#?}"
         );
@@ -696,13 +800,54 @@ jobs:
     #[test]
     fn pip_tool_installs_are_rewritten_for_stowlocks_environment() {
         assert_eq!(
-            pip_lines("python3 -m venv /tmp/tools\n/tmp/tools/bin/pip install --quiet \"shellcheck-py==$V\"\necho /tmp/tools/bin >> \"$GITHUB_PATH\"").as_deref(),
+            pip_lines("python3 -m venv /tmp/tools\n/tmp/tools/bin/pip install --quiet \"shellcheck-py==$V\"\necho /tmp/tools/bin >> \"$GITHUB_PATH\"", &[]).as_deref(),
             Some("pip install --quiet \"shellcheck-py==$V\"")
         );
-        assert_eq!(pip_lines("sudo apt-get install -y shellcheck"), None);
+        assert_eq!(pip_lines("sudo apt-get install -y shellcheck", &[]), None);
         assert_eq!(
-            pip_lines("pip install --user ruff && ruff --version").as_deref(),
+            pip_lines("pip install --user ruff && ruff --version", &[]).as_deref(),
             Some("pip install ruff")
         );
+    }
+
+    #[test]
+    fn workflow_env_values_are_filled_in() {
+        let env = vec![("SHELLCHECK_VERSION".to_string(), "0.11.0.1".to_string())];
+        assert_eq!(
+            pip_lines(
+                "pip install \"shellcheck-py==${{ env.SHELLCHECK_VERSION }}\"",
+                &env
+            )
+            .as_deref(),
+            Some("pip install \"shellcheck-py==0.11.0.1\"")
+        );
+        // Values from GitHub itself can't be known here: the line is left out.
+        assert_eq!(pip_lines("pip install x==${{ matrix.v }}", &env), None);
+    }
+
+    #[test]
+    fn cargo_tool_installs_skip_tools_you_already_have() {
+        assert_eq!(
+            cargo_lines("cargo install cargo-audit --locked", &[]).as_deref(),
+            Some("command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked")
+        );
+        assert_eq!(
+            cargo_lines("cargo install --locked --version 0.18.3 cargo-deny", &[]).as_deref(),
+            Some("command -v cargo-deny >/dev/null 2>&1 || cargo install --locked --version 0.18.3 cargo-deny")
+        );
+        assert_eq!(cargo_lines("cargo build --release", &[]), None);
+    }
+
+    #[test]
+    fn jobs_that_only_run_on_github_arent_counted_as_steps() {
+        let p = plan(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert!(
+            p.github_only_jobs().iter().any(|j| j.contains("Arch")),
+            "{:?}",
+            p.github_only_jobs()
+        );
+        let arch_steps = p.skipped.iter().filter(|s| s.whole_job).count();
+        assert!(arch_steps > 5);
+        assert_eq!(p.total(), p.steps.len() + p.skipped.len() - arch_steps);
     }
 }

@@ -107,6 +107,8 @@ pub struct Config {
     pub fallback_git_email: String,
     pub tag_prefix: String,
     pub check_for_updates: bool,
+    /// Check once a day whether a newer stable Rust is out (needs rustup).
+    pub rust_update_check: bool,
     /// "stable", "beta", or "" = Beta when this build is itself a beta.
     pub update_channel: String,
     /// The user's own words to hide in bug reports.
@@ -140,6 +142,7 @@ impl Default for Config {
             fallback_git_email: String::new(),
             tag_prefix: "v".into(),
             check_for_updates: true,
+            rust_update_check: true,
             update_channel: String::new(),
             report_hide_words: Vec::new(),
             theme: String::new(),

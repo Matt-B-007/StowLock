@@ -106,6 +106,13 @@ pub(crate) fn is_important(line: &str) -> bool {
 pub(crate) fn is_missing_line(l: &str) -> bool {
     let l = l.to_ascii_lowercase();
     l.contains("command not found")
+        || l.contains("is needed (found")
+        || l.contains("found: none")
+        || l.contains("missing tool")
+        || l.contains("tools missing")
+        || l.contains("sudo pacman -s")
+        || l.contains("could not choose a version")
+        || l.contains("no default toolchain")
         || l.contains("isn't installed")
         || l.contains("is not installed")
         || l.contains("no such command")

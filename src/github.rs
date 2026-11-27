@@ -98,6 +98,37 @@ pub fn failed_step(jobs_json: &str) -> Option<String> {
     None
 }
 
+/// The run number in a GitHub Actions run address
+/// (https://github.com/o/r/actions/runs/123…).
+pub fn run_id(url: &str) -> Option<String> {
+    let rest = url.split("/runs/").nth(1)?;
+    let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// A failure GitHub's machine had, rather than the project: a download or
+/// network problem. Re-running usually fixes these.
+pub fn looks_transient(log: &str) -> bool {
+    const SIGNS: [&str; 14] = [
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "connection timed out",
+        "connection reset",
+        "etimedout",
+        "econnreset",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway",
+        "failed to fetch",
+        "hash sum mismatch",
+        "unable to connect",
+        "rate limit",
+        "the operation was canceled",
+    ];
+    let l = log.to_ascii_lowercase();
+    SIGNS.iter().any(|s| l.contains(s))
+}
+
 pub trait GitHubApi: Send + Sync {
     fn login(&self) -> Res<String>;
     fn orgs(&self) -> Vec<String>;
@@ -129,6 +160,8 @@ pub trait GitHubApi: Send + Sync {
     fn delete_release(&self, owner: &str, slug: &str, tag: &str, log: &Logger) -> Res<()>;
     /// GitHub's build status for a pushed commit.
     fn build_status(&self, owner: &str, slug: &str, commit: &str) -> Res<Build>;
+    /// Re-run only the failed jobs of a run (its web address, from Build::Failed).
+    fn rerun_failed(&self, owner: &str, slug: &str, run_url: &str) -> Res<()>;
 
     fn repo_url(&self, owner: &str, slug: &str) -> String {
         format!("https://github.com/{owner}/{slug}")
@@ -410,6 +443,26 @@ impl GitHubApi for RealGh {
         }
     }
 
+    fn rerun_failed(&self, owner: &str, slug: &str, run_url: &str) -> Res<()> {
+        let id = run_id(run_url).ok_or("StowLock couldn't tell which GitHub run to re-run.")?;
+        let o = gh(&[
+            "run",
+            "rerun",
+            &id,
+            "--failed",
+            "-R",
+            &format!("{owner}/{slug}"),
+        ]);
+        if o.ok() {
+            Ok(())
+        } else {
+            Err(format!(
+                "GitHub didn't start the re-run: {}",
+                o.combined().trim()
+            ))
+        }
+    }
+
     fn build_status(&self, owner: &str, slug: &str, commit: &str) -> Res<Build> {
         let repo = format!("{owner}/{slug}");
         let o = gh(&[
@@ -607,6 +660,15 @@ impl GitHubApi for FakeGh {
         Ok(())
     }
 
+    /// Tests put the result of a re-run in `<root>/rerun.json` (same shape as
+    /// build.json); re-running makes it the build result.
+    fn rerun_failed(&self, _owner: &str, _slug: &str, _run_url: &str) -> Res<()> {
+        match std::fs::read(self.root.join("rerun.json")) {
+            Ok(b) => std::fs::write(self.root.join("build.json"), b).map_err(|e| e.to_string()),
+            Err(_) => Err("GitHub didn't start the re-run (test)".into()),
+        }
+    }
+
     /// Tests set the build result in `<root>/build.json` as
     /// {"state":"passed"|"running"|"failed","step":"…","log":"…"}.
     fn build_status(&self, _owner: &str, _slug: &str, _commit: &str) -> Res<Build> {
@@ -689,5 +751,18 @@ mod build_tests {
             Some("arch (cargo test --locked)")
         );
         assert_eq!(failed_step("{}"), None);
+    }
+
+    #[test]
+    fn reads_run_numbers_and_spots_network_failures() {
+        assert_eq!(
+            run_id("https://github.com/o/r/actions/runs/123456789/job/42").as_deref(),
+            Some("123456789")
+        );
+        assert_eq!(run_id("https://github.com/o/r"), None);
+        assert!(looks_transient(
+            "E: Failed to fetch http://azure.archive.ubuntu.com/... 503 Service Unavailable"
+        ));
+        assert!(!looks_transient("test x ... FAILED\nassertion failed"));
     }
 }

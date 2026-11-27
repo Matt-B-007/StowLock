@@ -173,6 +173,27 @@ pub fn delete(a: &Attempt, trash: impl Fn(&Path) -> Res<String>) -> Res<String> 
     }
 }
 
+/// The newest saved attempt is identical to the one before it (the same zip
+/// staged again): drop the new copy, so retries don't pile up. True if dropped.
+pub fn drop_if_duplicate(dir: &Path) -> bool {
+    let out = |args: &[&str]| crate::git::git(dir, args).stdout.trim().to_string();
+    let prev_msg = out(&["log", "-1", "--format=%s", "stash@{1}"]);
+    if !prev_msg.contains(STASH_PREFIX) {
+        return false;
+    }
+    let tree = |r: &str| out(&["rev-parse", "--verify", "-q", &format!("{r}^{{tree}}")]);
+    let same_tracked = {
+        let (a, b) = (tree("stash@{0}"), tree("stash@{1}"));
+        !a.is_empty() && a == b
+    };
+    // Untracked files live in the stash's third parent (when there are any).
+    let same_untracked = tree("stash@{0}^3") == tree("stash@{1}^3");
+    if same_tracked && same_untracked {
+        return crate::git::git(dir, &["stash", "drop", "-q", "stash@{0}"]).ok();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,6 +4,34 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.1.0-beta.10] - 2026-11-27
+
+Checks that tell the truth, re-runs from StowLock, and safer releases.
+
+### Fixed
+- **Exit code 3 from a project's `scripts/check.sh` means "tools missing", not "failed"** (the House Standard). The result says "Can't run here", shows the script's full list of missing tools and its `sudo pacman -S --needed …` command, and the push isn't blocked. Before, it read as a failure with the list hidden.
+- **No AI prompt when nothing failed.** The bug report only includes one when there's failure output to show.
+- **Missing tools are named correctly,** whatever the wording ("is needed (found: none)", "isn't installed", "no such command"). A note no longer blames a GitHub-only install step when the output names the tool.
+- **rustup without a chosen Rust** says so ("run: rustup default stable") instead of "rustc: not installed".
+- **A project whose workflow can't run here still gets checked:** when it has `scripts/check.sh`, StowLock runs that. It never says "no tests" when the workflow has steps; it lists what only GitHub runs.
+- **Clearer step counts:** jobs that run only on GitHub (an Arch container, macOS) are named instead of counted as steps not run ("Ran 8 of 10 GitHub steps here · "Arch" runs only on GitHub").
+- **A lint failure counts as a real failure** ("could not compile"), with no misleading notes.
+- **Staging the same zip again doesn't pile up saved attempts.** An identical attempt is kept once.
+
+### Added
+- **Re-run on GitHub** in the failed-build card: re-runs only the failed jobs, and StowLock watches again. **Check again** picks up a re-run started on GitHub. When the log shows a download or network error, the card says it's probably a passing GitHub problem and suggests the re-run first.
+- **Tools a workflow installs with Cargo** (`cargo install cargo-audit --locked`) are installed here too, in StowLock's own shared tools folder, unless you already have them. `${{ env.NAME }}` values in tool-install steps are filled in, so pinned tools install as intended.
+- **Rust update notice.** Once a day StowLock asks rustup whether a newer stable Rust is out, and offers **Update Rust** (it runs `rustup update` in the background). Settings → Updates shows your Rust, with Check Rust. The checks card says when your Rust is older than the one GitHub uses.
+- **Check caches:** Settings → Checks shows how much space they use, with **Clear**. A project's cache is removed after 30 days without a check.
+
+### Changed
+- **Rust follows the newest stable release** (`rust-toolchain.toml`: `channel = "stable"`) on GitHub and, with rustup, on your computer.
+- **`scripts/check.sh` follows the House Standard:** it checks every tool first and lists all the missing ones with the install command, and exits 0 (passed), 1 (a check failed) or 3 (only tools missing). New section: **sign**, a signing dry run.
+- **Releases are safer:**
+  - The signing secret's shape is checked in seconds, before any building. It says exactly what's wrong (only one line, the public key, a password-protected key) without printing it.
+  - Signing lives in one script, `scripts/sign.sh`, used by the release and by a **signing dry run on every push**, so a broken signing step shows up on an ordinary push.
+  - GitHub's machine is pinned to **Ubuntu 24.04** instead of "latest", so it only changes when we change it.
+
 ## [0.1.0-beta.9] - 2026-11-26
 
 The first signed release. From here on, StowLock only installs updates that are signed with its own key.

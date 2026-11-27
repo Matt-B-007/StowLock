@@ -13,20 +13,18 @@ permissions:
 jobs:
   build:
     name: Check, build and publish the release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - name: Check the signing key secret is set
+      - name: Check the signing key secret (present, 2 lines, no password)
+        # Seconds, before any building: says exactly what's wrong with the
+        # secret (never printing it).
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-        run: |
-          if [ -z "$MINISIGN_SECRET_KEY" ]; then
-            echo "MINISIGN_SECRET_KEY secret is missing, so this release can't be signed. Add it in Settings > Secrets and variables > Actions, then re-run."
-            exit 1
-          fi
+        run: sh scripts/sign.sh check-secret
       - name: Check the tag, Cargo.toml and CHANGELOG agree
         run: |
           WANT="${GITHUB_REF_NAME#v}"
@@ -57,8 +55,12 @@ jobs:
         run: sh scripts/check.sh build
       - name: Self-test of the release build (--self-test)
         run: sh scripts/check.sh selftest
+      - name: Install minisign
+        run: sudo apt-get update -qq && sudo apt-get install -y minisign
       - name: Check shell scripts (sh -n + shellcheck)
         run: sh scripts/check.sh shell
+      - name: Signing dry run (throwaway key)
+        run: sh scripts/check.sh sign
       - name: Package
         run: |
           cp target/release/stowlock stowlock-linux-x86_64
@@ -73,32 +75,9 @@ jobs:
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           TAG: ${{ github.ref_name }}
-        run: |
-          sudo apt-get install -y minisign
-          key="$RUNNER_TEMP/minisign.key"
-          trap 'rm -f "$key"' EXIT
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
-          chmod 600 "$key"
-          for f in SHA256SUMS stowlock-linux-x86_64.sha256; do
-            if ! minisign -S -s "$key" -m "$f" -t "StowLock $TAG" < /dev/null; then
-              echo "Signing failed. If it said the secret key couldn't be loaded (\"Error while loading the secret key file\" or \"base64 conversion failed\"), the MINISIGN_SECRET_KEY secret's contents are wrong: re-paste the whole two-line key file. The workflow itself is fine."
-              exit 1
-            fi
-          done
+        run: sh scripts/sign.sh sign "$TAG" SHA256SUMS stowlock-linux-x86_64.sha256
       - name: Check the signatures against StowLock's public keys (before publishing)
-        run: |
-          primary="$(grep -v '^untrusted comment:' packaging/minisign/primary.pub)"
-          backup="$(grep -v '^untrusted comment:' packaging/minisign/backup.pub)"
-          for f in SHA256SUMS stowlock-linux-x86_64.sha256; do
-            if minisign -V -q -P "$primary" -m "$f" 2>/dev/null; then
-              echo "$f: signed with the primary key"
-            elif minisign -V -q -P "$backup" -m "$f" 2>/dev/null; then
-              echo "$f: signed with the backup key"
-            else
-              echo "$f.minisig doesn't verify with either public key, so nothing was published."
-              exit 1
-            fi
-          done
+        run: sh scripts/sign.sh verify SHA256SUMS stowlock-linux-x86_64.sha256
       - name: Publish the release
         # House Standard order: a draft first, then the files, then publish,
         # so nobody can see (or update to) a release without its files.

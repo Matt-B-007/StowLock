@@ -86,12 +86,22 @@ enum Msg {
     Pushed(Result<PushOutcome, String>),
     /// GitHub's build for a pushed commit: (watch id, status).
     Build(u64, Result<crate::github::Build, String>),
+    /// GitHub started (or refused) a re-run of the failed jobs.
+    Rerun(Result<(), String>),
     /// Finish the release / Remove the tag / Delete release finished.
     ReleaseFixed(Result<String, String>),
     Archived(Result<PathBuf, String>),
     Projects(Vec<ProjectInfo>),
     SelfTest(Box<SelfTestReport>, Option<PathBuf>),
     UpdateChecked(Result<updater::CheckResult, String>),
+    /// The check caches' size in bytes (for Settings).
+    CacheSize(u64),
+    /// Check caches cleared: bytes freed, or why not.
+    CachesCleared(Result<u64, String>),
+    /// What this computer's Rust is like (rustup check).
+    Rust(crate::rustcheck::RustState),
+    /// `rustup update` finished: the new version, or why not.
+    RustUpdated(Result<String, String>),
     UpdateApplied(Result<PathBuf, String>),
     RolledBack(Result<(PathBuf, String), String>),
     SignIn(SignInEvent),
@@ -234,6 +244,8 @@ struct BuildWatch {
     owner: String,
     slug: String,
     tag: Option<String>,
+    /// The pushed commit being watched (for Check again and re-runs).
+    commit: String,
     status: Option<crate::github::Build>,
     /// The local checks passed (so a failure on GitHub is a mismatch).
     local_passed: bool,
@@ -320,6 +332,13 @@ pub struct App {
     deleting_release: Option<(String, String, String, String)>,
     /// Confirming "Remove the tag" / "Delete the release and tag" after a push.
     confirm_remove_tag: bool,
+    /// This computer's Rust (from the daily rustup check) and whether an update
+    /// is running / was put off for now.
+    rust: Option<crate::rustcheck::RustState>,
+    /// The check caches' size (None until measured).
+    cache_size: Option<u64>,
+    rust_busy: bool,
+    rust_later: bool,
     /// Each account's repos on GitHub, as last loaded (lower-case owner).
     repo_lists: std::collections::HashMap<String, Vec<String>>,
     /// Accounts whose list is loading now / when each was last asked for.
@@ -446,6 +465,10 @@ impl App {
             build_poll: (8, 15),
             deleting_release: None,
             confirm_remove_tag: false,
+            rust: None,
+            cache_size: None,
+            rust_busy: false,
+            rust_later: false,
             repo_lists: Default::default(),
             repos_loading: Default::default(),
             repos_asked: Default::default(),
@@ -958,6 +981,63 @@ impl App {
         });
     }
 
+    /// Ask rustup whether a newer stable Rust is out (in the background).
+    fn check_rust(&mut self) {
+        let paths = self.paths.clone();
+        self.spawn_bg(move || Msg::Rust(crate::rustcheck::check(&paths)));
+    }
+
+    /// Run `rustup update stable` (or `rustup default stable`) in the background.
+    fn update_rust(&mut self) {
+        let Some(state) = self.rust.clone() else {
+            return;
+        };
+        self.rust_busy = true;
+        self.log.info("rust", "Updating Rust with rustup");
+        self.spawn_bg(move || Msg::RustUpdated(crate::rustcheck::update(&state)));
+    }
+
+    /// The "newer Rust" notice on the Stage screen.
+    fn rust_notice(&mut self, ui: &mut egui::Ui) {
+        use crate::rustcheck::RustState;
+        if self.rust_later && !self.rust_busy {
+            return;
+        }
+        let text = match &self.rust {
+            Some(RustState::UpdateAvailable { have, newest }) => format!(
+                "Rust {newest} is available (you have {have}). GitHub uses the newest, so update before checking Rust projects."
+            ),
+            Some(RustState::NoDefault) => {
+                "rustup is installed but has no Rust version yet, so Rust projects can't be checked.".into()
+            }
+            _ => return,
+        };
+        let action = if self.rust == Some(RustState::NoDefault) {
+            "Set up Rust"
+        } else {
+            "Update Rust"
+        };
+        ui::banner(ui, ACCENT(), |ui| {
+            if self.rust_busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Updating Rust with rustup (a minute or two)…");
+                });
+                return;
+            }
+            ui.add(egui::Label::new(text).wrap());
+            ui.horizontal_wrapped(|ui| {
+                if ui::primary(ui, action, self.busy.is_none()).clicked() {
+                    self.update_rust();
+                }
+                if ui.button("Later").clicked() {
+                    self.rust_later = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
     fn apply_update(&mut self, tag: String) {
         self.update = UpdateState::Working(tag.clone());
         let paths = self.paths.clone();
@@ -969,24 +1049,37 @@ impl App {
     /// Follow GitHub's build for a pushed commit: check every 15 seconds for
     /// up to 40 minutes. No build within 90 seconds means the project has none.
     fn watch_build(&mut self, commit: String, tag: Option<String>) {
-        let id = self.build.as_ref().map(|w| w.id + 1).unwrap_or(1);
         let local_passed = self
             .session
             .checks
             .as_ref()
             .map(|c| c.tests.status == TestStatus::Passed)
             .unwrap_or(false);
+        let (owner, slug) = (self.session.owner.clone(), self.session.slug.clone());
+        self.watch_build_for(owner, slug, commit, tag, local_passed);
+    }
+
+    /// Watch GitHub's build of `commit` until it passes or fails.
+    fn watch_build_for(
+        &mut self,
+        owner: String,
+        slug: String,
+        commit: String,
+        tag: Option<String>,
+        local_passed: bool,
+    ) {
+        let id = self.build.as_ref().map(|w| w.id + 1).unwrap_or(1);
         self.build = Some(BuildWatch {
             id,
-            owner: self.session.owner.clone(),
-            slug: self.session.slug.clone(),
+            owner: owner.clone(),
+            slug: slug.clone(),
             tag,
+            commit: commit.clone(),
             status: None,
             local_passed,
             dismissed: false,
         });
         let gh = self.gh.clone();
-        let (owner, slug) = (self.session.owner.clone(), self.session.slug.clone());
         let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         let (first, every) = self.build_poll;
@@ -1012,6 +1105,29 @@ impl App {
                 std::thread::sleep(std::time::Duration::from_secs(every));
             }
         });
+    }
+
+    /// Watch the same build again (after a re-run started here or on GitHub).
+    fn rewatch_build(&mut self) {
+        if let Some(w) = &self.build {
+            let (o, s, c, t, l) = (
+                w.owner.clone(),
+                w.slug.clone(),
+                w.commit.clone(),
+                w.tag.clone(),
+                w.local_passed,
+            );
+            self.confirm_remove_tag = false;
+            self.watch_build_for(o, s, c, t, l);
+        }
+    }
+
+    /// Ask GitHub to re-run the failed jobs, then watch again.
+    fn rerun_build(&mut self, run_url: String) {
+        let Some(w) = &self.build else { return };
+        let (owner, slug) = (w.owner.clone(), w.slug.clone());
+        let gh = self.gh.clone();
+        self.spawn_bg(move || Msg::Rerun(gh.rerun_failed(&owner, &slug, &run_url)));
     }
 
     fn fix_release(&mut self, finish: bool, owner: String, slug: String, tag: String, beta: bool) {
@@ -1137,10 +1253,22 @@ impl App {
                         ui::semibold(format!("GitHub's build failed at {step}"), 14.5)
                             .color(ERROR()),
                     );
-                    if w.local_passed {
+                    let transient = crate::github::looks_transient(&log);
+                    if transient {
+                        ui.add(egui::Label::new(RichText::new("This looks like a passing problem on GitHub's side (a download or network error), not your project. Re-run it first.").color(WARNING())).wrap());
+                    } else if w.local_passed {
                         ui.add(egui::Label::new(ui::muted("It passed here but failed on GitHub: GitHub runs on a different machine, often with newer tools.").size(13.0)).wrap());
                     }
                     ui.horizontal_wrapped(|ui| {
+                        if ui::button_enabled(ui, self.busy.is_none(), ui::icon::REFRESH, "Re-run on GitHub")
+                            .on_hover_text("Re-runs only the failed jobs, then StowLock watches again")
+                            .clicked()
+                        {
+                            self.rerun_build(url.clone());
+                        }
+                        if ui.link("Check again").on_hover_text("If you re-ran it on GitHub yourself").clicked() {
+                            self.rewatch_build();
+                        }
                         if ui::button(ui, ui::icon::EXTERNAL, "Open the build log").clicked() {
                             let _ = proc::xdg_open(&url);
                         }
@@ -1399,6 +1527,30 @@ impl App {
                 if first && self.config.check_for_updates && updater::check_due(&self.paths) {
                     self.check_updates(false);
                 }
+                if first
+                    && self.config.rust_update_check
+                    && crate::rustcheck::check_due(&self.paths)
+                {
+                    self.check_rust();
+                }
+                if first {
+                    // Project check caches unused for 30 days are removed.
+                    let paths = self.paths.clone();
+                    let log = self.log.clone();
+                    std::thread::spawn(move || {
+                        let (cleared, freed) = pipeline::clean_old_caches(&paths, 30);
+                        if !cleared.is_empty() {
+                            log.info(
+                                "cache",
+                                &format!(
+                                    "Removed check caches unused for 30 days ({}, {})",
+                                    cleared.len(),
+                                    util::human_size(freed)
+                                ),
+                            );
+                        }
+                    });
+                }
             }
             Msg::Repos(owner, r) => {
                 let key = owner.to_ascii_lowercase();
@@ -1450,6 +1602,15 @@ impl App {
                     self.record_health(self.session.mode == Mode::Update);
                     self.fail(&e, "stage");
                 }
+            },
+            Msg::Rerun(r) => match r {
+                Ok(()) => {
+                    self.log
+                        .info("build", "Asked GitHub to re-run the failed jobs");
+                    self.toast("GitHub is re-running the failed jobs. StowLock is watching.");
+                    self.rewatch_build();
+                }
+                Err(e) => self.fail(&e, "build"),
             },
             Msg::Build(id, r) => {
                 let Some(w) = self.build.as_mut().filter(|w| w.id == id) else {
@@ -1544,6 +1705,32 @@ impl App {
                 self.health = HealthState::load(&self.paths);
                 self.toast(&format!("Self-test: {}", r.summary_line()));
                 self.last_selftest = Some((*r, path));
+            }
+            Msg::CacheSize(n) => self.cache_size = Some(n),
+            Msg::CachesCleared(r) => match r {
+                Ok(n) => {
+                    self.cache_size = Some(0);
+                    self.toast(&format!(
+                        "Cleared the check caches ({})",
+                        util::human_size(n)
+                    ));
+                }
+                Err(e) => self.fail(&e, "cache"),
+            },
+            Msg::Rust(state) => {
+                self.log.info("rust", &state.line());
+                self.rust = Some(state);
+            }
+            Msg::RustUpdated(r) => {
+                self.rust_busy = false;
+                match r {
+                    Ok(v) => {
+                        self.log.info("rust", &format!("Rust updated to {v}"));
+                        self.toast(&format!("Rust updated to {v}"));
+                        self.rust = Some(crate::rustcheck::RustState::UpToDate { version: v });
+                    }
+                    Err(e) => self.fail(&e, "rust"),
+                }
             }
             Msg::UpdateChecked(r) => match r {
                 Ok(c) => {
@@ -2154,6 +2341,34 @@ impl App {
                     self.check_updates(true);
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                let line = match &self.rust {
+                    Some(r) => r.line(),
+                    None => "Rust: not checked yet".into(),
+                };
+                ui.label(ui::muted(line).size(13.0));
+                if ui
+                    .add_enabled(!self.rust_busy, egui::Button::new("Check Rust").small())
+                    .clicked()
+                {
+                    self.rust_later = false;
+                    self.check_rust();
+                }
+                if matches!(
+                    self.rust,
+                    Some(crate::rustcheck::RustState::UpdateAvailable { .. })
+                        | Some(crate::rustcheck::RustState::NoDefault)
+                ) && ui
+                    .add_enabled(!self.rust_busy, egui::Button::new("Update Rust").small())
+                    .clicked()
+                {
+                    self.update_rust();
+                }
+            });
+            ui.checkbox(
+                &mut self.config.rust_update_check,
+                "Check for a newer Rust once a day (rustup)",
+            );
             match &self.update {
                 UpdateState::Available(rel) => {
                     let label = rel.label();
@@ -2700,6 +2915,7 @@ impl App {
 
     fn stage_tab(&mut self, ui: &mut egui::Ui, hovering: bool) {
         self.error_card(ui);
+        self.rust_notice(ui);
         // ---- drop zone
         let has_zip = self.session.zip.is_some() || self.session.stage.is_some();
         let (fill, stroke) = if hovering {
@@ -3453,6 +3669,23 @@ impl App {
                         TestStatus::Cancelled => ("Tests cancelled", WARNING()),
                     };
                     let cant_run = txt == "Can't run here";
+                    let rust_project = self
+                        .session
+                        .stage
+                        .as_ref()
+                        .is_some_and(|st| st.stack() == crate::detect::Stack::Rust);
+                    if let (
+                        true,
+                        Some(crate::rustcheck::RustState::UpdateAvailable { have, newest }),
+                    ) = (rust_project, &self.rust)
+                    {
+                        ui.add(
+                            egui::Label::new(ui::muted(format!(
+                                "Your Rust ({have}) is older than the newest ({newest}), which GitHub uses: it may catch warnings this check didn't. Update Rust and Re-check to be sure."
+                            )).size(12.5))
+                            .wrap(),
+                        );
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui::badge(ui, txt, col);
                         ui.label(ui::muted(format!(
@@ -4861,6 +5094,26 @@ impl App {
                     &mut self.config.block_on_secrets,
                     "Block pushes when possible secrets are found",
                 );
+                ui.horizontal_wrapped(|ui| {
+                    if self.cache_size.is_none() {
+                        self.cache_size = Some(u64::MAX); // measuring
+                        let paths = self.paths.clone();
+                        self.spawn_bg(move || Msg::CacheSize(pipeline::cache_size(&paths)));
+                    }
+                    let size = match self.cache_size {
+                        Some(u64::MAX) | None => "measuring…".to_string(),
+                        Some(n) => util::human_size(n),
+                    };
+                    ui.label(format!("Check caches: {size}"))
+                        .on_hover_text("Builds, Python environments and tools StowLock keeps so checks are fast. A project's cache is removed after 30 days without a check.");
+                    if ui
+                        .add_enabled(self.busy.is_none(), egui::Button::new("Clear").small())
+                        .clicked()
+                    {
+                        let paths = self.paths.clone();
+                        self.spawn_bg(move || Msg::CachesCleared(pipeline::clear_caches(&paths)));
+                    }
+                });
                 ui.separator();
                 ui::section_title(ui, "PRIVACY");
                 ui.horizontal_wrapped(|ui| {
@@ -5451,6 +5704,20 @@ mod ui_tests {
 
         // Stage & check a zip.
         click_nav(&mut h, "Stage");
+        // A newer Rust is out: the Stage screen says so; Later hides it.
+        h.state_mut().rust = Some(crate::rustcheck::RustState::UpdateAvailable {
+            have: "1.100.0".into(),
+            newest: "1.101.0".into(),
+        });
+        steps(&mut h, 2);
+        assert!(h
+            .query_by_label_contains("Rust 1.101.0 is available (you have 1.100.0)")
+            .is_some());
+        click_button(&mut h, "Later");
+        steps(&mut h, 2);
+        assert!(h
+            .query_by_label_contains("Rust 1.101.0 is available")
+            .is_none());
         h.state_mut().load_zip(zip);
         steps(&mut h, 3);
         // The version comes from the zip: no typing.
@@ -5527,6 +5794,25 @@ mod ui_tests {
             .is_some());
         assert!(h
             .query_by_label_contains("It passed here but failed on GitHub")
+            .is_some());
+
+        // Re-run on GitHub: the re-run fails again, this time with a network
+        // error, so StowLock says it's GitHub's problem, not the project's.
+        std::fs::write(
+            d.path().join("gh/rerun.json"),
+            r#"{"state":"failed","step":"Install tools","log":"curl: (6) Could not resolve host: static.rust-lang.org"}"#,
+        )
+        .unwrap();
+        click_button(&mut h, "Re-run on GitHub");
+        wait_until(&mut h, "re-run watched", |a| {
+            matches!(
+                a.build.as_ref().and_then(|b| b.status.clone()),
+                Some(crate::github::Build::Failed { ref step, .. }) if step == "Install tools"
+            )
+        });
+        steps(&mut h, 2);
+        assert!(h
+            .query_by_label_contains("passing problem on GitHub's side")
             .is_some());
         click_button(&mut h, "Delete the release and tag");
         click_button(&mut h, "Delete v0.2.0 from GitHub");

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# The Rust version CI uses, pinned so a new Rust or clippy release can't make
-# CI fail overnight. Change it on purpose, in a release of its own.
-# (System cargo without rustup, as on Arch, ignores this file.)
+# Rust follows the newest stable release, on GitHub and (with rustup) on your
+# computer alike. Run `rustup update` now and then; StowLock reminds you.
 [toolchain]
-channel = "1.97.0"
+channel = "stable"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

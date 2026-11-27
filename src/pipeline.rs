@@ -447,9 +447,16 @@ fn stage_update(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut Stage
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         git::git_ok(target, &refs, log, "stage")
             .map_err(|e| format!("Couldn't set aside the earlier unpushed staging: {e}"))?;
-        result.notes.push(format!(
-            "Saved the earlier unpushed staging in git stash (\"{label}\")"
-        ));
+        if crate::attempts::drop_if_duplicate(target) {
+            log.info(
+                "stage",
+                "Same as the last saved attempt, so it wasn't saved twice",
+            );
+        } else {
+            result.notes.push(format!(
+                "Saved the earlier unpushed staging in git stash (\"{label}\")"
+            ));
+        }
     }
     // 4. Default branch, fetch, fast-forward.
     let branch = ctx
@@ -525,8 +532,84 @@ pub struct Checks {
     pub ignored_secrets: usize,
 }
 
+/// Where StowLock keeps each project's check cache (builds, its Python
+/// environment, the fresh home) and its shared tools folder.
+pub fn caches_dir(paths: &crate::config::AppPaths) -> PathBuf {
+    paths.cache_dir.join("builds")
+}
+
+/// The shared Cargo tools folder: kept when old project caches are cleared.
+const SHARED_TOOLS: &str = "stowlock-tools";
+/// Marks when a project's check cache was last used.
+const LAST_USED: &str = ".stowlock-last-used";
+
+fn dir_size(p: &Path) -> u64 {
+    walkdir::WalkDir::new(p)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// How much space the check caches use, in bytes.
+pub fn cache_size(paths: &crate::config::AppPaths) -> u64 {
+    dir_size(&caches_dir(paths))
+}
+
+/// Remove every check cache (they're rebuilt when needed). Returns bytes freed.
+pub fn clear_caches(paths: &crate::config::AppPaths) -> Res<u64> {
+    let dir = caches_dir(paths);
+    let size = dir_size(&dir);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("Couldn't clear the check caches: {e}"))?;
+    }
+    Ok(size)
+}
+
+/// Remove project caches not used for `days` days (the shared tools folder
+/// stays). Returns the projects cleared and the bytes freed.
+pub fn clean_old_caches(paths: &crate::config::AppPaths, days: u64) -> (Vec<String>, u64) {
+    let mut cleared = Vec::new();
+    let mut freed = 0;
+    let Ok(rd) = std::fs::read_dir(caches_dir(paths)) else {
+        return (cleared, freed);
+    };
+    let limit = std::time::Duration::from_secs(days * 24 * 60 * 60);
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if !p.is_dir() || name == SHARED_TOOLS {
+            continue;
+        }
+        let used = std::fs::metadata(p.join(LAST_USED))
+            .or_else(|_| std::fs::metadata(&p))
+            .and_then(|m| m.modified())
+            .ok();
+        let old = used
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > limit);
+        if old {
+            let size = dir_size(&p);
+            if std::fs::remove_dir_all(&p).is_ok() {
+                freed += size;
+                cleared.push(name);
+            }
+        }
+    }
+    (cleared, freed)
+}
+
 pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
     let st = ProjectsState::load(&ctx.paths).get(slug);
+    // Mark this project's check cache as used (for the 30-day clean-up).
+    let cache = caches_dir(&ctx.paths).join(slug.to_ascii_lowercase());
+    if std::fs::create_dir_all(&cache).is_ok() {
+        let _ = std::fs::write(cache.join(LAST_USED), util::now_stamp_secs());
+    }
     let tests = if ctx.config.run_tests_before_push {
         let t = Instant::now();
         ctx.log.step("Pre-flight tests", StepStatus::Running, 0, "");
@@ -1642,5 +1725,74 @@ mod tests {
         );
         let tags = crate::git::git_bare(&sb.fake.bare(&sb.owner, "demo-app"), &["tag"]).stdout;
         assert!(tags.contains("v1.0.0"), "tag not pushed: {tags}");
+    }
+
+    #[test]
+    fn restaging_the_same_zip_doesnt_pile_up_saved_attempts() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let ws = sb.ctx.workspace();
+        let v1 = sb.python_zip("demo-app.zip", "demo-app", &[("app.py", b"x = 1\n")]);
+        stage(&sb.ctx, &req(&sb, &v1, Mode::New)).unwrap();
+        push(
+            &sb.ctx,
+            &preq(&sb, Mode::New, "v0.1.0", Channel::Stable, None),
+        )
+        .unwrap();
+        let v2 = sb.python_zip(
+            "demo-app-2.zip",
+            "demo-app",
+            &[("app.py", b"x = 2\n"), ("new.py", b"y = 1\n")],
+        );
+        let v3 = sb.python_zip("demo-app-3.zip", "demo-app", &[("app.py", b"x = 3\n")]);
+        let stashes = || {
+            git::git(&ws.join("demo-app"), &["stash", "list"])
+                .stdout
+                .lines()
+                .count()
+        };
+        let restage = |zip: &std::path::Path| {
+            crate::state::ProjectsState::update(&sb.ctx.paths, "demo-app", |p| {
+                p.status = crate::state::Status::Staged
+            })
+            .unwrap();
+            stage(&sb.ctx, &req(&sb, zip, Mode::Update)).unwrap();
+        };
+        restage(&v2); // nothing to save yet
+        restage(&v2); // saves the v2 staging
+        assert_eq!(stashes(), 1);
+        restage(&v2); // the same v2 staging again: not saved twice
+        restage(&v3); // still the same v2 staging being set aside
+        assert_eq!(stashes(), 1, "identical attempts were saved twice");
+        restage(&v2); // now the v3 staging is set aside: a different attempt
+        assert_eq!(stashes(), 2);
+    }
+
+    #[test]
+    fn old_check_caches_are_removed_but_shared_tools_stay() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let root = caches_dir(&sb.ctx.paths);
+        for p in ["old-project", "new-project", SHARED_TOOLS] {
+            std::fs::create_dir_all(root.join(p)).unwrap();
+            std::fs::write(root.join(p).join("big.bin"), vec![0u8; 1000]).unwrap();
+            std::fs::write(root.join(p).join(LAST_USED), "x").unwrap();
+        }
+        let long_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 3600);
+        for p in ["old-project", SHARED_TOOLS] {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(root.join(p).join(LAST_USED))
+                .unwrap();
+            f.set_modified(long_ago).unwrap();
+        }
+        assert!(cache_size(&sb.ctx.paths) >= 3000);
+        let (cleared, freed) = clean_old_caches(&sb.ctx.paths, 30);
+        assert_eq!(cleared, ["old-project"]);
+        assert!(freed >= 1000);
+        assert!(root.join("new-project").exists() && root.join(SHARED_TOOLS).exists());
+        assert!(clear_caches(&sb.ctx.paths).unwrap() >= 2000);
+        assert!(!root.exists());
     }
 }

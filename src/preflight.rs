@@ -331,9 +331,19 @@ fn real_failure(block: &str) -> bool {
             "AssertionError",
             "error[E",
             "Diff in ",
+            "could not compile",
         ]
         .iter()
         .any(|w| block.contains(w))
+}
+
+/// The `sudo pacman -S …` command a check script suggests, if any.
+fn pacman_line(output: &str) -> Option<String> {
+    output.lines().find_map(|l| {
+        let i = l.find("sudo pacman -S")?;
+        let cmd = l[i..].trim().trim_end_matches(['.', ')', '`']);
+        Some(cmd.to_string())
+    })
 }
 
 /// The tool a "not installed" message names, and the project's own advice
@@ -341,20 +351,25 @@ fn real_failure(block: &str) -> bool {
 fn named_missing_tool(output: &str) -> (Option<String>, Option<String>) {
     let mut tool = missing_command(output);
     let mut hint = None;
+    if output.contains("could not choose a version") || output.contains("no default toolchain") {
+        return (
+            Some("a Rust version (rustup has none chosen yet)".into()),
+            Some("rustup default stable".into()),
+        );
+    }
+    // "shellcheck isn't installed", "shellcheck 0.11.0 is needed (found: none)"
+    let phrase = regex::Regex::new(
+        r"(?i)([A-Za-z][\w.+-]*)(?: v?[\d.]+)? (?:isn't installed|is not installed|is needed)",
+    )
+    .unwrap();
     for l in output.lines() {
         let l = l.trim();
         let lower = l.to_ascii_lowercase();
         if tool.is_none() {
-            for w in [" isn't installed", " is not installed"] {
-                if let Some(i) = lower.find(w) {
-                    let name = l[..i]
-                        .rsplit([' ', ':'])
-                        .next()
-                        .unwrap_or("")
-                        .trim_matches('`');
-                    if !name.is_empty() {
-                        tool = Some(name.to_string());
-                    }
+            if let Some(c) = phrase.captures(l) {
+                let name = c[1].trim_matches('`');
+                if !name.is_empty() && !name.eq_ignore_ascii_case("it") {
+                    tool = Some(name.to_string());
                 }
             }
             if let Some(i) = lower.find("no such command: ") {
@@ -397,6 +412,14 @@ fn install_hint(tool: &str) -> String {
         format!("sudo pacman -S python-{tool}")
     } else {
         format!("sudo pacman -S {tool}")
+    }
+}
+
+/// StowLock's shared folder for Cargo tools a workflow installs.
+fn tools_dir(dir: &Path, env: &TestEnv) -> PathBuf {
+    match env.build_cache.as_ref().and_then(|c| c.parent()) {
+        Some(p) => p.join("stowlock-tools"),
+        None => python_env_dir(dir, env).with_extension("tools"),
     }
 }
 
@@ -455,11 +478,21 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
                 hint,
             }
         };
-    let ran_of = |n: usize| format!("Ran {n} of {} GitHub steps here", plan.total());
+    let jobs = plan.github_only_jobs();
+    let jobs_note = match jobs.len() {
+        0 => String::new(),
+        1 => format!(" (\"{}\" runs only on GitHub)", jobs[0]),
+        _ => format!(" ({} jobs run only on GitHub)", jobs.len()),
+    };
+    let ran_of = |n: usize| format!("Ran {n} of {} GitHub steps here{jobs_note}", plan.total());
     let mut py_env: Vec<(String, String)> = Vec::new();
     // Steps that couldn't run here (something missing): (what it needs, how
     // to get it). The rest still run; GitHub runs these ones.
     let mut cant_run: Vec<(String, Option<String>)> = Vec::new();
+    // Tools StowLock installed for checks: its Python environment and its
+    // shared Cargo tools folder, searched before the system's.
+    let tools_root = tools_dir(dir, env);
+    let mut tool_paths: Vec<PathBuf> = vec![tools_root.join("bin")];
     let mut ran = 0usize;
     let (home_env, session_vars) = if env.clean_home {
         clean_home(dir, env).unwrap_or_default()
@@ -496,22 +529,36 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
                         );
                     }
                 }
-                let path = proc::full_path();
                 py_env = vec![
                     ("VIRTUAL_ENV".into(), venv.display().to_string()),
-                    (
-                        "PATH".into(),
-                        format!("{}:{path}", venv.join("bin").display()),
-                    ),
                     ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
                 ];
+                tool_paths.insert(0, venv.join("bin"));
             }
             cmd = cmd.replace(" --user", "");
             timeout = timeout.max(900);
         }
+        if step.cargo_tools {
+            // Cargo tools go into StowLock's own tools folder (built once,
+            // then reused by every project); tools you already have are kept.
+            let _ = std::fs::create_dir_all(&tools_root);
+            py_env.retain(|(k, _)| k != "CARGO_INSTALL_ROOT");
+            py_env.push((
+                "CARGO_INSTALL_ROOT".into(),
+                tools_root.display().to_string(),
+            ));
+            timeout = timeout.max(1800);
+        }
         let mut step_env = home_env.clone();
         step_env.extend(step.env.iter().cloned());
         step_env.extend(py_env.iter().cloned());
+        let path = tool_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .chain(std::iter::once(proc::full_path()))
+            .collect::<Vec<_>>()
+            .join(":");
+        step_env.push(("PATH".into(), path));
         let o = run_step_labelled(
             &wd,
             "bash",
@@ -550,6 +597,34 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             .rev()
             .find(|sk| sk.job == step.job && sk.is_install() && sk.before <= i);
         let missing_evidence = out.lines().any(crate::logbook::is_missing_line);
+        // House Standard: a check script exits 3 when only tools are missing.
+        let tools_missing_exit =
+            o.code == Some(3) && (step.run.contains("check.sh") || missing_evidence);
+        if tools_missing_exit {
+            let (tool, own_hint) = named_missing_tool(&out);
+            let shown = match (&tool, needs) {
+                (Some(t), _) => format!("`{t}`"),
+                (None, Some(sk)) => format!("what \"{}\" installs on GitHub", sk.name),
+                (None, None) => "tools that aren't installed here".to_string(),
+            };
+            done.push(format!(
+                "Can't run here: {label} (needs {shown}; GitHub runs it)"
+            ));
+            // The script's own list of what's missing, in full: it names
+            // tools, never the project's code.
+            done.extend(
+                out.lines()
+                    .map(str::trim_end)
+                    .filter(|l| !l.trim().is_empty())
+                    .take(12)
+                    .map(|l| format!("  {}", l.trim())),
+            );
+            let hint = pacman_line(&out)
+                .or(own_hint)
+                .or_else(|| tool.as_deref().map(install_hint));
+            cant_run.push((shown, hint));
+            continue;
+        }
         if o.code == Some(127) {
             let tool = missing_command(&out).unwrap_or_else(|| "a command it uses".into());
             let shown = if tool.contains(' ') {
@@ -584,7 +659,10 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             continue;
         }
         if let (Some(sk), true) = (needs, missing_evidence && !real_failure(&block)) {
-            let what = format!("what \"{}\" installs on GitHub", sk.name);
+            let what = match named_missing_tool(&out).0 {
+                Some(t) => format!("`{t}`"),
+                None => format!("what \"{}\" installs on GitHub", sk.name),
+            };
             done.push(format!(
                 "Can't run here: {label} (needs {what}; GitHub runs it)"
             ));
@@ -646,10 +724,11 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
     let counts = result_summary(&transcript)
         .map(|c| format!(" · {c}"))
         .unwrap_or_default();
-    let skipped = if plan.skipped.is_empty() {
+    let step_skips = plan.skipped.iter().filter(|s| !s.whole_job).count();
+    let skipped = if step_skips == 0 {
         String::new()
     } else {
-        format!(" · {} GitHub-only skipped", plan.skipped.len())
+        format!(" · {step_skips} GitHub-only skipped")
     };
     if cant_run.is_empty() {
         return finish(
@@ -738,9 +817,44 @@ pub fn run_tests(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
         }
     }
     if env.match_github {
-        if let Some(plan) = crate::workflows::plan(dir) {
+        let plan = crate::workflows::plan(dir);
+        if let Some(plan) = &plan {
             if !plan.steps.is_empty() {
-                return run_plan(dir, &plan, env);
+                return run_plan(dir, plan, env);
+            }
+        }
+        // Nothing in the workflows can run here, but the project has its own
+        // check script (the House Standard): run that.
+        if dir.join("scripts").join("check.sh").is_file() {
+            let mut p = plan.unwrap_or_default();
+            p.steps.push(crate::workflows::PlanStep {
+                job: "check.sh".into(),
+                name: "scripts/check.sh".into(),
+                run: "sh scripts/check.sh".into(),
+                python_deps: false,
+                cargo_tools: false,
+                env: Vec::new(),
+                workdir: None,
+            });
+            return run_plan(dir, &p, env);
+        }
+        if let Some(plan) = &plan {
+            if !plan.skipped.is_empty() {
+                let start = Instant::now();
+                let mut tail = String::from("Every workflow step needs GitHub:\n");
+                for sk in &plan.skipped {
+                    tail.push_str(&format!("  - {}: {} ({})\n", sk.job, sk.name, sk.why));
+                }
+                return TestResult {
+                    status: TestStatus::Skipped,
+                    summary: format!(
+                        "Can't run here: all {} GitHub steps need GitHub; GitHub runs them",
+                        plan.skipped.len()
+                    ),
+                    tail,
+                    duration: start.elapsed(),
+                    hint: None,
+                };
             }
         }
     }
@@ -1309,6 +1423,129 @@ mod tests {
         // missing tool, and after a GitHub-only install step it must still fail.
         let d = one_step_project(
             "echo 'Diff in /p/src/x.rs at line 3:'\necho '-    named(\"error: no such command: audit\")'\nexit 1",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert_eq!(r.status, TestStatus::Failed, "{}", r.summary);
+        assert_eq!(r.hint, None, "{:?}", r.hint);
+    }
+
+    #[test]
+    fn exit_code_3_means_tools_missing() {
+        // The House Standard check.sh: tools first, every missing one listed,
+        // exit 3 when only tools are missing.
+        let d = check_script_project(
+            "echo 'Missing tools (nothing was checked):'\necho '  - cargo-audit'\necho '  - rustup'\necho 'Install them with: sudo pacman -S --needed cargo-audit rustup'\nexit 3\n",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert_eq!(r.status, TestStatus::Skipped, "{}", r.summary);
+        assert!(r.summary.starts_with("Can't run here"), "{}", r.summary);
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("sudo pacman -S --needed cargo-audit rustup")
+        );
+        // The list shows in full.
+        assert!(
+            r.tail.contains("- cargo-audit") && r.tail.contains("- rustup"),
+            "{}",
+            r.tail
+        );
+    }
+
+    #[test]
+    fn rustup_without_a_chosen_version_is_named() {
+        let d = check_script_project(
+            "echo 'error: rustup could not choose a version of cargo to run, because one wasn'\\''t specified explicitly, and no default is configured.'\nexit 1\n",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert_eq!(r.status, TestStatus::Skipped, "{}", r.summary);
+        assert!(
+            r.summary.contains("rustup has none chosen"),
+            "{}",
+            r.summary
+        );
+        assert_eq!(r.hint.as_deref(), Some("rustup default stable"));
+    }
+
+    #[test]
+    fn needed_tools_are_named_whatever_the_wording() {
+        assert_eq!(
+            named_missing_tool("FAILED: shellcheck 0.11.0 is needed (found: none). Install it with: pip install shellcheck-py==0.11.0.1").0.as_deref(),
+            Some("shellcheck")
+        );
+        assert_eq!(
+            named_missing_tool("Check failed: cargo-audit isn't installed. Install it with: cargo install cargo-audit --locked").1.as_deref(),
+            Some("cargo install cargo-audit --locked")
+        );
+    }
+
+    #[test]
+    fn cargo_tools_you_have_arent_built_again() {
+        // `sh` is on every computer, so this "install" must be skipped (and
+        // needs no network), then the next step runs.
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Install tools\n        run: |\n          cargo install sh --locked\n          echo \"$HOME/.cargo/bin\" >> \"$GITHUB_PATH\"\n      - name: Tests\n        run: test -n \"$CARGO_INSTALL_ROOT\" || echo ok\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().join("proj"));
+        let r = run_tests(d.path(), Stack::Rust, &e);
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+        assert!(
+            r.tail
+                .contains("Passed: [t] Install tools (here: StowLock's own tools folder)"),
+            "{}",
+            r.tail
+        );
+    }
+
+    #[test]
+    fn a_check_script_runs_when_the_workflow_cant() {
+        // Only a container job (GitHub-only), but the project has check.sh.
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            "on: [push]\njobs:\n  arch:\n    runs-on: ubuntu-latest\n    container: archlinux:latest\n    steps:\n      - run: sh scripts/check.sh\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.path().join("scripts")).unwrap();
+        std::fs::write(
+            d.path().join("scripts/check.sh"),
+            "touch check-ran\necho 'test result: ok. 5 passed; 0 failed'\n",
+        )
+        .unwrap();
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Other, &env(&log));
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+        assert!(d.path().join("check-ran").exists());
+        assert!(
+            r.summary.contains("\"arch\" runs only on GitHub"),
+            "{}",
+            r.summary
+        );
+        // Without check.sh: never "no tests", but what GitHub runs.
+        std::fs::remove_file(d.path().join("scripts/check.sh")).unwrap();
+        let r = run_tests(d.path(), Stack::Other, &env(&log));
+        assert_eq!(r.status, TestStatus::Skipped);
+        assert!(r.summary.contains("need GitHub"), "{}", r.summary);
+    }
+
+    #[test]
+    fn a_lint_failure_is_a_real_failure() {
+        // Lint errors have no error[E…] code; "could not compile" still makes
+        // it a real failure, with no "comes after a GitHub-only step" note.
+        let d = one_step_project(
+            "echo 'error: this expression creates a reference which is immediately dereferenced'\necho 'error: could not compile `demo` (bin \"demo\" test) due to 1 previous error'\nexit 101",
         );
         let log = Logger::new(None);
         let r = run_tests(d.path(), Stack::Rust, &env(&log));
