@@ -28,6 +28,8 @@ pub struct ProjectState {
     pub not_secret: Vec<String>,
     /// Pass the full environment to Run and tests (off by default).
     pub pass_env: bool,
+    /// "Keep it" was chosen for a folder whose repo was deleted on GitHub.
+    pub keep_without_github: bool,
     pub updated_at: Option<String>,
 }
 

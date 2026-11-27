@@ -138,6 +138,8 @@ struct Session {
     /// The existing folder is StowLock's own earlier staging that was never pushed.
     local_is_ours: bool,
     on_github: Option<bool>,
+    /// The local folder pushes to a repo that was deleted on GitHub.
+    deleted_on_github: bool,
     replace_local: bool,
     description: String,
     topics: String,
@@ -184,6 +186,7 @@ impl Session {
             local_exists: false,
             local_is_ours: false,
             on_github: None,
+            deleted_on_github: false,
             replace_local: false,
             description: String::new(),
             topics: String::new(),
@@ -272,6 +275,8 @@ pub struct App {
     busy: Option<String>,
     cancel: Arc<AtomicBool>,
     tab: Tab,
+    /// The screen shown last frame (to notice opening Projects).
+    prev_tab: Tab,
     env: EnvStatus,
     session: Session,
     projects: Vec<ProjectInfo>,
@@ -312,6 +317,18 @@ pub struct App {
     deleting_release: Option<(String, String, String, String)>,
     /// Confirming "Remove the tag" / "Delete the release and tag" after a push.
     confirm_remove_tag: bool,
+    /// Each account's repos on GitHub, as last loaded (lower-case owner).
+    repo_lists: std::collections::HashMap<String, Vec<String>>,
+    /// Accounts whose list is loading now / when each was last asked for.
+    repos_loading: std::collections::HashSet<String>,
+    repos_asked: std::collections::HashMap<String, Instant>,
+    /// Accounts whose last reload failed (the list shown may be out of date).
+    repos_stale: std::collections::HashSet<String>,
+    /// The "Existing…" menu was open last frame / the window was focused.
+    existing_open: bool,
+    was_focused: bool,
+    /// Projects: the folder waiting for "Remove the folder" confirmation.
+    confirm_trash_project: Option<String>,
     /// The last update check's result, shown in Settings.
     update_note: Option<String>,
     /// The running check was started with Check now (so say the result).
@@ -378,6 +395,7 @@ impl App {
             busy: None,
             cancel: Arc::new(AtomicBool::new(false)),
             tab: Tab::Stage,
+            prev_tab: Tab::Stage,
             env: EnvStatus::default(),
             projects: Vec::new(),
             attempts: Vec::new(),
@@ -425,6 +443,13 @@ impl App {
             build_poll: (8, 15),
             deleting_release: None,
             confirm_remove_tag: false,
+            repo_lists: Default::default(),
+            repos_loading: Default::default(),
+            repos_asked: Default::default(),
+            repos_stale: Default::default(),
+            existing_open: false,
+            was_focused: true,
+            confirm_trash_project: None,
             update_note: None,
             update_manual: false,
             install_inst: inst,
@@ -651,9 +676,10 @@ impl App {
     fn load_project(&mut self, p: &ProjectInfo) {
         let mut s = Session::new(&self.config);
         s.slug = p.slug.clone();
-        s.owner = ProjectsState::load(&self.paths)
-            .get(&p.slug)
-            .owner
+        s.owner = self
+            .project_owner_repo(p)
+            .map(|o| o.0)
+            .or(ProjectsState::load(&self.paths).get(&p.slug).owner)
             .or(self.env.login.clone())
             .unwrap_or_default();
         s.description = format!("{}, a vibe-coded project", detect::title_from_slug(&s.slug));
@@ -685,21 +711,92 @@ impl App {
 
     fn recompute_mode(&mut self) {
         let ws = self.config.workspace();
+        let names = self.github_repos(&self.session.owner).cloned();
         let s = &mut self.session;
         // An existing GitHub repo keeps its exact name (capitals included).
-        if let Some(names) = &self.env.repo_names {
+        if let Some(names) = &names {
             if let Some(exact) = names.iter().find(|n| n.eq_ignore_ascii_case(&s.slug)) {
                 s.slug = exact.clone();
             }
         }
-        let (mode, local, remote) =
-            pipeline::decide_mode(&ws, &s.slug, &s.owner, self.env.repo_names.as_deref());
+        let r = pipeline::route(&ws, &s.slug, &s.owner, names.as_deref());
+        let mode = r.mode;
         s.mode = mode;
-        s.local_exists = local;
-        s.local_is_ours = local && ProjectsState::load(&self.paths).staged_not_pushed(&s.slug);
-        s.on_github = remote;
+        s.local_exists = r.local;
+        s.local_is_ours = r.local && ProjectsState::load(&self.paths).staged_not_pushed(&s.slug);
+        s.on_github = r.on_github;
+        s.deleted_on_github = r.deleted_on_github;
         if !s.commit_edited {
             s.commit_msg = version::default_commit_message(mode == Mode::New, &s.tag);
+        }
+    }
+
+    /// This account's repos on GitHub, if they've been loaded.
+    fn github_repos(&self, owner: &str) -> Option<&Vec<String>> {
+        self.repo_lists.get(&owner.to_ascii_lowercase())
+    }
+
+    /// Reload an account's repo list from GitHub (at most every few seconds).
+    fn refresh_repos(&mut self, owner: &str, force: bool) {
+        let key = owner.to_ascii_lowercase();
+        if key.is_empty() || !self.env.gh || self.repos_loading.contains(&key) {
+            return;
+        }
+        if !force
+            && self
+                .repos_asked
+                .get(&key)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.repos_loading.insert(key.clone());
+        self.repos_asked.insert(key, Instant::now());
+        let owner = owner.to_string();
+        let gh = self.gh.clone();
+        self.spawn_bg(move || {
+            let r = gh
+                .list_repos(&owner)
+                .map(|v| v.into_iter().map(|r| r.name).collect());
+            Msg::Repos(owner, r)
+        });
+    }
+
+    /// The GitHub owner and repo a project pushes to.
+    fn project_owner_repo(&self, p: &ProjectInfo) -> Option<(String, String)> {
+        let url = p.remote.as_deref()?;
+        git::owner_repo(url).or_else(|| {
+            let owner = ProjectsState::load(&self.paths)
+                .get(&p.slug)
+                .owner
+                .or(self.env.login.clone())?;
+            git::origin_matches(url, &owner, &p.slug).then(|| (owner, p.slug.clone()))
+        })
+    }
+
+    /// The project's repo is gone from GitHub (only when that account's list is known).
+    fn gone_from_github(&self, p: &ProjectInfo) -> bool {
+        let Some((owner, repo)) = self.project_owner_repo(p) else {
+            return false;
+        };
+        self.github_repos(&owner)
+            .is_some_and(|names| !names.iter().any(|n| n.eq_ignore_ascii_case(&repo)))
+    }
+
+    /// Reload the lists for every account the projects push to.
+    fn refresh_project_owners(&mut self, force: bool) {
+        let mut owners: Vec<String> = self
+            .projects
+            .iter()
+            .filter_map(|p| self.project_owner_repo(p).map(|o| o.0))
+            .collect();
+        if let Some(l) = self.env.login.clone() {
+            owners.push(l);
+        }
+        owners.sort_by_key(|o| o.to_ascii_lowercase());
+        owners.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        for o in owners {
+            self.refresh_repos(&o, force);
         }
     }
 
@@ -1250,6 +1347,14 @@ impl App {
                 let first = !self.env.checked;
                 let rebuild_report = self.tab == Tab::Report;
                 self.env = *e;
+                if let (Some(l), Some(names)) = (&self.env.login, &self.env.repo_names) {
+                    let key = l.to_ascii_lowercase();
+                    self.repo_lists.insert(key.clone(), names.clone());
+                    self.repos_stale.remove(&key);
+                    self.repos_asked.insert(key, Instant::now());
+                } else if let Some(l) = &self.env.login {
+                    self.repos_stale.insert(l.to_ascii_lowercase());
+                }
                 if self.identity_name.is_empty() {
                     self.identity_name = self.env.name.clone().unwrap_or_default();
                 }
@@ -1285,12 +1390,28 @@ impl App {
                 }
             }
             Msg::Repos(owner, r) => {
-                if owner == self.session.owner {
-                    if let Ok(names) = r {
-                        self.env.repo_names = Some(names);
-                        if self.session.stage.is_none() {
+                let key = owner.to_ascii_lowercase();
+                self.repos_loading.remove(&key);
+                match r {
+                    Ok(names) => {
+                        self.repos_stale.remove(&key);
+                        if self
+                            .env
+                            .login
+                            .as_deref()
+                            .is_some_and(|l| l.eq_ignore_ascii_case(&owner))
+                        {
+                            self.env.repo_names = Some(names.clone());
+                        }
+                        self.repo_lists.insert(key, names);
+                        if owner.eq_ignore_ascii_case(&self.session.owner)
+                            && self.session.stage.is_none()
+                        {
                             self.recompute_mode();
                         }
+                    }
+                    Err(_) => {
+                        self.repos_stale.insert(key);
                     }
                 }
             }
@@ -1364,6 +1485,8 @@ impl App {
             }
             Msg::Pushed(r) => {
                 self.record_health(self.session.mode == Mode::Update);
+                let owner = self.session.owner.clone();
+                self.refresh_repos(&owner, true);
                 match r {
                     Ok(out) => {
                         if out.archived.is_some() && self.session.archive_move {
@@ -1687,6 +1810,20 @@ impl eframe::App for App {
             }
         }
         ctx.request_repaint_after(Duration::from_secs(1));
+        // Back in front: GitHub may have changed meanwhile (a repo deleted, say).
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.was_focused && self.env.login.is_some() {
+            let owner = self.session.owner.clone();
+            self.refresh_repos(&owner, false);
+            if self.tab == Tab::Projects {
+                self.refresh_project_owners(false);
+            }
+        }
+        self.was_focused = focused;
+        if self.tab == Tab::Projects && self.prev_tab != Tab::Projects {
+            self.refresh_project_owners(false);
+        }
+        self.prev_tab = self.tab;
         if let Some(child) = self.run_child.as_mut() {
             if let Ok(Some(_)) = child.try_wait() {
                 self.run_child = None;
@@ -2825,11 +2962,13 @@ impl App {
                 .show(ui, |ui| {
                     ui.label("Repo name");
                     ui.horizontal_wrapped(|ui| {
-                        let mut names: Vec<String> =
-                            self.projects.iter().map(|p| p.slug.clone()).collect();
-                        if let Some(r) = &self.env.repo_names {
-                            names.extend(r.iter().cloned());
-                        }
+                        // Only repos that are on GitHub now; local folders stand in
+                        // only when GitHub's list couldn't be loaded.
+                        let gh_list = self.github_repos(&self.session.owner).cloned();
+                        let from_github = gh_list.is_some();
+                        let mut names: Vec<String> = gh_list.unwrap_or_else(|| {
+                            self.projects.iter().map(|p| p.slug.clone()).collect()
+                        });
                         names.sort_by_key(|n| n.to_lowercase());
                         names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
                         let field_w = (ui.available_width() - 150.0).clamp(140.0, 560.0);
@@ -2855,11 +2994,31 @@ impl App {
                                 slug_changed = true;
                             }
                         }
+                        let owner_key = self.session.owner.to_ascii_lowercase();
+                        let loading = self.repos_loading.contains(&owner_key);
+                        let stale = self.repos_stale.contains(&owner_key);
+                        let mut opened = false;
+                        let mut reload = false;
                         ui.add_enabled_ui(!staged, |ui| {
-                            egui::ComboBox::from_id_salt("existing")
+                            let r = egui::ComboBox::from_id_salt("existing")
                                 .selected_text("Existing…")
                                 .width(110.0)
                                 .show_ui(ui, |ui| {
+                                    let note = if loading {
+                                        "Loading from GitHub…".to_string()
+                                    } else if !from_github {
+                                        "Couldn't reach GitHub: showing folders on this computer"
+                                            .to_string()
+                                    } else if stale {
+                                        "Couldn't reach GitHub: this list may be out of date"
+                                            .to_string()
+                                    } else {
+                                        format!("On GitHub ({})", self.session.owner)
+                                    };
+                                    ui.label(ui::muted(note).size(12.0));
+                                    if names.is_empty() && from_github {
+                                        ui.label(ui::muted("No repos yet").size(12.5));
+                                    }
                                     for n in names {
                                         if ui.selectable_label(n == self.session.slug, &n).clicked()
                                         {
@@ -2868,7 +3027,21 @@ impl App {
                                         }
                                     }
                                 });
+                            opened = r.inner.is_some();
+                            reload = ui
+                                .add_enabled(!loading, egui::Button::new(ui::icon::REFRESH).small())
+                                .on_hover_text("Reload your repos from GitHub")
+                                .clicked();
                         });
+                        if opened && !self.existing_open {
+                            let o = self.session.owner.clone();
+                            self.refresh_repos(&o, true);
+                        }
+                        self.existing_open = opened;
+                        if reload {
+                            let o = self.session.owner.clone();
+                            self.refresh_repos(&o, true);
+                        }
                     });
                     ui.end_row();
                     if !self.session.archive_only {
@@ -2935,6 +3108,26 @@ impl App {
                     ))
                     .wrap(),
                 );
+            } else if self.session.deleted_on_github && !self.session.archive_only && !staged {
+                ui::banner(ui, WARNING(), |ui| {
+                    ui.label(ui::semibold(
+                        format!(
+                            "This repo was deleted on GitHub: github.com/{}/{}",
+                            self.session.owner, self.session.slug
+                        ),
+                        14.0,
+                    ));
+                    ui.add(
+                        egui::Label::new(ui::muted(
+                            "It isn't an update any more. Create it again, or type another name above.",
+                        ))
+                        .wrap(),
+                    );
+                    ui.checkbox(
+                        &mut self.session.replace_local,
+                        "Create it again from this zip (the old folder goes to the Trash)",
+                    );
+                });
             } else if self.session.mode == Mode::New
                 && self.session.local_exists
                 && !self.session.archive_only
@@ -2966,14 +3159,7 @@ impl App {
             self.recompute_mode();
             if owner_changed && !self.session.owner.is_empty() {
                 let owner = self.session.owner.clone();
-                let gh = self.gh.clone();
-                self.spawn_bg(move || {
-                    Msg::Repos(
-                        owner.clone(),
-                        gh.list_repos(&owner)
-                            .map(|v| v.into_iter().map(|r| r.name).collect()),
-                    )
-                });
+                self.refresh_repos(&owner, true);
             }
         }
     }
@@ -4029,7 +4215,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("↻ Refresh").clicked() {
                     self.refresh_projects();
-                    self.refresh_env();
+                    self.refresh_project_owners(true);
                 }
                 if ui.button("Open archive").clicked() {
                     let _ = std::fs::create_dir_all(self.config.archive_root());
@@ -4069,7 +4255,11 @@ impl App {
             return;
         }
         let mut load: Option<ProjectInfo> = None;
+        let mut trash: Option<ProjectInfo> = None;
+        let mut keep: Option<String> = None;
+        let saved = ProjectsState::load(&self.paths);
         for p in self.projects.clone() {
+            let gone = self.gone_from_github(&p) && !saved.get(&p.slug).keep_without_github;
             ui::card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.add(
@@ -4087,8 +4277,64 @@ impl App {
                     } else {
                         MUTED()
                     };
-                    ui::badge(ui, &p.badge, col);
+                    if gone {
+                        ui::badge(ui, "Not on GitHub anymore", ERROR());
+                    } else {
+                        ui::badge(ui, &p.badge, col);
+                    }
                 });
+                if gone {
+                    ui.add(
+                        egui::Label::new(ui::muted(
+                            "Its repo was deleted on GitHub. The folder and its history are still on this computer.",
+                        ))
+                        .wrap(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        if self.confirm_trash_project.as_deref() == Some(p.slug.as_str()) {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        ui::semibold(format!("Move {} to the Trash", p.slug), 13.5)
+                                            .color(ui::CARD()),
+                                    )
+                                    .fill(ERROR()),
+                                )
+                                .clicked()
+                            {
+                                trash = Some(p.clone());
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_trash_project = None;
+                            }
+                        } else if ui::button(ui, ui::icon::TRASH, "Remove the folder…")
+                            .on_hover_text("Moves it to the Trash, so it can be restored")
+                            .clicked()
+                        {
+                            self.confirm_trash_project = Some(p.slug.clone());
+                        }
+                        if ui::button_enabled(
+                            ui,
+                            self.busy.is_none(),
+                            ui::icon::UPLOAD,
+                            "Push it again as a new repo",
+                        )
+                        .on_hover_text(
+                            "Creates the repo on GitHub again, with this folder's history",
+                        )
+                        .clicked()
+                        {
+                            load = Some(p.clone());
+                        }
+                        if ui
+                            .button("Keep it")
+                            .on_hover_text("Stop flagging this folder")
+                            .clicked()
+                        {
+                            keep = Some(p.slug.clone());
+                        }
+                    });
+                }
                 ui.horizontal_wrapped(|ui| {
                     if let Some(t) = &p.last_tag {
                         ui.label(ui::muted(format!("Latest tag {t}")));
@@ -4139,6 +4385,21 @@ impl App {
         }
         if let Some(p) = load {
             self.load_project(&p);
+        }
+        if let Some(p) = trash {
+            self.confirm_trash_project = None;
+            match self.pctx().trash(&p.dir) {
+                Ok(_) => {
+                    self.log
+                        .info("projects", &format!("Moved {} to the Trash", p.slug));
+                    self.toast(&format!("Moved {} to the Trash", p.slug));
+                }
+                Err(e) => self.fail(&e, "projects"),
+            }
+            self.refresh_projects();
+        }
+        if let Some(slug) = keep {
+            let _ = ProjectsState::update(&self.paths, &slug, |s| s.keep_without_github = true);
         }
         self.attempts_card(ui);
     }
@@ -5220,5 +5481,53 @@ mod ui_tests {
             h.query_by_label_contains("demo-app").is_some(),
             "History is empty"
         );
+
+        // The repo is deleted on GitHub: Projects flags the folder.
+        std::fs::remove_dir_all(fake.bare("selftest-user", "demo-app")).unwrap();
+        click_nav(&mut h, "Projects");
+        click_button(&mut h, "Refresh");
+        wait_until(&mut h, "repo list reloaded", |a| {
+            a.repos_loading.is_empty()
+                && a.github_repos("selftest-user")
+                    .is_some_and(|n| n.is_empty())
+        });
+        steps(&mut h, 2);
+        assert!(
+            h.query_by_label_contains("Not on GitHub anymore").is_some(),
+            "deleted repo not flagged"
+        );
+        click_button(&mut h, "Remove the folder");
+        assert!(h
+            .query_by_label_contains("Move demo-app to the Trash")
+            .is_some());
+        click_button(&mut h, "Cancel");
+
+        // Push it again: not an update any more, and the repo comes back.
+        click_button(&mut h, "Push it again as a new repo");
+        wait_until(&mut h, "re-check", |a| {
+            a.session.checks.is_some() && a.busy.is_none()
+        });
+        assert_eq!(h.state().session.mode, Mode::New);
+        assert!(h.state().session.deleted_on_github);
+        assert!(h.state().session.confirm, "review window didn't open");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        steps(&mut h, 2);
+        if h.query_by_label_contains("I understand this will be public")
+            .is_some()
+        {
+            click_button(&mut h, "I understand this will be public");
+        }
+        click_button(&mut h, "to demo-app");
+        wait_until(&mut h, "push again", |a| {
+            a.session.outcome.is_some() && a.busy.is_none()
+        });
+        assert!(
+            fake.bare("selftest-user", "demo-app").exists(),
+            "repo not created again"
+        );
+        wait_until(&mut h, "repo list after push", |a| {
+            a.github_repos("selftest-user")
+                .is_some_and(|n| n.iter().any(|x| x == "demo-app"))
+        });
     }
 }

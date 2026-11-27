@@ -4,6 +4,17 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.1.0-beta.6] - 2026-11-26
+
+### Changed
+- **The "Existing…" repo menu lists only repos that are on GitHub right now.** It reloads when you open it, when StowLock comes back to the front, and after every push, and has a reload button. If GitHub can't be reached it says so and the list may be out of date. Folders on this computer only stand in when GitHub's list couldn't be loaded at all.
+
+### Added
+- **Projects flags folders whose repo was deleted on GitHub** ("Not on GitHub anymore"), with Remove the folder (moved to the Trash), Push it again as a new repo (keeps the folder's history), or Keep it.
+
+### Fixed
+- A zip whose repo was deleted on GitHub is no longer treated as an update (which failed with "repository not found"). StowLock says the repo was deleted and offers to create it again or use another name.
+
 ## [0.1.0-beta.5] - 2026-11-25
 
 ### Added

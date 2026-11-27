@@ -135,6 +135,19 @@ pub fn remote_url(dir: &Path) -> Option<String> {
 }
 
 /// Does a remote URL point to owner/slug? Accepts https, ssh and file forms.
+/// The GitHub owner and repo a remote URL points to.
+pub fn owner_repo(url: &str) -> Option<(String, String)> {
+    let u = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let rest = u
+        .rsplit_once("github.com/")
+        .or_else(|| u.rsplit_once("github.com:"))
+        .map(|(_, r)| r)?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some((owner.to_string(), repo.to_string()))
+}
+
 pub fn origin_matches(url: &str, owner: &str, slug: &str) -> bool {
     let u = url
         .trim()

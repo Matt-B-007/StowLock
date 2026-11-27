@@ -93,12 +93,30 @@ impl Ctx {
 
 /// Decide the mode for a slug from what exists locally and on GitHub.
 /// `remote` is None when GitHub couldn't be checked (offline).
+#[cfg(test)]
 pub fn decide_mode(
     workspace: &Path,
     slug: &str,
     owner: &str,
     remote: Option<&[String]>,
 ) -> (Mode, bool, Option<bool>) {
+    let r = route(workspace, slug, owner, remote);
+    (r.mode, r.local, r.on_github)
+}
+
+/// Where a project goes: new or update, and whether its repo was deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    pub mode: Mode,
+    /// A folder with this name is in the workspace.
+    pub local: bool,
+    /// On GitHub right now (None = GitHub's list isn't known).
+    pub on_github: Option<bool>,
+    /// The local folder pushes to this repo, but GitHub no longer has it.
+    pub deleted_on_github: bool,
+}
+
+pub fn route(workspace: &Path, slug: &str, owner: &str, remote: Option<&[String]>) -> Route {
     let dir = detect::project_dir(workspace, slug);
     let local = dir.exists();
     let on_github = remote.map(|names| names.iter().any(|n| n.eq_ignore_ascii_case(slug)));
@@ -106,12 +124,20 @@ pub fn decide_mode(
         && git::remote_url(&dir)
             .map(|u| git::origin_matches(&u, owner, slug))
             .unwrap_or(false);
-    let mode = if on_github == Some(true) || local_linked {
-        Mode::Update
-    } else {
-        Mode::New
+    // Only trust the local folder's link when GitHub's list isn't known:
+    // a repo deleted on GitHub isn't an update any more.
+    let mode = match on_github {
+        Some(true) => Mode::Update,
+        Some(false) => Mode::New,
+        None if local_linked => Mode::Update,
+        None => Mode::New,
     };
-    (mode, local, on_github)
+    Route {
+        mode,
+        local,
+        on_github,
+        deleted_on_github: local_linked && on_github == Some(false),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -718,7 +744,18 @@ pub fn push(ctx: &Ctx, req: &PushRequest) -> Res<PushOutcome> {
             if !git::is_repo(&dir) {
                 git::git_ok(&dir, &["init", "-b", "main"], log, "push")?;
             }
-            let remote = git::remote_url(&dir);
+            let mut remote = git::remote_url(&dir);
+            // The folder still points at a repo that was deleted on GitHub:
+            // create it again (history and tags are kept).
+            if let Some(url) = remote.clone() {
+                if git::origin_matches(&url, &req.owner, &req.slug)
+                    && !ctx.gh.repo_exists(&req.owner, &req.slug)?
+                {
+                    git::git_ok(&dir, &["remote", "remove", "origin"], log, "push")?;
+                    log.info("push", "The repo was deleted on GitHub; creating it again");
+                    remote = None;
+                }
+            }
             if remote.is_none() && ctx.gh.repo_exists(&req.owner, &req.slug)? {
                 return Err(format!(
                     "Name already exists on this account: {}/{}",
@@ -1496,5 +1533,73 @@ mod tests {
         assert!(fake.releases(&sb.owner, "demo-app").is_empty());
         let dir = detect::project_dir(&sb.ctx.workspace(), "demo-app");
         assert!(!git::tags(&dir).contains(&"v0.1.0".to_string()));
+    }
+
+    #[test]
+    fn a_repo_deleted_on_github_is_created_again() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let ws = sb.ctx.workspace();
+        let zip = sb.python_zip("demo-app.zip", "demo-app", &[("app.py", b"x = 1\n")]);
+        stage(&sb.ctx, &req(&sb, &zip, Mode::New)).unwrap();
+        push(
+            &sb.ctx,
+            &preq(&sb, Mode::New, "v0.1.0", Channel::Stable, None),
+        )
+        .unwrap();
+        let names = |sb: &Sandbox| -> Vec<String> {
+            sb.ctx
+                .gh
+                .list_repos(&sb.owner)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        let r = route(&ws, "demo-app", &sb.owner, Some(&names(&sb)));
+        assert_eq!((r.mode, r.deleted_on_github), (Mode::Update, false));
+
+        // Deleted on GitHub: no longer an update, and flagged.
+        std::fs::remove_dir_all(sb.fake.bare(&sb.owner, "demo-app")).unwrap();
+        let r = route(&ws, "demo-app", &sb.owner, Some(&names(&sb)));
+        assert_eq!(
+            (r.mode, r.on_github, r.deleted_on_github),
+            (Mode::New, Some(false), true)
+        );
+        // GitHub's list unknown (offline): the folder's link still counts.
+        let r = route(&ws, "demo-app", &sb.owner, None);
+        assert_eq!((r.mode, r.deleted_on_github), (Mode::Update, false));
+
+        // Push it again as a new repo: created again, with its history.
+        let commits_before =
+            git::git(&ws.join("demo-app"), &["rev-list", "--count", "HEAD"]).stdout;
+        push(
+            &sb.ctx,
+            &preq(&sb, Mode::New, "v0.1.1", Channel::Stable, None),
+        )
+        .unwrap();
+        assert!(
+            names(&sb).iter().any(|n| n == "demo-app"),
+            "repo not created again"
+        );
+        let bare = sb.fake.bare(&sb.owner, "demo-app");
+        let on_gh = crate::git::git_bare(&bare, &["rev-list", "--count", "main"]).stdout;
+        assert_eq!(on_gh.trim(), commits_before.trim(), "history wasn't kept");
+    }
+
+    #[test]
+    fn owner_and_repo_from_remote_urls() {
+        for u in [
+            "https://github.com/Matt-B-007/StowLock.git",
+            "git@github.com:Matt-B-007/StowLock.git",
+            "https://github.com/Matt-B-007/StowLock/",
+        ] {
+            assert_eq!(
+                git::owner_repo(u),
+                Some(("Matt-B-007".into(), "StowLock".into())),
+                "{u}"
+            );
+        }
+        assert_eq!(git::owner_repo("/tmp/fake/x.git"), None);
     }
 }
