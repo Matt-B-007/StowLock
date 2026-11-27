@@ -181,6 +181,32 @@ pub(crate) fn mark_important(lines: &[&str]) -> Vec<bool> {
     keep
 }
 
+/// The lines that matter in a long log (errors, failures and the lines just
+/// before a verdict), at most `max`, newest kept. GitHub's log lines start
+/// with "job\tstep\ttime": only the message is kept.
+pub fn key_lines(log: &str, max: usize) -> Vec<String> {
+    let msgs: Vec<&str> = log
+        .lines()
+        .map(|l| {
+            let m = l.rsplit('\t').next().unwrap_or(l);
+            // "2026-11-27T12:00:00.1234567Z message"
+            match m.split_once(' ') {
+                Some((t, rest)) if t.len() > 20 && t.ends_with('Z') && t.contains('T') => rest,
+                _ => m,
+            }
+        })
+        .collect();
+    let keep = mark_important(&msgs);
+    let picked: Vec<String> = msgs
+        .iter()
+        .zip(keep)
+        .filter(|(l, k)| *k && !l.trim().is_empty())
+        .map(|(l, _)| l.trim_end().to_string())
+        .collect();
+    let skip = picked.len().saturating_sub(max);
+    picked.into_iter().skip(skip).collect()
+}
+
 /// A check script's closing "this failed" line.
 fn is_verdict(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
@@ -460,6 +486,15 @@ impl Logger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn githubs_log_is_boiled_down_to_what_matters() {
+        let log = "test\tRun checks\t2026-11-27T12:00:00.1234567Z Compiling foo v1\ntest\tRun checks\t2026-11-27T12:00:01.1234567Z error[E0425]: cannot find value `x`\ntest\tRun checks\t2026-11-27T12:00:02.1234567Z ##[error]Process completed with exit code 101.";
+        let k = key_lines(log, 12);
+        assert!(k.iter().any(|l| l.starts_with("error[E0425]")), "{k:?}");
+        assert!(!k.iter().any(|l| l.contains("Compiling")), "{k:?}");
+        assert!(!k.iter().any(|l| l.contains("2026-11-27T")), "{k:?}");
+    }
 
     #[test]
     fn the_reason_before_a_check_scripts_verdict_is_kept() {

@@ -152,6 +152,10 @@ impl App {
 
     pub(super) fn end_tour(&mut self) {
         self.tour_step = None;
+        // Not signed in yet: the tour ends on the GitHub account panel.
+        if !self.env.ready() {
+            self.tab = Tab::Settings;
+        }
         if !self.config.tour_seen {
             self.config.tour_seen = true;
             self.save_config();

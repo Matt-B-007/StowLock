@@ -232,8 +232,42 @@ pub fn install_fonts(ctx: &egui::Context) {
             .into_iter()
             .filter(|n| n != "inter"),
     );
+    // Space Grotesk for large titles only (House Standard v1.3); body text stays Inter.
+    f.font_data.insert(
+        "space-grotesk".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/SpaceGrotesk-SemiBold.ttf"
+        ))),
+    );
+    let mut display = vec!["space-grotesk".to_string()];
+    display.extend(semi.iter().cloned());
     f.families.insert(FontFamily::Name("semibold".into()), semi);
+    f.families
+        .insert(FontFamily::Name("display".into()), display);
     ctx.set_fonts(f);
+}
+
+/// A faint dot grid (4 % of the text colour), drawn behind a screen's cards
+/// so it only shows in the empty areas.
+pub fn dot_grid(p: &egui::Painter, r: egui::Rect) {
+    let c = TEXT().gamma_multiply(0.04);
+    let step = 24.0;
+    let mut y = (r.top() / step).ceil() * step;
+    while y < r.bottom() {
+        let mut x = (r.left() / step).ceil() * step;
+        while x < r.right() {
+            p.circle_filled(egui::pos2(x, y), 1.0, c);
+            x += step;
+        }
+        y += step;
+    }
+}
+
+/// A large title in Space Grotesk.
+pub fn display(text: impl Into<String>, size: f32) -> RichText {
+    RichText::new(text.into())
+        .size(size)
+        .family(FontFamily::Name("display".into()))
 }
 
 /// Text in Inter SemiBold.
@@ -245,7 +279,7 @@ pub fn semibold(text: impl Into<String>, size: f32) -> RichText {
 
 /// A screen's title.
 pub fn title(ui: &mut Ui, text: &str, subtitle: &str) {
-    ui.label(semibold(text, 24.0).color(TEXT()));
+    ui.label(display(text, 26.0).color(TEXT()));
     if !subtitle.is_empty() {
         ui.add_space(-4.0);
         ui.label(RichText::new(subtitle).size(14.0).color(MUTED()));

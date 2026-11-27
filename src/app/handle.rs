@@ -31,8 +31,13 @@ impl App {
                 if !self.session.slug.is_empty() && self.session.stage.is_none() {
                     self.recompute_mode();
                 }
-                if first && !self.env.ready() {
-                    // First-run screen: the GitHub account panel.
+                // First-run screen: the GitHub account panel (not during the
+                // tour, and not over a zip opened with StowLock).
+                if first
+                    && !self.env.ready()
+                    && self.tour_step.is_none()
+                    && self.session.zip.is_none()
+                {
                     self.tab = Tab::Settings;
                 }
                 if self.env.ready() {

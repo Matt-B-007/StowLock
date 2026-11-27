@@ -16,7 +16,7 @@ StowLock is a small native Linux app (Rust + egui) for people who build projects
 
 Built for CachyOS and other Arch-based distributions; it runs on any x86_64 Linux desktop.
 
-<p align="center"><img src="assets/screenshots/stage.png" width="760" alt="The Stage screen: a zip routed to an update of an existing repo"></p>
+<p align="center"><img src="assets/screenshots/stage.png" width="760" alt="The Stage screen: a zip routed to a new repo"></p>
 
 ## What it does
 
@@ -166,4 +166,4 @@ Pushing a `v*` tag builds `stowlock-linux-x86_64` and its checksum in GitHub Act
 
 ## License
 
-StowLock is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE). It bundles the [Inter](https://rsms.me/inter/) font (SIL Open Font License 1.1) and [Lucide](https://lucide.dev) icons (ISC License); their licenses are in `assets/licenses/`.
+StowLock is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE). It bundles the [Inter](https://rsms.me/inter/) and [Space Grotesk](https://github.com/floriankarsten/space-grotesk) fonts (SIL Open Font License 1.1) and [Lucide](https://lucide.dev) icons (ISC License); their licenses are in `assets/licenses/`.

@@ -310,6 +310,10 @@ impl App {
             if let Some(i) = ui::segmented(ui, &["Follow system", "Light", "Dark"], sel, 340.0) {
                 self.config.theme = ["", "light", "dark"][i].to_string();
             }
+            ui.checkbox(
+                &mut self.config.plain_look,
+                "Plain look: no dot pattern behind the screens",
+            );
         });
     }
 }

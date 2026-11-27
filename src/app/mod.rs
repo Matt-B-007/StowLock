@@ -422,6 +422,9 @@ impl App {
                 false,
                 "StowLock closed unexpectedly last time",
             );
+        } else {
+            // Settings read fine and the last run ended cleanly.
+            HealthState::record(&paths, "Settings & state", true, "");
         }
         report::apply_retention(&paths, config.report_retention_days);
         pipeline::clean_stale_temp(&config);
@@ -785,6 +788,10 @@ impl eframe::App for App {
                     }),
             )
             .show(root, |ui| {
+                // A faint dot grid behind empty areas (House Standard v1.3).
+                if !self.config.plain_look {
+                    ui::dot_grid(ui.painter(), ui.max_rect());
+                }
                 self.banners(ui);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])

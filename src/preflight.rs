@@ -63,6 +63,27 @@ pub struct TestEnv<'a> {
     /// Run GitHub steps with only the fonts GitHub's machine has (DejaVu),
     /// so text that only fits with this computer's fonts fails here too.
     pub github_fonts: bool,
+    /// Run steps in a bubblewrap sandbox (with clean_home, when available).
+    pub sandbox: bool,
+    /// With the sandbox: no network at all.
+    pub offline: bool,
+    /// Run only these workflow jobs (empty = all): "Re-check this job".
+    pub only_jobs: Vec<String>,
+}
+
+/// The workflow jobs that failed, from a result's step list ("Failed: [test] Tests").
+pub fn failed_jobs(tail: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in tail.lines() {
+        if let Some(rest) = l.strip_prefix("Failed: [") {
+            if let Some(job) = rest.split(']').next() {
+                if !out.iter().any(|j| j == job) {
+                    out.push(job.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Added to a test summary when the failures look specific to this computer.
@@ -259,6 +280,13 @@ fn run_step_labelled(
     label: Option<&str>,
     timeout_secs: u64,
 ) -> Output {
+    // In the sandbox, the program runs inside bubblewrap.
+    let wrapped = sandbox_for(env, extra).map(|sb| sb.wrap(dir, program, args));
+    let (program, args): (&str, Vec<&str>) = match &wrapped {
+        Some(w) => ("bwrap", w.iter().map(String::as_str).collect()),
+        None => (program, args.to_vec()),
+    };
+    let args = &args[..];
     let opts = Opts {
         cwd: Some(dir.to_path_buf()),
         timeout: Some(Duration::from_secs(timeout_secs)),
@@ -274,6 +302,7 @@ fn run_step_labelled(
         },
         stdin: None,
         env_remove: remove.to_vec(),
+        live: true,
     };
     let o = proc::run(program, args, &opts);
     match label {
@@ -281,6 +310,79 @@ fn run_step_labelled(
         None => env.log.command("tests", &o),
     }
     o
+}
+
+/// The sandbox for a step, when sandboxed checks are on and possible: the
+/// project and caches writable, the tools on the PATH readable, the rest of
+/// the home folder hidden.
+fn sandbox_for(env: &TestEnv, extra: &[(String, String)]) -> Option<crate::sandbox::Sandbox> {
+    if !env.sandbox || !env.clean_home || !crate::sandbox::available() {
+        return None;
+    }
+    let cache = env.build_cache.as_ref()?;
+    let home = crate::util::home_dir();
+    let var = |name: &str, default: PathBuf| {
+        extra
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| PathBuf::from(v))
+            .or_else(|| std::env::var_os(name).map(PathBuf::from))
+            .unwrap_or(default)
+    };
+    let cargo_home = var("CARGO_HOME", home.join(".cargo"));
+    let tmp = cache.join("stowlock-tmp");
+    std::fs::create_dir_all(&tmp).ok()?;
+    // All of StowLock's build folders (this project's build, its own tools,
+    // Python environments, fresh homes and fonts live under here).
+    let builds = cache.parent().unwrap_or(cache).to_path_buf();
+    let mut writable = vec![
+        builds,
+        cache.clone(),
+        cargo_home.clone(),
+        var("RUSTUP_HOME", home.join(".rustup")),
+        var("PIP_CACHE_DIR", home.join(".cache/pip")),
+        var("npm_config_cache", home.join(".npm")),
+        var("GOPATH", home.join("go")),
+        var("GOCACHE", home.join(".cache/go-build")),
+    ];
+    if let Some((_, h)) = extra.iter().find(|(k, _)| k == "HOME") {
+        writable.push(PathBuf::from(h));
+    }
+    // Tools on the PATH that live in the home folder (~/.local/bin), and
+    // files your environment points tools at (a certificate bundle in
+    // SSL_CERT_FILE, say), read-only.
+    let mut readable: Vec<PathBuf> = extra
+        .iter()
+        .filter(|(k, _)| k == "PATH")
+        .flat_map(|(_, v)| v.split(':').map(PathBuf::from).collect::<Vec<_>>())
+        .chain([home.join(".local/bin"), home.join(".local/lib")])
+        .filter(|p| p.starts_with(&home))
+        .collect();
+    for (k, v) in std::env::vars().chain(extra.iter().cloned()) {
+        // Where you are and your settings folders aren't tools' files.
+        if matches!(k.as_str(), "PWD" | "OLDPWD" | "HOME" | "PATH") || k.starts_with("XDG_") {
+            continue;
+        }
+        for part in v.split(':') {
+            let p = Path::new(part);
+            if p.is_absolute() && p.starts_with(&home) && p.exists() && p != home {
+                readable.push(p.to_path_buf());
+            }
+        }
+    }
+    Some(crate::sandbox::Sandbox {
+        home,
+        writable,
+        readable,
+        // A crates.io login stays private even though ~/.cargo is shared.
+        hidden_files: vec![
+            cargo_home.join("credentials.toml"),
+            cargo_home.join("credentials"),
+        ],
+        tmp,
+        offline: env.offline,
+    })
 }
 
 /// The desktop session's variables: GitHub's machine has none, and apps read
@@ -670,6 +772,9 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
     let mut failures: Vec<StepFailure> = Vec::new();
     let mut fonts_missing = false;
     for (i, step) in plan.steps.iter().enumerate() {
+        if !env.only_jobs.is_empty() && !env.only_jobs.contains(&step.job) {
+            continue;
+        }
         if current_job.as_deref() != Some(step.job.as_str()) {
             current_job = Some(step.job.clone());
             py_env.clear();
@@ -920,7 +1025,10 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         // that ran (and mostly passed) clearly had what they needed.
         let ran_tests =
             result_summary(&block).is_some_and(|c| some_passed(&c)) || real_failure(&block);
-        let hint = if fonts {
+        let blocked = env.sandbox && env.clean_home && crate::sandbox::blocked(&block);
+        let hint = if blocked {
+            Some("The sandbox may have stopped this: the step tried to write outside the project and StowLock's build folders, which checks can't do (GitHub's machine allows it). If the project really needs that, turn off Settings → Checks → Sandbox, or change the step to write inside the project.".to_string())
+        } else if fonts {
             Some("This looks like a font difference. StowLock ran it with only the fonts GitHub's machine has (DejaVu, Liberation and emoji), so it would fail on GitHub too. The project should bundle its fonts and load them at startup, and let text that might not fit shorten with a tooltip. Copy for AI asks for that.".to_string())
         } else if machine {
             Some("These failures mention things on this computer that GitHub's machine doesn't have, such as a running copy of the app or your home folder. They'll likely pass on GitHub. Quit the running copy and Re-check, or push anyway.".to_string())
@@ -1068,6 +1176,9 @@ fn run_with_act(dir: &Path, env: &TestEnv) -> Option<TestResult> {
         exact: false,
         clean_home: false,
         github_fonts: false,
+        sandbox: false,
+        offline: false,
+        only_jobs: Vec::new(),
     };
     let o = run_step(dir, "act", &["push", "--rm"], &long);
     let transcript = format!("$ act push --rm\n{}\n", o.combined());
@@ -1112,6 +1223,9 @@ pub fn run_tests(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
         exact: env.exact,
         clean_home: env.clean_home,
         github_fonts: env.github_fonts,
+        sandbox: env.sandbox,
+        offline: env.offline,
+        only_jobs: env.only_jobs.clone(),
     };
     let _link = local
         .build_cache
@@ -1350,6 +1464,9 @@ mod tests {
             exact: false,
             clean_home: true,
             github_fonts: false,
+            sandbox: false,
+            offline: false,
+            only_jobs: Vec::new(),
         }
     }
 
@@ -1594,6 +1711,73 @@ mod tests {
         assert!(!font_related("FAILED: self-test: the program wasn't built"));
         assert!(!font_related("test fonts::loads_bundled_inter ... ok"));
         assert!(!font_related("warning: integer overflow"));
+    }
+
+    #[test]
+    fn sandboxed_github_steps_see_only_the_project_and_its_tools() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let home = crate::util::home_dir();
+        let secret = home.join(".stowlock-sandbox-test-secret");
+        std::fs::write(&secret, "private").unwrap();
+        let d = one_step_project(&format!(
+            "test ! -e {}\ntouch made-in-sandbox\nmkdir -p \"$CARGO_TARGET_DIR/release\" && echo hi > ./target/release/app\ntest \"$(ls /proc | grep -c '^[0-9]')\" -le 6\necho \"1 passed\"",
+            secret.display()
+        ));
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().join("builds/demo"));
+        e.sandbox = true;
+        let r = run_tests(d.path(), Stack::Python, &e);
+        let _ = std::fs::remove_file(&secret);
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+        assert!(d.path().join("made-in-sandbox").exists());
+        assert!(cache.path().join("builds/demo/release/app").exists());
+    }
+
+    #[test]
+    fn files_the_environment_points_at_stay_readable_in_the_sandbox() {
+        // From a real run: pip needed a certificate bundle in the home folder
+        // that SSL_CERT_FILE pointed to, and the sandbox had hidden it.
+        let home = crate::util::home_dir();
+        let bundle = home.join(".stowlock-test-ca-bundle.crt");
+        std::fs::write(&bundle, "cert").unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        let cache = tempfile::tempdir().unwrap();
+        e.build_cache = Some(cache.path().join("builds/demo"));
+        e.sandbox = true;
+        let extra = vec![("SSL_CERT_FILE".to_string(), bundle.display().to_string())];
+        let sb = sandbox_for(&e, &extra);
+        let _ = std::fs::remove_file(&bundle);
+        if let Some(sb) = sb {
+            assert!(sb.readable.contains(&bundle), "{:?}", sb.readable);
+            assert!(!sb.readable.contains(&home), "never the whole home folder");
+        }
+    }
+
+    #[test]
+    fn a_step_stopped_by_the_sandbox_says_so() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let d = one_step_project("touch /usr/stowlock-not-allowed\necho \"1 passed\"");
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().join("builds/demo"));
+        e.sandbox = true;
+        let r = run_tests(d.path(), Stack::Python, &e);
+        assert_eq!(r.status, TestStatus::Failed);
+        // Running as root here can make /usr writable outside; inside it's read-only.
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("sandbox"),
+            "{:?} {}",
+            r.hint,
+            r.tail
+        );
     }
 
     #[test]
@@ -2162,6 +2346,21 @@ mod tests {
             r.tail.contains("Not run: [test] After the failure"),
             "{}",
             r.tail
+        );
+        assert_eq!(failed_jobs(&r.tail), ["test"]);
+        // Re-check only the failed job: the other one doesn't run again.
+        std::fs::remove_file(d.path().join("rust-job-ran")).unwrap();
+        e.only_jobs = vec!["test".into()];
+        let r = run_tests(d.path(), Stack::Rust, &e);
+        assert_eq!(r.status, TestStatus::Failed);
+        assert!(
+            !d.path().join("rust-job-ran").exists(),
+            "only the chosen job ran"
+        );
+        assert!(
+            r.summary.contains("GitHub step \"Tests\" failed"),
+            "{}",
+            r.summary
         );
     }
 }

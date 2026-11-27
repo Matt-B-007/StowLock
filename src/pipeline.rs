@@ -527,6 +527,8 @@ fn stage_update(ctx: &Ctx, req: &StageRequest, target: &Path, result: &mut Stage
 #[derive(Debug, Clone)]
 pub struct Checks {
     pub tests: TestResult,
+    /// Only some jobs were re-checked: the full check must run before a push.
+    pub partial: bool,
     /// Unresolved hits (those marked "Not a secret" are removed).
     pub secrets: Vec<Hit>,
     pub ignored_secrets: usize,
@@ -604,6 +606,17 @@ pub fn clean_old_caches(paths: &crate::config::AppPaths, days: u64) -> (Vec<Stri
 }
 
 pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
+    run_checks_of(ctx, slug, dir, stack, &[])
+}
+
+/// The checks, for only some workflow jobs when `only_jobs` isn't empty.
+pub fn run_checks_of(
+    ctx: &Ctx,
+    slug: &str,
+    dir: &Path,
+    stack: Stack,
+    only_jobs: &[String],
+) -> Checks {
     let st = ProjectsState::load(&ctx.paths).get(slug);
     // Mark this project's check cache as used (for the 30-day clean-up).
     let cache = caches_dir(&ctx.paths).join(slug.to_ascii_lowercase());
@@ -628,6 +641,9 @@ pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
             exact: ctx.config.exact_github_checks,
             clean_home: ctx.config.clean_test_home,
             github_fonts: ctx.config.github_fonts,
+            sandbox: ctx.config.sandbox_checks,
+            offline: ctx.config.offline_checks,
+            only_jobs: only_jobs.to_vec(),
         };
         let r = preflight::run_tests(dir, stack, &env);
         let status = match r.status {
@@ -677,6 +693,7 @@ pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
     }
     Checks {
         tests,
+        partial: !only_jobs.is_empty(),
         secrets: unresolved,
         ignored_secrets: ignored,
     }
@@ -708,6 +725,9 @@ pub fn push_blockers(
             }
             if c.tests.status == preflight::TestStatus::Cancelled && !override_tests {
                 v.push("Tests were cancelled".into());
+            }
+            if c.partial && !override_tests {
+                v.push("Only some jobs were re-checked: run the full check before pushing".into());
             }
             if !c.secrets.is_empty() && (ctx.config.block_on_secrets || public) {
                 v.push(format!("{} possible secret(s) found", c.secrets.len()));

@@ -1067,6 +1067,22 @@ ui::named(cb.response, "License");
                             ui.label(ui::muted("Checks haven't run yet."));
                         }
                     });
+                    // The newest output, so a slow or stuck step is easy to see.
+                    if self.busy.is_some() {
+                        let lines = proc::live_lines();
+                        if !lines.is_empty() {
+                            ui::inset(ui, |ui| {
+                                for l in &lines {
+                                    ui.add(
+                                        egui::Label::new(ui::mono(l).size(12.0).color(MUTED()))
+                                            .truncate(),
+                                    );
+                                }
+                            });
+                        }
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(400));
+                    }
                 }
                 Some(c) => {
                     let (txt, col) = match c.tests.status {
@@ -1104,6 +1120,26 @@ ui::named(cb.response, "License");
                             c.tests.duration.as_secs_f32()
                         )));
                     });
+                    if c.partial {
+                        ui::banner(ui, WARNING(), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    "Only the failed job was re-checked. Run the full check before pushing.",
+                                )
+                                .wrap(),
+                            );
+                            if self.busy.is_none()
+                                && ui::primary(
+                                    ui,
+                                    &ui::with_icon(ui::icon::REFRESH, "Run the full check"),
+                                    true,
+                                )
+                                .clicked()
+                            {
+                                self.recheck();
+                            }
+                        });
+                    }
                     if cant_run {
                         ui.add(
                             egui::Label::new(
@@ -1163,6 +1199,20 @@ ui::named(cb.response, "License");
                                     .show(ui, |ui| {
                                         ui.label(ui::mono(&c.tests.tail).size(12.0));
                                     });
+                                // Re-check only what failed: quicker while fixing.
+                                let failed = crate::preflight::failed_jobs(&c.tests.tail);
+                                let several = c.tests.summary.contains(" · jobs: ")
+                                    || c.partial;
+                                if c.tests.status == TestStatus::Failed && several && self.busy.is_none() {
+                                    for job in &failed {
+                                        if ui::button(ui, ui::icon::REFRESH, &format!("Re-check \"{job}\" only"))
+                                            .on_hover_text("Runs just this job again: quicker while you fix it. The full check runs before you push.")
+                                            .clicked()
+                                        {
+                                            self.recheck_jobs(vec![job.clone()]);
+                                        }
+                                    }
+                                }
                                 if ui
                                     .small_button(ui::with_icon(ui::icon::COPY, "Copy output"))
                                     .on_hover_text("Copies the result and output, with your name, folders and other private things hidden")

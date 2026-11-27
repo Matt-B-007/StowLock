@@ -109,6 +109,29 @@ impl App {
                     "Only GitHub's fonts: run checks with just the fonts GitHub's machine has (DejaVu, Liberation, emoji)",
                 )
                 .on_hover_text("Text that only fits with your own fonts fails here too, before you push. Fonts a project bundles and loads itself still work.");
+                let bwrap = crate::sandbox::available();
+                ui.add_enabled_ui(bwrap && self.config.clean_test_home, |ui| {
+                    ui.checkbox(
+                        &mut self.config.sandbox_checks,
+                        "Sandbox: checks can't see your home folder, keys or running apps (bubblewrap)",
+                    )
+                    .on_hover_text("The project's scripts and tests see only the project, the build tools and a fresh home, like GitHub's machine. Stopping a check stops everything in it.");
+                    ui.add_enabled_ui(self.config.sandbox_checks, |ui| {
+                        ui.checkbox(
+                            &mut self.config.offline_checks,
+                            "Offline: no network during checks (finds steps that quietly download)",
+                        );
+                    });
+                });
+                if !bwrap {
+                    ui.add(
+                        egui::Label::new(
+                            ui::muted("The sandbox needs bubblewrap: sudo pacman -S bubblewrap (or Install missing tools in Health)")
+                                .size(12.5),
+                        )
+                        .wrap(),
+                    );
+                }
                 let act_ready = proc::which("act").is_some() && proc::which("docker").is_some();
                 ui.add_enabled_ui(act_ready, |ui| {
                     ui.checkbox(

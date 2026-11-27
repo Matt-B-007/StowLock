@@ -66,6 +66,13 @@ pub fn survey() -> Vec<ToolInfo> {
             "checks Rust dependencies' licences and sources",
         ),
         (
+            "bubblewrap",
+            "bwrap",
+            &["--version"][..],
+            "bubblewrap",
+            "sandboxed checks",
+        ),
+        (
             "minisign",
             "minisign",
             &["-v"][..],

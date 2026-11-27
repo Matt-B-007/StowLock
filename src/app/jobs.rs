@@ -390,15 +390,32 @@ impl App {
     }
 
     pub(super) fn recheck(&mut self) {
-        self.session.review_when_ready = true;
+        self.recheck_jobs(Vec::new());
+    }
+
+    /// Check again: everything, or only the given workflow jobs (a quick
+    /// re-check of what failed; the full check still runs before a push).
+    pub(super) fn recheck_jobs(&mut self, jobs: Vec<String>) {
+        self.session.review_when_ready = jobs.is_empty();
         let Some(st) = self.session.stage.clone() else {
             return;
         };
         let slug = self.session.slug.clone();
         self.session.checks = None;
-        self.spawn_job("Checking", move |pctx| {
+        let label = if jobs.is_empty() {
+            "Checking".to_string()
+        } else {
+            format!("Re-checking {}", jobs.join(", "))
+        };
+        self.spawn_job(&label, move |pctx| {
             let _ = crate::cleanup::cleanup(&st.dir, st.stack());
-            Msg::Checked(pipeline::run_checks(&pctx, &slug, &st.dir, st.stack()))
+            Msg::Checked(pipeline::run_checks_of(
+                &pctx,
+                &slug,
+                &st.dir,
+                st.stack(),
+                &jobs,
+            ))
         });
         if let Some(st) = self.session.stage.as_mut() {
             let files = git::files_to_commit(&st.dir);

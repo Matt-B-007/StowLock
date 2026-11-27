@@ -4,6 +4,32 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.2.0-beta.6] - 2026-11-27
+
+Checks that behave like GitHub's machine, and quicker fixing when they fail.
+
+### Added
+- **Sandboxed checks (bubblewrap).** With "Like GitHub's clean machine" on, a project's scripts and tests run in a sealed-off view of your computer. They see only:
+  - the project,
+  - StowLock's build folders and the tool caches (Rust, pip, npm, Go),
+  - a fresh home folder,
+  - the system's programs (read-only).
+
+  They can't see your home folder, your keys, your running apps or your desktop. Files your own environment points tools at, such as a certificate bundle in `SSL_CERT_FILE`, stay readable. Your crates.io login stays hidden. Stopping a check stops everything inside it. If a step is stopped for writing outside the project, the checks card says so. On by default when bubblewrap is installed (Settings → Checks); otherwise the previous clean-machine method is used, and Your tools offers to install bubblewrap.
+- **Offline checks** (optional, Settings → Checks): no network during checks, to find steps that quietly download things.
+- **Re-check only the failed job.** When one of several jobs fails, "Re-check "job" only" runs just that job again, which is much quicker while you fix it. Before pushing, StowLock asks for one full check ("Run the full check").
+- **Live output while checks run:** the newest lines of the running step, so a slow or stuck step is easy to spot.
+- **What GitHub's log says:** when GitHub's build fails after a push, the build card shows the lines that matter from GitHub's log, with your details hidden. No need to open the log.
+- **The House Standard extras:** Space Grotesk for the large screen titles (body text stays Inter), and a faint dot pattern behind empty areas. Settings → Appearance → Plain look turns the pattern off.
+
+### Fixed
+- **The tour is no longer interrupted** on a new install by StowLock switching to the GitHub account panel. That now happens when the tour ends.
+- **A zip opened with StowLock stays on screen** on first run, instead of the account panel covering it.
+- **"Settings & state" in Health is cleared on a clean start,** instead of staying "Broken" from an old notice until a setting was saved.
+
+### Changed
+- New screenshots in the README.
+
 ## [0.2.0-beta.5] - 2026-11-27
 
 ### Fixed

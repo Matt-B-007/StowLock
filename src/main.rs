@@ -27,6 +27,7 @@ mod preflight;
 mod proc;
 mod report;
 mod rustcheck;
+mod sandbox;
 mod secrets;
 mod selftest;
 mod signing;

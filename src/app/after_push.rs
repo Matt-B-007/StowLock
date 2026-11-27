@@ -119,6 +119,24 @@ impl App {
                     } else if w.local_passed {
                         ui.add(egui::Label::new(ui::muted("It passed here but failed on GitHub: GitHub runs on a different machine, often with newer tools.").size(13.0)).wrap());
                     }
+                    // What GitHub said, without opening the log.
+                    let key = crate::logbook::key_lines(&log, 12);
+                    if !key.is_empty() {
+                        egui::CollapsingHeader::new("What GitHub's log says")
+                            .id_salt("gh_fail_lines")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for l in &key {
+                                    ui.add(
+                                        egui::Label::new(
+                                            ui::mono(report::redact(l, &self.redact_ctx()))
+                                                .size(12.0),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                    }
                     ui.horizontal_wrapped(|ui| {
                         if ui::button_enabled(ui, self.busy.is_none(), ui::icon::REFRESH, "Re-run on GitHub")
                             .on_hover_text("Re-runs only the failed jobs, then StowLock watches again")

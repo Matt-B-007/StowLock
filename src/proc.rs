@@ -67,6 +67,71 @@ pub struct Opts {
     pub stdin: Option<String>,
     /// Variables to leave out (for example the desktop session's).
     pub env_remove: Vec<String>,
+    /// Show the output as it comes (the newest lines, for the checks card).
+    pub live: bool,
+}
+
+/// The newest output lines of the command running with `live` (one check
+/// runs at a time), for showing progress while it runs.
+static LIVE: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const LIVE_LINES: usize = 6;
+
+/// The newest lines of the running check's output.
+pub fn live_lines() -> Vec<String> {
+    LIVE.lock()
+        .map(|l| l.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn live_clear() {
+    if let Ok(mut l) = LIVE.lock() {
+        l.clear();
+    }
+}
+
+fn live_push(text: &str) {
+    let line = crate::util::strip_ansi(text);
+    // A progress line rewritten with \r: keep its newest version.
+    let line = line
+        .rsplit('\r')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_string();
+    if line.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut l) = LIVE.lock() {
+        l.push_back(line);
+        while l.len() > LIVE_LINES {
+            l.pop_front();
+        }
+    }
+}
+
+/// Read a pipe to the end; with `live`, also pass on each line as it comes.
+fn read_all(mut r: impl Read, live: bool) -> Vec<u8> {
+    let mut all = Vec::new();
+    if !live {
+        let _ = r.read_to_end(&mut all);
+        return all;
+    }
+    let mut buf = [0u8; 8192];
+    let mut start = 0;
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                all.extend_from_slice(&buf[..n]);
+                while let Some(i) = all[start..].iter().position(|b| *b == b'\n') {
+                    live_push(&String::from_utf8_lossy(&all[start..start + i]));
+                    start += i + 1;
+                }
+            }
+        }
+    }
+    all
 }
 
 impl Opts {
@@ -269,18 +334,14 @@ pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
             let _ = si.write_all(input.as_bytes());
         }
     }
-    let mut so = child.stdout.take().expect("piped");
-    let mut se = child.stderr.take().expect("piped");
-    let t_out = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = so.read_to_end(&mut v);
-        v
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = se.read_to_end(&mut v);
-        v
-    });
+    let so = child.stdout.take().expect("piped");
+    let se = child.stderr.take().expect("piped");
+    let live = opts.live;
+    if live {
+        live_clear();
+    }
+    let t_out = std::thread::spawn(move || read_all(so, live));
+    let t_err = std::thread::spawn(move || read_all(se, live));
     // Check often at first (most commands finish in a few milliseconds),
     // then settle at every 25 ms for long ones.
     let mut pause = Duration::from_millis(1);
@@ -376,6 +437,15 @@ pub fn xdg_open(target: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn live_output_keeps_the_whole_output_too() {
+        let text = "one\ntwo\r50%\rthree\nfour (no newline)";
+        let plain = read_all(text.as_bytes(), false);
+        let live = read_all(text.as_bytes(), true);
+        assert_eq!(plain, live);
+        assert_eq!(String::from_utf8(live).unwrap(), text);
+    }
 
     #[test]
     fn cancel_stops_everything_the_command_started() {
