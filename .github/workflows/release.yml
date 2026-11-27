@@ -12,21 +12,45 @@ permissions:
 
 jobs:
   build:
+    name: Check, build and publish the release
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Check the version matches the tag
+      - name: Check the tag, Cargo.toml and CHANGELOG agree
         run: |
           WANT="${GITHUB_REF_NAME#v}"
           HAVE="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           if [ "$WANT" != "$HAVE" ]; then
             echo "Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $HAVE"; exit 1
           fi
-      - name: Test
-        run: cargo test --locked
-      - name: Build
-        run: cargo build --release --locked
+          TOP="$(grep -m1 '^## \[' CHANGELOG.md | sed -E 's/^## \[([^]]*)\].*/\1/')"
+          if [ "$WANT" != "$TOP" ]; then
+            echo "The newest CHANGELOG entry is $TOP, not $WANT"; exit 1
+          fi
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          TC="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$TC" --profile minimal -c clippy -c rustfmt
+      - name: Install the pinned shellcheck
+        run: |
+          python3 -m venv /tmp/tools
+          /tmp/tools/bin/pip install --quiet "shellcheck-py==0.11.0.1"
+          echo /tmp/tools/bin >> "$GITHUB_PATH"
+      - name: Format (cargo fmt --check)
+        run: sh scripts/check.sh fmt
+      - name: Lint (cargo clippy -D warnings)
+        run: sh scripts/check.sh clippy
+      - name: Tests (cargo test)
+        run: sh scripts/check.sh test
+      - name: Release build (cargo build --release)
+        run: sh scripts/check.sh build
+      - name: Self-test of the release build (--self-test)
+        run: sh scripts/check.sh selftest
+      - name: Check shell scripts (sh -n + shellcheck)
+        run: sh scripts/check.sh shell
       - name: Package
         run: |
           cp target/release/stowlock stowlock-linux-x86_64
@@ -34,17 +58,50 @@ jobs:
           ./packaging/aur/make-pkgbuild.sh "$GITHUB_REF_NAME" stowlock-linux-x86_64 aur > aur-package-name
           cp aur/PKGBUILD aur-PKGBUILD
           cp aur/.SRCINFO aur-SRCINFO
-      - name: Attach to release
+      - name: Publish the release
+        # House Standard order: a draft first, then the files, then publish,
+        # so nobody can see (or update to) a release without its files.
+        # A release made earlier (by an older StowLock) just gets the files.
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          PRE=""
-          case "$TAG" in *-beta*|*-alpha*|*-rc*) PRE="--prerelease" ;; esac
+          FILES=(stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 aur-PKGBUILD aur-SRCINFO)
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 aur-PKGBUILD aur-SRCINFO --clobber
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+            exit 0
+          fi
+          OPTS=(--draft --verify-tag --title "$TAG")
+          case "$TAG" in *-beta*|*-alpha*|*-rc*) OPTS+=(--prerelease) ;; esac
+          # The CHANGELOG section for this version becomes the release notes.
+          VERSION="${TAG#v}"
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ -s release-notes.md ]; then
+            OPTS+=(--notes-file release-notes.md)
           else
-            gh release create "$TAG" stowlock-linux-x86_64 stowlock-linux-x86_64.sha256 aur-PKGBUILD aur-SRCINFO --generate-notes $PRE
+            OPTS+=(--generate-notes)
+          fi
+          gh release create "$TAG" "${OPTS[@]}"
+          gh release upload "$TAG" "${FILES[@]}"
+          gh release edit "$TAG" --draft=false
+      - name: Remove an unfinished draft (only if this run failed)
+        # Fail closed: a release that didn't finish never stays behind as a
+        # draft. A published release (or one an older StowLock made) is kept.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          DRAFT="$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null || true)"
+          if [ "$DRAFT" = "true" ]; then
+            gh release delete "$TAG" --yes
+            echo "Deleted the unfinished draft release $TAG. The tag is kept."
+          else
+            echo "No draft release was left behind."
           fi
       - name: Publish to the AUR
         # Runs only once the AUR_SSH_PRIVATE_KEY secret is set in the repo

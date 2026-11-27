@@ -4,6 +4,27 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.1.0-beta.8] - 2026-11-26
+
+### Changed
+- **GitHub steps run like GitHub's clean machine.** They get a fresh home folder and none of your desktop session's settings (display, theme, scaling, session bus), so tests don't pick up your own settings, app data or desktop. Tool caches (Rust, pip, npm, Go) are kept, so checks stay fast. You can turn this off in Settings → Checks.
+- **When a project's release workflow publishes its own release, StowLock pushes the tag only** and shows "GitHub is building and publishing v1.2.0". Projects without such a workflow work as before.
+- StowLock's own release workflow now creates a draft release with the CHANGELOG notes, attaches the files, then publishes, so a release is never visible without its files.
+- **A step that can't run here no longer stops the others.** If one GitHub step needs a tool this computer doesn't have (shellcheck, say), StowLock notes it and runs the remaining steps. When everything that ran passed, the result is "Passed · 1 step can't run here (needs `shellcheck`; GitHub runs it)", and the install command is shown as optional. Before, the whole check read "Skipped" and the install command read like an order.
+- Steps that write to GitHub's own files (`$GITHUB_PATH`, `$GITHUB_ENV`, `$GITHUB_OUTPUT`) are recognised as GitHub-only instead of failing here.
+- **Tools a workflow installs with pip are installed here too,** in StowLock's own Python environment (for example the pinned `shellcheck-py`), so the checks that need them run on this computer instead of being skipped.
+- A project's own check script that stops because a tool "isn't installed" (or "no such command") counts as "can't run here", with the project's own install advice, unless something really failed first (failed tests, a compile error, a formatting diff).
+- Terminal colour codes no longer end up in logs and bug reports.
+- Bug reports no longer mistake version numbers like `0.11.0.1` for IP addresses.
+- Bug reports hide your home folder path even when it contains "stowlock" (it was missed when StowLock checked its own repo in its fresh home).
+- **CI must pass first time (House Standard v1.2).** All checks live in `scripts/check.sh`. CI and the release workflow run its sections one by one (format, lint with warnings as errors, tests, release build, self-test, shell scripts with `sh -n` + shellcheck), so a local pass means a GitHub pass and a failure names what broke. The Rust toolchain (1.97.0, in `rust-toolchain.toml`) and shellcheck (0.11.0.1) are pinned. The release workflow also checks that the tag, Cargo.toml and the newest CHANGELOG entry agree, and deletes its own unfinished draft if anything fails.
+
+### Fixed
+- **Failures that look specific to this computer are flagged,** for example a test finding a running copy of the app or a path in your home folder. Copy for AI then asks to fix the tests' dependence on the machine, not the app's behaviour.
+- The note "this step comes after a step only GitHub can run" only appears when that step could be the cause. It no longer appears when the tests ran and most of them passed.
+- pytest's short summary ("5 failed, 1154 passed in 116s") now shows in the check result.
+- In bug reports, every "lines left out" note keeps its time.
+
 ## [0.1.0-beta.7] - 2026-11-26
 
 ### Fixed

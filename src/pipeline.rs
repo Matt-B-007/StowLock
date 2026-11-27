@@ -543,6 +543,7 @@ pub fn run_checks(ctx: &Ctx, slug: &str, dir: &Path, stack: Stack) -> Checks {
             ),
             match_github: ctx.config.match_github_checks,
             exact: ctx.config.exact_github_checks,
+            clean_home: ctx.config.clean_test_home,
         };
         let r = preflight::run_tests(dir, stack, &env);
         let status = match r.status {
@@ -661,6 +662,9 @@ pub struct PushOutcome {
     /// The tag reached GitHub but creating the release failed: the reason.
     /// The UI offers Finish the release or Remove the tag.
     pub release_failed: Option<String>,
+    /// The project's own release workflow builds and publishes the release
+    /// (StowLock pushed the tag only).
+    pub release_by_workflow: bool,
 }
 
 /// Create the GitHub release for `tag`, with the CHANGELOG notes if any.
@@ -844,6 +848,14 @@ pub fn push(ctx: &Ctx, req: &PushRequest) -> Res<PushOutcome> {
                     );
                 }
                 return Err(e);
+            }
+            if crate::workflows::publishes_releases(&dir) {
+                log.info(
+                    "release",
+                    &format!("The project's release workflow builds and publishes {tag} on GitHub"),
+                );
+                outcome.release_by_workflow = true;
+                return Ok(());
             }
             if let Err(e) = create_release_with_notes(
                 ctx,
@@ -1601,5 +1613,34 @@ mod tests {
             );
         }
         assert_eq!(git::owner_repo("/tmp/fake/x.git"), None);
+    }
+
+    #[test]
+    fn a_project_that_publishes_its_own_releases_gets_the_tag_only() {
+        let d = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(d.path()).unwrap();
+        let wf = b"on:\n  push:\n    tags: ['v*']\njobs:\n  release:\n    runs-on: ubuntu-latest\n    steps:\n      - run: gh release create \"$GITHUB_REF_NAME\" --draft\n";
+        let zip = sb.python_zip(
+            "demo-app.zip",
+            "demo-app",
+            &[
+                ("app.py", b"x = 1\n"),
+                (".github/workflows/release.yml", wf),
+            ],
+        );
+        stage(&sb.ctx, &req(&sb, &zip, Mode::New)).unwrap();
+        let out = push(
+            &sb.ctx,
+            &preq(&sb, Mode::New, "v1.0.0", Channel::Stable, None),
+        )
+        .unwrap();
+        assert!(out.release_by_workflow);
+        assert_eq!(out.tag.as_deref(), Some("v1.0.0"));
+        assert!(
+            sb.fake.releases(&sb.owner, "demo-app").is_empty(),
+            "StowLock made the release"
+        );
+        let tags = crate::git::git_bare(&sb.fake.bare(&sb.owner, "demo-app"), &["tag"]).stdout;
+        assert!(tags.contains("v1.0.0"), "tag not pushed: {tags}");
     }
 }

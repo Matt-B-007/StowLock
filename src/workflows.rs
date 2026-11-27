@@ -163,6 +163,17 @@ fn github_only(run: &str) -> Option<&'static str> {
 
 fn github_only_inner(r: &str) -> Option<&'static str> {
     let r = r.to_string();
+    // GitHub's own files for passing values between steps don't exist here.
+    const GITHUB_FILES: [&str; 5] = [
+        "github_path",
+        "github_env",
+        "github_output",
+        "github_step_summary",
+        "github_state",
+    ];
+    if GITHUB_FILES.iter().any(|f| r.contains(f)) {
+        return Some("uses GitHub's own variables");
+    }
     if r.contains("${{") {
         return Some("uses GitHub's own variables");
     }
@@ -206,6 +217,45 @@ fn github_only_inner(r: &str) -> Option<&'static str> {
         return Some("publishes or uploads (GitHub only)");
     }
     None
+}
+
+/// The project has a workflow that runs on version tags and publishes the
+/// GitHub release itself (so StowLock should push the tag and let it).
+pub fn publishes_releases(dir: &Path) -> bool {
+    const PUBLISHERS: [&str; 6] = [
+        "gh release create",
+        "softprops/action-gh-release",
+        "ncipollo/release-action",
+        "actions/create-release",
+        "goreleaser",
+        "taiki-e/upload-rust-binary-action",
+    ];
+    let Ok(rd) = std::fs::read_dir(dir.join(".github").join("workflows")) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let p = e.path();
+        if !matches!(
+            p.extension().and_then(|x| x.to_str()),
+            Some("yml") | Some("yaml")
+        ) {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return false;
+        };
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+            return false;
+        };
+        let on = doc
+            .get("on")
+            .or_else(|| doc.get(serde_yaml::Value::Bool(true)));
+        let on_tags = on
+            .and_then(|o| o.get("push"))
+            .and_then(|p| p.as_mapping())
+            .is_some_and(|m| m.keys().filter_map(s).any(|k| k.starts_with("tags")));
+        on_tags && PUBLISHERS.iter().any(|w| text.contains(w))
+    })
 }
 
 /// Read the project's workflows. None when it has no workflow files.
@@ -345,6 +395,47 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                 } else {
                     github_only(run)
                 };
+                // A GitHub-only step that installs tools with pip (shellcheck-py,
+                // say): install the same packages here, in StowLock's own Python
+                // environment, so the checks that need them can run too.
+                if let Some(pip) = why
+                    .filter(|w| !w.starts_with("only runs") && *w != "uses PowerShell")
+                    .and_then(|_| pip_lines(run))
+                {
+                    let mut env = wf_env.clone();
+                    env.extend(job_env.clone());
+                    env.extend(env_of(st));
+                    // Anything else the step does (apt-get, say) still only runs on GitHub.
+                    let other = run.lines().map(str::trim).any(|l| {
+                        !(l.is_empty()
+                            || l.starts_with('#')
+                            || l.contains("pip install")
+                            || l.contains("pip3 install")
+                            || l.contains(" -m venv ")
+                            || l.to_ascii_lowercase().contains("github_path")
+                            || l.starts_with("echo "))
+                    });
+                    if other {
+                        plan.skipped.push(Skipped {
+                            job: job_name.clone(),
+                            name: step_name.clone(),
+                            why: why.unwrap_or_default().into(),
+                            run: Some(run.to_string()),
+                            before: plan.steps.len(),
+                        });
+                    }
+                    if !plan.steps.iter().any(|p| p.run == pip) {
+                        plan.steps.push(PlanStep {
+                            job: job_name.clone(),
+                            name: format!("{step_name} (here: StowLock's own Python environment)"),
+                            run: pip,
+                            python_deps: true,
+                            env,
+                            workdir: None,
+                        });
+                    }
+                    continue;
+                }
                 if let Some(why) = why {
                     plan.skipped.push(Skipped {
                         job: job_name.clone(),
@@ -382,6 +473,34 @@ pub fn plan(dir: &Path) -> Option<Plan> {
         return None;
     }
     Some(plan)
+}
+
+/// The pip installs in a step, rewritten to run in StowLock's own Python
+/// environment: "/tmp/tools/bin/pip install shellcheck-py==0.11.0.1" becomes
+/// "pip install shellcheck-py==0.11.0.1". None when there are none, or when
+/// they depend on GitHub's own values.
+pub fn pip_lines(run: &str) -> Option<String> {
+    let mut out = Vec::new();
+    for line in run.lines() {
+        let l = line.trim();
+        if l.starts_with('#') || l.contains("${{") {
+            continue;
+        }
+        let at = ["pip3 install ", "pip install "]
+            .iter()
+            .filter_map(|w| l.find(w).map(|i| (i, w.len())))
+            .min_by_key(|(i, _)| *i);
+        let Some((i, n)) = at else { continue };
+        let args: Vec<&str> = l[i + n..]
+            .split_whitespace()
+            .take_while(|a| !matches!(*a, "&&" | "||" | ";" | "|"))
+            .filter(|a| !matches!(*a, "--user" | "--break-system-packages"))
+            .collect();
+        if !args.is_empty() {
+            out.push(format!("pip install {}", args.join(" ")));
+        }
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
 }
 
 fn first_line(t: &str) -> String {
@@ -433,11 +552,13 @@ mod tests {
         );
         let p = plan(d.path()).unwrap();
         let runs: Vec<&str> = p.steps.iter().map(|s| s.run.as_str()).collect();
-        assert!(runs.contains(&"cargo test --locked"), "{runs:?}");
-        assert!(runs.contains(&"cargo build --release --locked"));
-        assert!(runs.contains(&"./target/release/stowlock --self-test"));
+        assert!(runs.contains(&"sh scripts/check.sh test"), "{runs:?}");
+        assert!(runs.contains(&"sh scripts/check.sh build"));
+        assert!(runs.contains(&"sh scripts/check.sh selftest"));
         assert_eq!(
-            runs.iter().filter(|r| **r == "cargo test --locked").count(),
+            runs.iter()
+                .filter(|r| **r == "sh scripts/check.sh test")
+                .count(),
             1,
             "run once"
         );
@@ -445,10 +566,7 @@ mod tests {
         assert!(p.skipped.iter().any(|s| s.why.contains("container")));
         // The release workflow only runs for tags: not a check.
         assert_eq!(p.files, ["ci.yml"]);
-        assert!(
-            p.provided >= 2,
-            "checkout and the toolchain are provided here"
-        );
+        assert!(p.provided >= 1, "checkout is provided here");
     }
 
     #[test]
@@ -533,5 +651,58 @@ jobs:
             "/cache/builds/demo/release/app --self-test"
         );
         assert_eq!(use_build_cache("cargo test", c), "cargo test");
+    }
+
+    #[test]
+    fn knows_when_a_project_publishes_its_own_releases() {
+        assert!(publishes_releases(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        ))));
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("ci.yml"), "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: gh release create x\n").unwrap();
+        assert!(!publishes_releases(d.path()), "not on tags");
+        std::fs::write(wf.join("rel.yml"), "on:\n  push:\n    tags: ['v*']\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: softprops/action-gh-release@v2\n").unwrap();
+        assert!(publishes_releases(d.path()));
+    }
+
+    #[test]
+    fn stowlocks_own_ci_runs_the_check_script_here() {
+        let plan = plan(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let runs: Vec<&str> = plan.steps.iter().map(|s| s.run.trim()).collect();
+        assert_eq!(
+            runs,
+            [
+                "pip install --quiet \"shellcheck-py==$SHELLCHECK_VERSION\"",
+                "sh scripts/check.sh fmt",
+                "sh scripts/check.sh clippy",
+                "sh scripts/check.sh test",
+                "sh scripts/check.sh build",
+                "sh scripts/check.sh selftest",
+                "sh scripts/check.sh shell",
+            ],
+            "{plan:#?}"
+        );
+        // The pinned shellcheck is installed here too, in StowLock's own
+        // Python environment, so the shell-script section runs locally.
+        assert!(plan.steps[0].python_deps);
+        assert!(!plan
+            .skipped
+            .iter()
+            .any(|s| s.job == "Checks (Ubuntu)" && s.name == "Install the pinned shellcheck"));
+    }
+
+    #[test]
+    fn pip_tool_installs_are_rewritten_for_stowlocks_environment() {
+        assert_eq!(
+            pip_lines("python3 -m venv /tmp/tools\n/tmp/tools/bin/pip install --quiet \"shellcheck-py==$V\"\necho /tmp/tools/bin >> \"$GITHUB_PATH\"").as_deref(),
+            Some("pip install --quiet \"shellcheck-py==$V\"")
+        );
+        assert_eq!(pip_lines("sudo apt-get install -y shellcheck"), None);
+        assert_eq!(
+            pip_lines("pip install --user ruff && ruff --version").as_deref(),
+            Some("pip install ruff")
+        );
     }
 }

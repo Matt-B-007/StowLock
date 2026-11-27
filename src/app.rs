@@ -140,6 +140,8 @@ struct Session {
     on_github: Option<bool>,
     /// The local folder pushes to a repo that was deleted on GitHub.
     deleted_on_github: bool,
+    /// The project's own release workflow publishes its releases (checked once).
+    workflow_publishes: Option<bool>,
     replace_local: bool,
     description: String,
     topics: String,
@@ -187,6 +189,7 @@ impl Session {
             local_is_ours: false,
             on_github: None,
             deleted_on_github: false,
+            workflow_publishes: None,
             replace_local: false,
             description: String::new(),
             topics: String::new(),
@@ -1087,10 +1090,16 @@ impl App {
                 ui::banner(ui, ACCENT(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spinner();
-                        ui.label(format!(
-                            "GitHub is building {}…",
-                            w.tag.clone().unwrap_or_else(|| "this push".into())
-                        ));
+                        let by_workflow = self
+                            .session
+                            .outcome
+                            .as_ref()
+                            .is_some_and(|o| o.release_by_workflow);
+                        ui.label(match (&w.tag, by_workflow) {
+                            (Some(t), true) => format!("GitHub is building and publishing {t}…"),
+                            (Some(t), false) => format!("GitHub is building {t}…"),
+                            (None, _) => "GitHub is building this push…".to_string(),
+                        });
                         if let Some(Build::Running { url }) = &w.status {
                             if ui.link("Watch on GitHub").clicked() {
                                 let _ = proc::xdg_open(url);
@@ -1105,14 +1114,16 @@ impl App {
                 ui::banner(ui, ui::SUCCESS(), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(ui::icon::CIRCLE_CHECK).color(ui::SUCCESS()));
-                        ui.label(format!(
-                            "Built on GitHub{}",
-                            if w.tag.is_some() {
-                                ": the release is ready"
-                            } else {
-                                ""
-                            }
-                        ));
+                        let by_workflow = self
+                            .session
+                            .outcome
+                            .as_ref()
+                            .is_some_and(|o| o.release_by_workflow);
+                        ui.label(match (&w.tag, by_workflow) {
+                            (Some(t), true) => format!("Built and published {t} on GitHub"),
+                            (Some(_), false) => "Built on GitHub: the release is ready".to_string(),
+                            (None, _) => "Built on GitHub".to_string(),
+                        });
                         if ui.link("View the build").clicked() {
                             let _ = proc::xdg_open(&url);
                         }
@@ -3466,8 +3477,21 @@ impl App {
                             );
                         }
                     }
+                    if c.tests.status == TestStatus::Passed
+                        && c.tests.summary.contains("can't run here")
+                    {
+                        ui.add(
+                            egui::Label::new(ui::muted(
+                                "Everything that could run here passed. GitHub runs the rest, and StowLock watches the build. Nothing to install unless you want to run those steps here too.",
+                            ).size(12.5))
+                            .wrap(),
+                        );
+                    }
                     if let Some(h) = &c.tests.hint {
                         ui.horizontal_wrapped(|ui| {
+                            if c.tests.status == TestStatus::Passed || cant_run {
+                                ui.label(ui::muted("Optional, to run it here too:").size(12.5));
+                            }
                             ui.add(egui::Label::new(ui::mono(h)).wrap());
                             if ui.small_button("Copy").clicked() {
                                 ui.ctx().copy_text(h.clone());
@@ -3498,6 +3522,11 @@ impl App {
                         let mut copied = false;
                         ui::banner(ui, WARNING(), |ui| {
                             ui.label(ui::semibold("What to do next", 14.5));
+                            if c.tests.summary.contains(crate::preflight::MACHINE_SPECIFIC) {
+                                ui.add(egui::Label::new(RichText::new(
+                                    "These failures look specific to this computer, not the project: they mention a running program or your home folder. They'll likely pass on GitHub. Quit the running copy and Re-check, or push anyway.",
+                                ).color(WARNING())).wrap());
+                            }
                             ui.add(egui::Label::new(
                                 "1. Copy for AI, paste it into your AI chat, and load the fixed zip it gives you. The failed attempt is kept, never lost.",
                             ).wrap());
@@ -3968,6 +3997,12 @@ impl App {
     /// The "Ready to push" window: everything about the push in one place,
     /// and a confirm button that says exactly what it will do.
     fn push_review(&mut self, ctx: &egui::Context) {
+        if self.session.workflow_publishes.is_none() {
+            if let Some(st) = &self.session.stage {
+                self.session.workflow_publishes =
+                    Some(crate::workflows::publishes_releases(&st.dir));
+            }
+        }
         let s = self.session.clone();
         let Some(stage) = s.stage.clone() else {
             self.session.confirm = false;
@@ -4130,7 +4165,11 @@ impl App {
                 ui.label(ui::muted("After"));
                     let mut after = Vec::new();
                     if !tag.is_empty() {
-                        after.push("release created");
+                        if s.workflow_publishes == Some(true) {
+                            after.push("the project's release workflow builds and publishes the release on GitHub");
+                        } else {
+                            after.push("release created");
+                        }
                     }
                     if s.archive_after {
                         after.push(if s.archive_move {
@@ -4789,6 +4828,11 @@ impl App {
                     "Match GitHub's checks: run the project's own GitHub workflow steps",
                 )
                 .on_hover_text("Uses the same commands and settings as the project's .github/workflows files, and lists the steps only GitHub can run.");
+                ui.checkbox(
+                    &mut self.config.clean_test_home,
+                    "Like GitHub's clean machine: a fresh home folder, without your desktop session",
+                )
+                .on_hover_text("Tests don't see your settings, app data or running desktop, as on GitHub. Tool caches are kept, so it stays fast.");
                 let act_ready = proc::which("act").is_some() && proc::which("docker").is_some();
                 ui.add_enabled_ui(act_ready, |ui| {
                     ui.checkbox(

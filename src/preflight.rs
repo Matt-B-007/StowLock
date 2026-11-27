@@ -57,7 +57,13 @@ pub struct TestEnv<'a> {
     pub match_github: bool,
     /// Run the GitHub workflows exactly, with act (needs act and Docker).
     pub exact: bool,
+    /// Run GitHub steps in a fresh home folder without the desktop session,
+    /// like GitHub's clean machine (tool caches are kept).
+    pub clean_home: bool,
 }
+
+/// Added to a test summary when the failures look specific to this computer.
+pub const MACHINE_SPECIFIC: &str = "looks specific to this computer";
 
 /// The names of failed tests (cargo, pytest, go, jest), shortest form,
 /// in the order they appear, without repeats.
@@ -122,6 +128,11 @@ pub fn result_summary(transcript: &str) -> Option<String> {
     if let Some(c) = py.captures_iter(transcript).last() {
         return Some(c[1].to_string());
     }
+    // pytest -q ends with a bare line: "5 failed, 1154 passed, 6 skipped in 116.08s"
+    let quiet = Regex::new(r"(?m)^\s*(\d+ (?:failed|passed|errors?)\b[^\n]*?) in [\d.]+s").unwrap();
+    if let Some(c) = quiet.captures_iter(transcript).last() {
+        return Some(c[1].to_string());
+    }
     let ok = transcript
         .lines()
         .filter(|l| l.starts_with("ok ") || l.starts_with("ok\t"))
@@ -147,7 +158,7 @@ fn run_step_with(
     env: &TestEnv,
     extra: &[(String, String)],
 ) -> Output {
-    run_step_labelled(dir, program, args, env, extra, None, env.timeout_secs)
+    run_step_labelled(dir, program, args, env, extra, &[], None, env.timeout_secs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,6 +168,7 @@ fn run_step_labelled(
     args: &[&str],
     env: &TestEnv,
     extra: &[(String, String)],
+    remove: &[String],
     label: Option<&str>,
     timeout_secs: u64,
 ) -> Output {
@@ -174,6 +186,7 @@ fn run_step_labelled(
             e
         },
         stdin: None,
+        env_remove: remove.to_vec(),
     };
     let o = proc::run(program, args, &opts);
     match label {
@@ -181,6 +194,188 @@ fn run_step_labelled(
         None => env.log.command("tests", &o),
     }
     o
+}
+
+/// The desktop session's variables: GitHub's machine has none, and apps read
+/// them to decide how to look (effects, scaling, theme).
+const SESSION_VARS: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_ID",
+    "XDG_SESSION_CLASS",
+    "XDG_SEAT",
+    "XDG_VTNR",
+    "DESKTOP_SESSION",
+    "SESSION_MANAGER",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "KDE_FULL_SESSION",
+    "KDE_SESSION_VERSION",
+    "KDE_SESSION_UID",
+    "KDE_APPLICATIONS_AS_SCOPE",
+    "GNOME_DESKTOP_SESSION_ID",
+    "GNOME_SETUP_DISPLAY",
+    "QT_QPA_PLATFORMTHEME",
+    "QT_STYLE_OVERRIDE",
+    "QT_AUTO_SCREEN_SCALE_FACTOR",
+    "QT_SCREEN_SCALE_FACTORS",
+    "QT_SCALE_FACTOR",
+    "PLASMA_USE_QT_SCALING",
+    "GTK_THEME",
+    "GTK_MODULES",
+    "GDK_SCALE",
+    "GDK_BACKEND",
+    "XCURSOR_THEME",
+    "XCURSOR_SIZE",
+    "SSH_AUTH_SOCK",
+    "GPG_AGENT_INFO",
+];
+
+/// A fresh home folder for GitHub steps: (variables to set, variables to drop).
+/// Tool caches (Rust, pip, npm, Go) still point at the real ones, so it stays fast.
+/// Variables to set, and variables to leave out.
+type EnvChanges = (Vec<(String, String)>, Vec<String>);
+
+fn clean_home(dir: &Path, env: &TestEnv) -> Option<EnvChanges> {
+    let real = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    let home = match &env.build_cache {
+        Some(c) => c.join("stowlock-home"),
+        None => python_env_dir(dir, env).with_extension("home"),
+    };
+    let _ = std::fs::remove_dir_all(&home);
+    let runtime = home.join(".run");
+    for d in [".config", ".local/share", ".local/state", ".cache"] {
+        std::fs::create_dir_all(home.join(d)).ok()?;
+    }
+    std::fs::create_dir_all(&runtime).ok()?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700));
+    }
+    let h = |p: &str| home.join(p).display().to_string();
+    let keep = |var: &str, default: String| std::env::var(var).unwrap_or(default);
+    let set = vec![
+        ("HOME".into(), home.display().to_string()),
+        ("XDG_CONFIG_HOME".into(), h(".config")),
+        ("XDG_DATA_HOME".into(), h(".local/share")),
+        ("XDG_STATE_HOME".into(), h(".local/state")),
+        ("XDG_CACHE_HOME".into(), h(".cache")),
+        ("XDG_RUNTIME_DIR".into(), runtime.display().to_string()),
+        (
+            "CARGO_HOME".into(),
+            keep("CARGO_HOME", format!("{real}/.cargo")),
+        ),
+        (
+            "RUSTUP_HOME".into(),
+            keep("RUSTUP_HOME", format!("{real}/.rustup")),
+        ),
+        (
+            "PIP_CACHE_DIR".into(),
+            keep("PIP_CACHE_DIR", format!("{real}/.cache/pip")),
+        ),
+        (
+            "npm_config_cache".into(),
+            keep("npm_config_cache", format!("{real}/.npm")),
+        ),
+        ("GOPATH".into(), keep("GOPATH", format!("{real}/go"))),
+        (
+            "GOCACHE".into(),
+            keep("GOCACHE", format!("{real}/.cache/go-build")),
+        ),
+    ];
+    Some((set, SESSION_VARS.iter().map(|v| v.to_string()).collect()))
+}
+
+/// The failures mention this computer itself (a running program, your real
+/// home folder), not the project: they'd likely pass on GitHub.
+fn machine_specific(output: &str, dir: &Path, env: &TestEnv) -> bool {
+    let mut text = output.to_string();
+    // The project's own folder and StowLock's cache are expected in paths.
+    text = text.replace(&dir.display().to_string(), "<project>");
+    if let Some(c) = &env.build_cache {
+        text = text.replace(&c.display().to_string(), "<cache>");
+    }
+    let lower = text.to_ascii_lowercase();
+    let running = regex::Regex::new(r"(?i)(still running|already running|\(process \d+|\bpid \d+)")
+        .unwrap()
+        .is_match(&text);
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| h.len() > 1)
+        .is_some_and(|h| lower.contains(&format!("{}/", h.to_ascii_lowercase())));
+    running || home
+}
+
+/// Did any tests pass? ("1154 passed", "75 passed, 0 failed")
+fn some_passed(counts: &str) -> bool {
+    regex::Regex::new(r"(\d+) passed")
+        .unwrap()
+        .captures_iter(counts)
+        .any(|c| c[1].parse::<u64>().unwrap_or(0) > 0)
+}
+
+/// Something really failed: failed tests, a panic, a compile error, a
+/// formatting diff. Then a missing tool later on isn't the whole story.
+fn real_failure(block: &str) -> bool {
+    let failed = regex::Regex::new(r"(\d+) failed")
+        .unwrap()
+        .captures_iter(block)
+        .any(|c| c[1].parse::<u64>().unwrap_or(0) > 0);
+    failed
+        || [
+            "panicked at",
+            " FAILED",
+            "AssertionError",
+            "error[E",
+            "Diff in ",
+        ]
+        .iter()
+        .any(|w| block.contains(w))
+}
+
+/// The tool a "not installed" message names, and the project's own advice
+/// for installing it ("Install it with: …"), if it gives one.
+fn named_missing_tool(output: &str) -> (Option<String>, Option<String>) {
+    let mut tool = missing_command(output);
+    let mut hint = None;
+    for l in output.lines() {
+        let l = l.trim();
+        let lower = l.to_ascii_lowercase();
+        if tool.is_none() {
+            for w in [" isn't installed", " is not installed"] {
+                if let Some(i) = lower.find(w) {
+                    let name = l[..i]
+                        .rsplit([' ', ':'])
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches('`');
+                    if !name.is_empty() {
+                        tool = Some(name.to_string());
+                    }
+                }
+            }
+            if let Some(i) = lower.find("no such command: ") {
+                let name = l[i + 17..]
+                    .trim()
+                    .trim_matches(|c| c == '`' || c == '\'' || c == '"');
+                if !name.is_empty() {
+                    tool = Some(format!("cargo-{name}"));
+                }
+            }
+        }
+        if hint.is_none() {
+            if let Some(i) = lower.find("install it with: ") {
+                let h = l[i + 17..].trim().trim_end_matches('.');
+                if !h.is_empty() {
+                    hint = Some(h.to_string());
+                }
+            }
+        }
+    }
+    (tool, hint)
 }
 
 /// The command a "command not found" line names.
@@ -262,6 +457,15 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         };
     let ran_of = |n: usize| format!("Ran {n} of {} GitHub steps here", plan.total());
     let mut py_env: Vec<(String, String)> = Vec::new();
+    // Steps that couldn't run here (something missing): (what it needs, how
+    // to get it). The rest still run; GitHub runs these ones.
+    let mut cant_run: Vec<(String, Option<String>)> = Vec::new();
+    let mut ran = 0usize;
+    let (home_env, session_vars) = if env.clean_home {
+        clean_home(dir, env).unwrap_or_default()
+    } else {
+        Default::default()
+    };
     for (i, step) in plan.steps.iter().enumerate() {
         let mut cmd = match &env.build_cache {
             Some(c) => crate::workflows::use_build_cache(&step.run, c),
@@ -292,7 +496,7 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
                         );
                     }
                 }
-                let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+                let path = proc::full_path();
                 py_env = vec![
                     ("VIRTUAL_ENV".into(), venv.display().to_string()),
                     (
@@ -305,7 +509,8 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             cmd = cmd.replace(" --user", "");
             timeout = timeout.max(900);
         }
-        let mut step_env = step.env.clone();
+        let mut step_env = home_env.clone();
+        step_env.extend(step.env.iter().cloned());
         step_env.extend(py_env.iter().cloned());
         let o = run_step_labelled(
             &wd,
@@ -313,10 +518,11 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             &["-e", "-o", "pipefail", "-c", &cmd],
             env,
             &step_env,
+            &session_vars,
             Some(&label),
             timeout,
         );
-        let out = o.combined();
+        let out = crate::util::strip_ansi(&o.combined());
         let block = format!("$ {label}\n{out}\n");
         transcript.push_str(&block);
         if o.cancelled {
@@ -329,6 +535,7 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             );
         }
         if o.ok() {
+            ran += 1;
             let counts = result_summary(&block)
                 .map(|c| format!(" · {c}"))
                 .unwrap_or_default();
@@ -350,47 +557,87 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             } else {
                 format!("`{tool}`")
             };
-            return finish(&done, TestStatus::Skipped,
-                format!(
-                    "Can't run here: GitHub step \"{}\" needs {shown}, which isn't installed on this computer · {} · GitHub will run it",
-                    step.name,
-                    ran_of(i)
-                ),
-                &block,
-                Some(install_hint(&tool)),
-            );
+            done.push(format!(
+                "Can't run here: {label} (needs {shown}; GitHub runs it)"
+            ));
+            let hint = (!tool.contains(' ')).then(|| install_hint(&tool));
+            cant_run.push((shown, hint));
+            continue;
         }
-        if let (Some(sk), true) = (needs, missing_evidence) {
-            return finish(&done, TestStatus::Skipped,
-                format!(
-                    "Can't run here: GitHub step \"{}\" needs what \"{}\" installs on GitHub · {} · GitHub will run it",
-                    step.name,
-                    sk.name,
-                    ran_of(i)
-                ),
-                &block,
-                sk.run.as_ref().map(|r| {
-                    format!("GitHub installs it with: {}", r.lines().find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).unwrap_or(r).trim())
-                }),
+        // A project's own script that stops because a tool isn't installed
+        // ("shellcheck isn't installed") can't run here either, as long as
+        // nothing actually failed before it.
+        if missing_evidence && needs.is_none() && !real_failure(&block) {
+            let (tool, own_hint) = named_missing_tool(&out);
+            let shown = tool
+                .as_ref()
+                .map(|t| format!("`{t}`"))
+                .unwrap_or_else(|| "a tool it uses".into());
+            let counts = result_summary(&block)
+                .map(|c| format!(", after {c}"))
+                .unwrap_or_default();
+            done.push(format!(
+                "Can't run here: {label} (needs {shown}{counts}; GitHub runs it)"
+            ));
+            let hint = own_hint.or_else(|| tool.as_deref().map(install_hint));
+            cant_run.push((shown, hint));
+            continue;
+        }
+        if let (Some(sk), true) = (needs, missing_evidence && !real_failure(&block)) {
+            let what = format!("what \"{}\" installs on GitHub", sk.name);
+            done.push(format!(
+                "Can't run here: {label} (needs {what}; GitHub runs it)"
+            ));
+            done.extend(
+                crate::logbook::shorten(&out)
+                    .into_iter()
+                    .filter(|l| crate::logbook::is_missing_line(l))
+                    .take(3)
+                    .map(|l| format!("  {}", l.trim())),
             );
+            let hint = sk.run.as_ref().map(|r| {
+                format!(
+                    "GitHub installs it with: {}",
+                    r.lines()
+                        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                        .unwrap_or(r)
+                        .trim()
+                )
+            });
+            cant_run.push((what, hint));
+            continue;
         }
         let what = if o.timed_out { "timed out" } else { "failed" };
         let counts = result_summary(&block)
             .map(|c| format!(" · {}", with_failed_names(c, &block)))
             .unwrap_or_default();
-        let hint = needs.map(|sk| {
-            format!(
-                "This step comes after \"{}\", which only runs on GitHub. If it needs what that step installs, it can't pass here.",
-                sk.name
-            )
-        });
+        let machine = machine_specific(&out, dir, env);
+        // Only mention a skipped install when it could be the cause: tests
+        // that ran (and mostly passed) clearly had what they needed.
+        let ran_tests =
+            result_summary(&block).is_some_and(|c| some_passed(&c)) || real_failure(&block);
+        let hint = if machine {
+            Some("These failures mention things on this computer that GitHub's machine doesn't have, such as a running copy of the app or your home folder. They'll likely pass on GitHub. Quit the running copy and Re-check, or push anyway.".to_string())
+        } else {
+            needs.filter(|_| !ran_tests).map(|sk| {
+                format!(
+                    "This step comes after \"{}\", which only runs on GitHub. If it needs what that step installs, it can't pass here.",
+                    sk.name
+                )
+            })
+        };
+        let note = if machine {
+            format!(" · {MACHINE_SPECIFIC}")
+        } else {
+            String::new()
+        };
         return finish(
             &done,
             TestStatus::Failed,
             format!(
-                "GitHub step \"{}\" {what} · {}{counts}",
+                "GitHub step \"{}\" {what} · {}{counts}{note}",
                 step.name,
-                ran_of(i + 1)
+                ran_of(ran + 1)
             ),
             &block,
             hint,
@@ -404,12 +651,41 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
     } else {
         format!(" · {} GitHub-only skipped", plan.skipped.len())
     };
+    if cant_run.is_empty() {
+        return finish(
+            &done,
+            TestStatus::Passed,
+            format!("Passed: {}{skipped}{counts}", ran_of(ran)),
+            "",
+            None,
+        );
+    }
+    // Everything that could run here passed; a few steps need something this
+    // computer doesn't have. That's a pass with a note, not a problem.
+    let needs: Vec<&str> = cant_run.iter().map(|(w, _)| w.as_str()).collect();
+    let n = cant_run.len();
+    let note = format!(
+        "{n} step{} can't run here (needs {}; GitHub runs {})",
+        if n == 1 { "" } else { "s" },
+        needs.join(", "),
+        if n == 1 { "it" } else { "them" }
+    );
+    let hint = cant_run.iter().find_map(|(_, h)| h.clone());
+    if ran == 0 {
+        return finish(
+            &done,
+            TestStatus::Skipped,
+            format!("Can't run here: {note}{counts}"),
+            "",
+            hint,
+        );
+    }
     finish(
         &done,
         TestStatus::Passed,
-        format!("Passed: {}{skipped}{counts}", ran_of(plan.steps.len())),
+        format!("Passed: {}{counts} · {note}", ran_of(ran)),
         "",
-        None,
+        hint,
     )
 }
 
@@ -427,6 +703,7 @@ fn run_with_act(dir: &Path, env: &TestEnv) -> Option<TestResult> {
         build_cache: None,
         match_github: false,
         exact: false,
+        clean_home: false,
     };
     let o = run_step(dir, "act", &["push", "--rm"], &long);
     let transcript = format!("$ act push --rm\n{}\n", o.combined());
@@ -621,6 +898,7 @@ mod tests {
             build_cache: None,
             match_github: true,
             exact: false,
+            clean_home: true,
         }
     }
 
@@ -737,9 +1015,15 @@ mod tests {
         );
         let log = Logger::new(None);
         let r = run_tests(d.path(), Stack::Python, &env(&log));
-        assert_eq!(r.status, TestStatus::Skipped, "{}", r.summary);
-        assert!(r.summary.starts_with("Can't run here"), "{}", r.summary);
+        // The later steps still ran; the library check is a note, not a failure.
+        assert_eq!(r.status, TestStatus::Passed, "{}", r.summary);
+        assert!(r.summary.contains("can't run here"), "{}", r.summary);
         assert!(r.summary.contains("Install Qt libraries"), "{}", r.summary);
+        assert!(
+            r.tail.contains("Can't run here: [test] Check Qt libraries"),
+            "{}",
+            r.tail
+        );
         assert!(
             r.hint.as_deref().unwrap_or("").contains("apt-get install"),
             "{:?}",
@@ -792,7 +1076,7 @@ mod tests {
             r.tail
         );
         // pytest isn't installed: can't run here, not "your tests failed".
-        assert_eq!(r.status, TestStatus::Skipped, "{}", r.summary);
+        assert_eq!(r.status, TestStatus::Passed, "{}", r.summary);
         assert!(
             r.summary.contains("needs `stowlock-missing-tool`"),
             "{}",
@@ -836,5 +1120,199 @@ mod tests {
             Some("pytest")
         );
         assert_eq!(missing_command("all good").as_deref(), None);
+    }
+
+    fn one_step_project(run: &str) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            format!("on: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Install system libraries\n        run: sudo apt-get install -y libegl1\n      - name: Tests\n        run: |\n{}\n", run.lines().map(|l| format!("          {l}")).collect::<Vec<_>>().join("\n")),
+        )
+        .unwrap();
+        std::fs::write(d.path().join("app.py"), "print(1)\n").unwrap();
+        d
+    }
+
+    #[test]
+    fn github_steps_get_a_fresh_home_without_the_desktop_session() {
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-test-0");
+        let real = std::env::var("HOME").unwrap();
+        // Where the real Rust cache is (kept as it is, even in a fresh home).
+        let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{real}/.cargo"));
+        let d = one_step_project(&format!(
+            "test \"$HOME\" != \"{real}\"\ntest -d \"$XDG_CONFIG_HOME\"\ntest -z \"${{WAYLAND_DISPLAY:-}}\"\ntest -z \"${{DBUS_SESSION_BUS_ADDRESS:-}}\"\ntest \"$CARGO_HOME\" = \"{cargo_home}\""
+        ));
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().to_path_buf());
+        let r = run_tests(d.path(), Stack::Python, &e);
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+        // Off: the real session is seen.
+        let d = one_step_project("test -n \"${WAYLAND_DISPLAY:-}\"");
+        e.clean_home = false;
+        let r = run_tests(d.path(), Stack::Python, &e);
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+    }
+
+    #[test]
+    fn failures_about_this_computer_are_flagged() {
+        let d = one_step_project(
+            "echo \"E  Left over: a demo program is still running (process 2206: /x/.venv/bin/python -m demo --minimized)\"\necho \"1 failed, 10 passed, 2 skipped in 0.52s\"\nexit 1",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Python, &env(&log));
+        assert_eq!(r.status, TestStatus::Failed);
+        assert!(r.summary.contains(MACHINE_SPECIFIC), "{}", r.summary);
+        assert!(
+            r.summary.contains("1 failed, 10 passed"),
+            "pytest -q counts: {}",
+            r.summary
+        );
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("running copy"),
+            "{:?}",
+            r.hint
+        );
+    }
+
+    #[test]
+    fn no_install_note_when_the_tests_ran() {
+        // Like the glass test: tests ran and mostly passed after a GitHub-only
+        // install step, so that step clearly wasn't the cause.
+        let d = one_step_project(
+            "echo \"E  assert False\"\necho \"1 failed, 1158 passed, 6 skipped in 111.63s\"\nexit 1",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Python, &env(&log));
+        assert_eq!(r.status, TestStatus::Failed);
+        assert!(!r.summary.contains(MACHINE_SPECIFIC), "{}", r.summary);
+        assert_eq!(r.hint, None, "{:?}", r.hint);
+        // Nothing ran: the note still helps.
+        let d = one_step_project("echo 'segfault while loading'\nexit 1");
+        let r = run_tests(d.path(), Stack::Python, &env(&log));
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("Install system libraries"),
+            "{:?}",
+            r.hint
+        );
+    }
+
+    #[test]
+    fn a_missing_lint_tool_doesnt_stop_the_other_steps() {
+        // Like the shellcheck report: tests pass, one lint step needs a tool
+        // this computer doesn't have, and the steps after it still run.
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            "on: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Tests\n        run: |\n          echo 'test result: ok. 162 passed; 0 failed; 0 ignored'\n      - name: Check the install and release scripts\n        run: |\n          sh -n install.sh\n          stowlock-shellcheck-not-here install.sh\n      - name: Later step\n        run: touch later-step-ran\n",
+        )
+        .unwrap();
+        std::fs::write(d.path().join("install.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert_eq!(r.status, TestStatus::Passed, "{}", r.summary);
+        assert!(
+            r.summary
+                .starts_with("Passed: Ran 2 of 3 GitHub steps here"),
+            "{}",
+            r.summary
+        );
+        assert!(r.summary.contains("162 passed"), "{}", r.summary);
+        assert!(
+            r.summary
+                .contains("1 step can't run here (needs `stowlock-shellcheck-not-here`"),
+            "{}",
+            r.summary
+        );
+        assert!(
+            d.path().join("later-step-ran").exists(),
+            "stopped at the missing tool"
+        );
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("sudo pacman -S stowlock-shellcheck-not-here")
+        );
+    }
+
+    fn check_script_project(script: &str) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            "on: [push]\njobs:\n  test:\n    name: Tests (Ubuntu)\n    runs-on: ubuntu-latest\n    steps:\n      - name: Run scripts/check.sh (shell scripts, fmt, clippy, tests)\n        run: sh scripts/check.sh\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.path().join("scripts")).unwrap();
+        std::fs::write(d.path().join("scripts/check.sh"), script).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_check_script_that_stops_for_a_missing_tool_cant_run_here() {
+        // Like the report: the project's own check.sh stops (exit 1, in red)
+        // because shellcheck isn't installed.
+        let d = check_script_project(
+            "echo 'test result: ok. 162 passed; 0 failed; 0 ignored'\nprintf '\\033[1;31mCheck failed:\\033[0m shellcheck isn'\\''t installed. Install it with: pip install shellcheck-py==0.11.0.1\\n'\nexit 1\n",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert_eq!(r.status, TestStatus::Skipped, "{}", r.summary);
+        assert!(r.summary.contains("needs `shellcheck`"), "{}", r.summary);
+        assert!(r.summary.contains("162 passed"), "{}", r.summary);
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("pip install shellcheck-py==0.11.0.1")
+        );
+        assert!(
+            !r.tail.contains('\u{1b}'),
+            "colour codes left in: {:?}",
+            r.tail
+        );
+    }
+
+    #[test]
+    fn a_real_failure_with_a_missing_tool_message_still_fails() {
+        let d = check_script_project(
+            "echo 'test result: FAILED. 160 passed; 2 failed; 0 ignored'\necho 'cargo-audit is not installed'\nexit 1\n",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert_eq!(r.status, TestStatus::Failed, "{}", r.summary);
+    }
+
+    #[test]
+    fn names_tools_from_not_installed_messages() {
+        assert_eq!(
+            named_missing_tool("Check failed: shellcheck isn't installed. Install it with: pip install shellcheck-py==1.0.").0.as_deref(),
+            Some("shellcheck")
+        );
+        assert_eq!(
+            named_missing_tool("error: no such command: `audit`")
+                .0
+                .as_deref(),
+            Some("cargo-audit")
+        );
+    }
+
+    #[test]
+    fn a_formatting_diff_that_mentions_a_missing_tool_still_fails() {
+        // The diff's own text said "no such command"; that's code, not a
+        // missing tool, and after a GitHub-only install step it must still fail.
+        let d = one_step_project(
+            "echo 'Diff in /p/src/x.rs at line 3:'\necho '-    named(\"error: no such command: audit\")'\nexit 1",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Rust, &env(&log));
+        assert_eq!(r.status, TestStatus::Failed, "{}", r.summary);
+        assert_eq!(r.hint, None, "{:?}", r.hint);
     }
 }

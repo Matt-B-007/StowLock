@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Every check is in scripts/check.sh: CI runs its sections one by one, so a
+# failure names what broke, and running the script locally gives the same
+# result. Tool versions are pinned (rust-toolchain.toml, shellcheck below).
 name: CI
 
 on:
@@ -6,37 +9,79 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  SHELLCHECK_VERSION: "0.11.0.1"
+
 jobs:
   test:
+    name: Checks (Ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --locked
-      - run: cargo build --release --locked
-      - run: ./target/release/stowlock --self-test
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          TC="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$TC" --profile minimal -c clippy -c rustfmt
+          rustc --version
+      - name: Install the pinned shellcheck
+        run: |
+          python3 -m venv /tmp/tools
+          /tmp/tools/bin/pip install --quiet "shellcheck-py==$SHELLCHECK_VERSION"
+          echo /tmp/tools/bin >> "$GITHUB_PATH"
+      - name: Format (cargo fmt --check)
+        run: sh scripts/check.sh fmt
+      - name: Lint (cargo clippy -D warnings)
+        run: sh scripts/check.sh clippy
+      - name: Tests (cargo test)
+        run: sh scripts/check.sh test
+      - name: Release build (cargo build --release)
+        run: sh scripts/check.sh build
+      - name: Self-test of the release build (--self-test)
+        run: sh scripts/check.sh selftest
+      - name: Check shell scripts (sh -n + shellcheck)
+        run: sh scripts/check.sh shell
 
   # The same checks on an up-to-date Arch Linux (close to CachyOS), with the
-  # newest git and Rust and git's strictest settings, so problems that only
-  # show up on new versions are caught before a release.
+  # newest git and git's strictest settings, then the AUR package is built and
+  # installed from local files.
   arch:
+    name: Checks and AUR package (Arch Linux)
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - name: Install tools
-        run: pacman -Syu --noconfirm --needed rust git github-cli base-devel python
+      - name: Install tools (rustup, git, gh, base-devel, python)
+        run: pacman -Syu --noconfirm --needed rustup git github-cli base-devel python
       - uses: actions/checkout@v4
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          TC="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$TC" --profile minimal -c clippy -c rustfmt
+          rustup default "$TC"
+      - name: Install the pinned shellcheck
+        run: |
+          python -m venv /tmp/tools
+          /tmp/tools/bin/pip install --quiet "shellcheck-py==$SHELLCHECK_VERSION"
+          echo /tmp/tools/bin >> "$GITHUB_PATH"
       - name: Strict git settings
         run: |
           git config --global safe.bareRepository explicit
           git config --global init.defaultBranch main
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Versions
-        run: rustc --version && cargo --version && git --version
-      - run: cargo test --locked
-      - run: cargo build --release --locked
-      - run: ./target/release/stowlock --self-test
-      - name: Build and install the AUR package (from local files)
+        run: rustc --version && cargo --version && git --version && shellcheck --version
+      - name: Format (cargo fmt --check)
+        run: sh scripts/check.sh fmt
+      - name: Lint (cargo clippy -D warnings)
+        run: sh scripts/check.sh clippy
+      - name: Tests (cargo test)
+        run: sh scripts/check.sh test
+      - name: Release build (cargo build --release)
+        run: sh scripts/check.sh build
+      - name: Self-test of the release build (--self-test)
+        run: sh scripts/check.sh selftest
+      - name: Check shell scripts (sh -n + shellcheck)
+        run: sh scripts/check.sh shell
+      - name: Build and install the AUR package (makepkg, from local files)
         run: |
           useradd -m builder
           VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
@@ -54,4 +99,3 @@ jobs:
           test -f /usr/share/applications/stowlock.desktop
           test -f /usr/share/icons/hicolor/scalable/apps/stowlock.svg
           pacman -R --noconfirm "$PKG"
-

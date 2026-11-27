@@ -65,6 +65,8 @@ pub struct Opts {
     pub scrub_env: bool,
     pub env: Vec<(String, String)>,
     pub stdin: Option<String>,
+    /// Variables to leave out (for example the desktop session's).
+    pub env_remove: Vec<String>,
 }
 
 impl Opts {
@@ -155,6 +157,9 @@ pub fn command(program: &str, args: &[&str], opts: &Opts) -> Command {
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GH_PROMPT_DISABLED", "1");
     cmd.env("GH_NO_UPDATE_NOTIFIER", "1");
+    for k in &opts.env_remove {
+        cmd.env_remove(k);
+    }
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }

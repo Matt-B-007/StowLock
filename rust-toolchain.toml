@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# The Rust version CI uses, pinned so a new Rust or clippy release can't make
+# CI fail overnight. Change it on purpose, in a release of its own.
+# (System cargo without rustup, as on Arch, ignores this file.)
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

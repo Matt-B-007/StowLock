@@ -115,11 +115,9 @@ const KEEP: [&str; 2] = ["StowLock", "stowlock"];
 
 pub fn redact(text: &str, rc: &RedactContext) -> String {
     let mut s = redact_secrets(text);
-    // Protect the app's own name (a user's repo may share it).
-    for (i, k) in KEEP.iter().enumerate() {
-        s = s.replace(k, &format!("\u{2}APP{i}\u{2}"));
-    }
-    // Paths: workspace → project-relative, then home → ~.
+    // Paths first: workspace → project-relative, then home → ~. (Before the
+    // app's name is protected, so a home path containing "stowlock" is still
+    // hidden whole.)
     if !rc.workspace.is_empty() {
         s = s.replace(&format!("{}/", rc.workspace), "");
         s = s.replace(&rc.workspace, "<workspace>");
@@ -131,6 +129,10 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
     }
     if !rc.home.is_empty() {
         s = s.replace(&rc.home, "~");
+    }
+    // Protect the app's own name (a user's repo may share it).
+    for (i, k) in KEEP.iter().enumerate() {
+        s = s.replace(k, &format!("\u{2}APP{i}\u{2}"));
     }
     // GitHub URLs → placeholders (handled with the account/repo maps below).
     let mut accounts: Vec<String> = Vec::new();
@@ -249,7 +251,24 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
     }
     s = mac_re().replace_all(&s, "[removed]").into_owned();
     s = ipv6_re().replace_all(&s, "[removed]").into_owned();
-    s = ip_re().replace_all(&s, "[removed]").into_owned();
+    // Version numbers like shellcheck-py==0.11.0.1 or v1.2.3.4 look like IP
+    // addresses; keep those.
+    s = ip_re()
+        .replace_all(&s, |c: &regex::Captures| {
+            let m = c.get(0).unwrap();
+            let before = &s[..m.start()];
+            let version = before.ends_with('=')
+                || before.ends_with('v')
+                || before.ends_with('-')
+                || before.ends_with('@')
+                || before.to_ascii_lowercase().ends_with("version ");
+            if version {
+                m.as_str().to_string()
+            } else {
+                "[removed]".to_string()
+            }
+        })
+        .into_owned();
     s = serial_re().replace_all(&s, "[removed]").into_owned();
     for (i, k) in KEEP.iter().enumerate() {
         s = s.replace(&format!("\u{2}APP{i}\u{2}"), k);
@@ -350,6 +369,9 @@ pub fn privacy_filter(lines: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let (mut files, mut tests) = (0usize, 0usize);
     let mut prefix_for_note = String::new();
+    // A group of left-out lines with no command line before it (the start of
+    // "Latest log lines") takes the time of its first line instead.
+    let mut first_hidden = String::new();
     let flush = |out: &mut Vec<String>, files: &mut usize, tests: &mut usize, prefix: &str| {
         let mut notes = Vec::new();
         if *files > 0 {
@@ -365,7 +387,7 @@ pub fn privacy_filter(lines: &[String]) -> Vec<String> {
             ));
         }
         if !notes.is_empty() {
-            out.push(format!("{prefix}  [{}]", notes.join(", ")));
+            out.push(format!("{}  [{}]", prefix.trim_end(), notes.join(", ")));
         }
         *files = 0;
         *tests = 0;
@@ -375,13 +397,24 @@ pub fn privacy_filter(lines: &[String]) -> Vec<String> {
         let body = bodies[i];
         let is_header = body.starts_with("$ ");
         if is_header {
-            flush(&mut out, &mut files, &mut tests, &prefix_for_note);
+            {
+                let p = if prefix_for_note.is_empty() {
+                    first_hidden.clone()
+                } else {
+                    prefix_for_note.clone()
+                };
+                flush(&mut out, &mut files, &mut tests, &p);
+                first_hidden.clear();
+            }
             prefix_for_note = prefix.to_string();
             out.push(l.clone());
             continue;
         }
         let hidden_marker = body.starts_with('[') && body.contains("hidden]");
         if file_line.is_match(body) || (hidden_marker && prefix.contains("[push]")) {
+            if first_hidden.is_empty() {
+                first_hidden = prefix.to_string();
+            }
             files += 1;
             continue;
         }
@@ -390,16 +423,35 @@ pub fn privacy_filter(lines: &[String]) -> Vec<String> {
                 continue;
             }
             if !keep[i] && !hidden_marker {
+                if first_hidden.is_empty() {
+                    first_hidden = prefix.to_string();
+                }
                 tests += 1;
                 continue;
             }
             out.push(l.clone());
             continue;
         }
-        flush(&mut out, &mut files, &mut tests, &prefix_for_note);
+        {
+            let p = if prefix_for_note.is_empty() {
+                first_hidden.clone()
+            } else {
+                prefix_for_note.clone()
+            };
+            flush(&mut out, &mut files, &mut tests, &p);
+            first_hidden.clear();
+        }
         out.push(l.clone());
     }
-    flush(&mut out, &mut files, &mut tests, &prefix_for_note);
+    {
+        let p = if prefix_for_note.is_empty() {
+            first_hidden.clone()
+        } else {
+            prefix_for_note.clone()
+        };
+        flush(&mut out, &mut files, &mut tests, &p);
+        first_hidden.clear();
+    }
     out
 }
 
@@ -470,9 +522,12 @@ pub fn project_fix_prompt(summary: &str, output: &[String]) -> String {
         .filter(|t| crate::logbook::is_failure_line(t) || t.starts_with("thread '"))
         .take(40)
         .collect();
-    let mut p = String::from(
-        "My project's tests failed when StowLock checked it before pushing to GitHub.\n",
-    );
+    let machine = summary.contains(crate::preflight::MACHINE_SPECIFIC);
+    let mut p = String::from(if machine {
+        "Some of my project's tests fail only on my own computer, not on GitHub's clean machine. The output shows they depend on things on my computer (a running copy of the app, my home folder or desktop settings).\n"
+    } else {
+        "My project's tests failed when StowLock checked it before pushing to GitHub.\n"
+    });
     if !summary.trim().is_empty() {
         p.push_str(&format!("Result: {}\n", summary.trim()));
     }
@@ -482,9 +537,13 @@ pub fn project_fix_prompt(summary: &str, output: &[String]) -> String {
             p.push_str(&format!("  {f}\n"));
         }
     }
-    p.push_str(
-        "Please fix the project so these tests pass, without changing behaviour elsewhere. If a test itself is wrong, explain why before changing it, and give me the updated project as a zip.\n",
-    );
+    if machine {
+        p.push_str("Change the tests so they don't depend on the real machine: give them fakes or fixed values (for example a fake process list or a fixed effects setting). Don't change how the app behaves. Give me the updated project as a zip.\n");
+    } else {
+        p.push_str(
+            "Please fix the project so these tests pass, without changing behaviour elsewhere. If a test itself is wrong, explain why before changing it, and give me the updated project as a zip.\n",
+        );
+    }
     p
 }
 
@@ -1108,5 +1167,57 @@ mod tests {
                 .any(|l| l.contains("Check Qt libraries") || l.contains("missing libraries")),
             "{last:?}"
         );
+    }
+
+    #[test]
+    fn computer_specific_failures_get_a_different_prompt() {
+        let p = project_fix_prompt(
+            &format!(
+                "GitHub step \"Tests\" failed · 1 failed · {}",
+                crate::preflight::MACHINE_SPECIFIC
+            ),
+            &["18:46:59 WARN  [tests]   E  a demo program is still running".to_string()],
+        );
+        assert!(p.contains("don't depend on the real machine"), "{p}");
+        assert!(p.contains("Don't change how the app behaves"), "{p}");
+        assert!(!p.contains("so these tests pass"), "{p}");
+    }
+
+    #[test]
+    fn left_out_notes_keep_their_time() {
+        let lines: Vec<String> = [
+            "18:49:10 INFO  [tests]   collected 1165 items",
+            "18:49:10 INFO  [tests]   tests/test_a.py ....",
+            "18:49:12 INFO  [tests] $ [test] Check libs  (exit Some(0), 16 ms)",
+            "18:49:12 INFO  [tests]   Qt's libraries are there",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let out = privacy_filter(&lines);
+        assert!(out.iter().all(|l| l.starts_with("18:49:")), "{out:?}");
+    }
+
+    #[test]
+    fn version_numbers_arent_taken_for_ip_addresses() {
+        let out = redact(
+            "pip install shellcheck-py==0.11.0.1 (v1.2.3.4) from 192.168.1.20",
+            &rc(),
+        );
+        assert!(out.contains("shellcheck-py==0.11.0.1"), "{out}");
+        assert!(out.contains("v1.2.3.4"), "{out}");
+        assert!(!out.contains("192.168.1.20"), "{out}");
+    }
+
+    #[test]
+    fn a_home_folder_named_after_the_app_is_still_hidden() {
+        let mut c = rc();
+        c.home = "/home/matt/.cache/stowlock/checks/stowlock-home".into();
+        c.workspace = format!("{}/GitHub_Projects", c.home);
+        let out = redact(
+            "Report: /home/matt/.cache/stowlock/checks/stowlock-home/.local/state/stowlock/r.md",
+            &c,
+        );
+        assert_eq!(out, "Report: ~/.local/state/stowlock/r.md");
     }
 }

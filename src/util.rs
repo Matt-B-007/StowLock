@@ -205,6 +205,14 @@ pub fn capitalize(s: &str) -> String {
     }
 }
 
+/// Remove terminal colour codes ("\x1b[1;31m") from program output.
+pub fn strip_ansi(text: &str) -> String {
+    static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07").unwrap())
+        .replace_all(text, "")
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -106,6 +106,9 @@ pub(crate) fn is_important(line: &str) -> bool {
 pub(crate) fn is_missing_line(l: &str) -> bool {
     let l = l.to_ascii_lowercase();
     l.contains("command not found")
+        || l.contains("isn't installed")
+        || l.contains("is not installed")
+        || l.contains("no such command")
         || l.contains("no module named")
         || l.contains("modulenotfounderror")
         || l.contains("cannot open shared object file")
@@ -298,7 +301,7 @@ impl Logger {
                 out.duration.as_millis()
             ),
         );
-        let text = out.combined();
+        let text = crate::util::strip_ansi(&out.combined());
         if !text.is_empty() {
             for l in shorten(&text) {
                 // Only failure lines are warnings; the rest is normal output.

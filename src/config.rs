@@ -117,6 +117,8 @@ pub struct Config {
     pub match_github_checks: bool,
     /// Run the GitHub workflows exactly with act (needs act and Docker).
     pub exact_github_checks: bool,
+    /// Run GitHub steps in a fresh home folder without the desktop session.
+    pub clean_test_home: bool,
     pub report_retention_days: u32,
     /// Advanced: where StowLock checks for its own updates.
     pub update_repo: String,
@@ -143,6 +145,7 @@ impl Default for Config {
             theme: String::new(),
             match_github_checks: true,
             exact_github_checks: false,
+            clean_test_home: true,
             report_retention_days: 30,
             update_repo: UPDATE_REPO.into(),
         }
