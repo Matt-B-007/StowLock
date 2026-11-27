@@ -128,6 +128,8 @@ pub struct Config {
     pub report_retention_days: u32,
     /// Advanced: where StowLock checks for its own updates.
     pub update_repo: String,
+    /// The tour has been shown (it starts by itself only on a new install).
+    pub tour_seen: bool,
 }
 
 impl Default for Config {
@@ -157,13 +159,14 @@ impl Default for Config {
             clean_test_home: true,
             report_retention_days: 30,
             update_repo: UPDATE_REPO.into(),
+            tour_seen: false,
         }
     }
 }
 
 /// The settings layout this build writes. Raise it (and add a step to
 /// `migrate`) whenever a setting is renamed or its meaning changes.
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 /// Keep a backup of the settings at most this often, and this many of them.
 const BACKUP_EVERY_SECS: u64 = 15 * 60;
 const BACKUPS_KEPT: usize = 5;
@@ -175,10 +178,14 @@ fn migrate(mut t: toml::Table) -> toml::Table {
         .and_then(|v| v.as_integer())
         .unwrap_or(0) as u32;
     while v < SETTINGS_VERSION {
-        #[allow(clippy::single_match)]
         match v {
             // 0 → 1: files from before versioning; every setting kept as is.
             0 => {}
+            // 1 → 2: the tour. Someone upgrading already knows the app, so
+            // it doesn't start by itself for them.
+            1 => {
+                t.insert("tour_seen".into(), toml::Value::Boolean(true));
+            }
             _ => {}
         }
         v += 1;
@@ -327,6 +334,9 @@ mod tests {
         let c = Config::load(&paths);
         assert_eq!(c.workspace_dir, "~/Projects");
         assert_eq!(c.settings_version, SETTINGS_VERSION);
+        // Upgraders don't get the tour by themselves; a new install does.
+        assert!(c.tour_seen);
+        assert!(!Config::default().tour_seen);
         // Saving keeps one backup, not one per save.
         c.save(&paths).unwrap();
         c.save(&paths).unwrap();

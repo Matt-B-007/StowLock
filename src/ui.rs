@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Look and feel: light and dark palettes (emerald accent), the Inter font,
+//! Look and feel: House Standard v1.3 light and dark palettes (navy hull,
+//! emerald accent), the Inter font,
 //! Lucide icons, cards, badges, buttons, segmented switches, the step
 //! tracker and toasts.
 #![allow(non_snake_case)]
@@ -34,40 +35,41 @@ const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
-/// Graphite and emerald, dark. Every text colour meets 4.5:1 contrast on
-/// every background it's used on (checked when the palette was chosen).
+/// House Standard v1.3, dark: a navy hull with StowLock's emerald. Filled
+/// buttons carry ink text. Every text colour meets 4.5:1 contrast on every
+/// background it's used on (the tests below check).
 const DARK: Pal = Pal {
-    bg: rgb(0x101113),
-    side: rgb(0x0B0C0E),
-    card: rgb(0x17181B),
-    control: rgb(0x1E2023),
-    hover: rgb(0x25272B),
-    border: rgb(0x2A2C30),
-    text: rgb(0xECEDEF),
-    muted: rgb(0x9EA3AB),
-    accent: rgb(0x5EE6B0),
-    accent_btn: rgb(0x10B981),
-    on_accent: rgb(0x03241A),
-    accent_soft: rgb(0x173528),
+    bg: rgb(0x0F141B),
+    side: rgb(0x0B0F15),
+    card: rgb(0x151B24),
+    control: rgb(0x1B2330),
+    hover: rgb(0x232D3B),
+    border: rgb(0x2A3444),
+    text: rgb(0xE8EDF4),
+    muted: rgb(0x9DA9BA),
+    accent: rgb(0x34D399),
+    accent_btn: rgb(0x34D399),
+    on_accent: rgb(0x0C1016),
+    accent_soft: rgb(0x10302A),
     success: rgb(0x6EE7B7),
     warning: rgb(0xFBBF24),
     error: rgb(0xF87171),
 };
 
-/// Graphite and emerald, light.
+/// House Standard v1.3, light.
 const LIGHT: Pal = Pal {
-    bg: rgb(0xF6F7F8),
-    side: rgb(0xEEF0F2),
+    bg: rgb(0xF5F7FA),
+    side: rgb(0xECF0F5),
     card: rgb(0xFFFFFF),
-    control: rgb(0xF1F3F5),
-    hover: rgb(0xE6E9ED),
-    border: rgb(0xE2E5E9),
-    text: rgb(0x111317),
-    muted: rgb(0x5B6270),
+    control: rgb(0xF0F3F7),
+    hover: rgb(0xE3E8EF),
+    border: rgb(0xDDE3EB),
+    text: rgb(0x0F1622),
+    muted: rgb(0x536175),
     accent: rgb(0x047857),
     accent_btn: rgb(0x047857),
     on_accent: rgb(0xFFFFFF),
-    accent_soft: rgb(0xDDF4EA),
+    accent_soft: rgb(0xDCF3EA),
     success: rgb(0x047857),
     warning: rgb(0x975A06),
     error: rgb(0xB91C1C),
@@ -130,6 +132,14 @@ pub fn ERROR() -> Color32 {
     pal().error
 }
 
+/// Name a widget for screen readers (and the click-through tests) when the
+/// label beside it isn't tied to it.
+pub fn named(resp: egui::Response, name: &str) -> egui::Response {
+    resp.ctx
+        .accesskit_node_builder(resp.id, |n| n.set_label(name));
+    resp
+}
+
 // ------------------------------------------------------------------ icons
 
 /// Lucide icon glyphs (from the bundled, trimmed icon font). Not every
@@ -146,6 +156,8 @@ pub mod icon {
     pub const PACKAGE: &str = "\u{e129}";
     pub const FOLDER: &str = "\u{e0d7}";
     pub const X: &str = "\u{e1b2}";
+    pub const CIRCLE_HELP: &str = "\u{e082}";
+    pub const KEYBOARD: &str = "\u{e284}";
     pub const CIRCLE_CHECK: &str = "\u{e226}";
     pub const CIRCLE_ALERT: &str = "\u{e077}";
     pub const TRIANGLE_ALERT: &str = "\u{e193}";
@@ -297,7 +309,7 @@ pub fn apply_theme(ctx: &egui::Context, light: bool) {
     v.widgets.open.bg_fill = p.hover;
     v.widgets.open.weak_bg_fill = p.hover;
     ctx.set_visuals(v);
-    ctx.style_mut(|s| {
+    ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = Vec2::new(8.0, 8.0);
         s.spacing.button_padding = Vec2::new(14.0, 7.0);
         s.spacing.interact_size.y = 34.0;
@@ -521,7 +533,7 @@ pub fn nav_item(
         }
     }
     // A real, named button for screen readers (and the click-through tests).
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, label));
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if compact {
         resp.on_hover_text(label)
@@ -642,7 +654,7 @@ pub fn toast(ctx: &egui::Context, text: &str, age_secs: f32, bottom_gap: f32) ->
         return false;
     }
     let alpha = ((SHOW - age_secs) / 0.4).clamp(0.0, 1.0);
-    egui::Area::new(egui::Id::new("toast"))
+    egui::Area::new(egui::Id::unique("toast"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-24.0, -bottom_gap))
         .interactable(false)
@@ -721,6 +733,65 @@ mod tests {
                 contrast(p.accent, p.accent_soft) >= 4.5,
                 "{name}: selected nav item"
             );
+            assert!(
+                contrast(p.text, p.hover) >= 4.5,
+                "{name}: text on a hovered row"
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    use super::*;
+
+    /// Every symbol the app writes can be drawn by its fonts (a missing one
+    /// shows as an empty box).
+    #[test]
+    fn every_symbol_in_the_app_has_a_glyph() {
+        let mut chars = std::collections::BTreeSet::new();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    // Only what the app draws: not comments, the tests at the
+                    // end of each file, or the README tree (never on screen).
+                    for line in std::fs::read_to_string(&p).unwrap().lines() {
+                        if line.starts_with("#[cfg(test)]") {
+                            break;
+                        }
+                        if line.trim_start().starts_with("//") {
+                            continue;
+                        }
+                        chars.extend(line.chars().filter(|c| !c.is_ascii()));
+                    }
+                }
+            }
+        }
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .textures_delta
+            .clear();
+        // Box lines for the README's file tree, and the "✕" a test runner
+        // prints (only matched, never drawn).
+        for c in "─│└├✕".chars() {
+            chars.remove(&c);
+        }
+        let missing: Vec<char> = ctx.fonts_mut(|f| {
+            chars
+                .iter()
+                .copied()
+                .filter(|c| {
+                    !f.has_glyph(&egui::FontId::proportional(14.0), *c)
+                        || !f.has_glyph(&egui::FontId::monospace(14.0), *c)
+                })
+                .collect()
+        });
+        assert!(missing.is_empty(), "no glyph for: {missing:?}");
     }
 }

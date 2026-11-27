@@ -142,7 +142,7 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
           git clone "ssh://aur@aur.archlinux.org/$PKG.git" aur-repo
           cp aur/PKGBUILD aur/.SRCINFO aur-repo/
-          cd aur-repo
+          cd aur-repo || exit 1
           git add PKGBUILD .SRCINFO
           if git diff --cached --quiet; then echo "AUR already up to date"; exit 0; fi
           git -c user.name="Matt-B-007" -c user.email="Matt-B-007@users.noreply.github.com" commit -m "Update to $TAG"

@@ -103,11 +103,13 @@ fn cli_report(paths: &AppPaths) -> Result<PathBuf, String> {
 fn quick_self_test(paths: &AppPaths) -> Result<(), String> {
     let ctx = eframe::egui::Context::default();
     ui::install_fonts(&ctx);
-    let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
-        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+    let mut out = ctx.run_ui(eframe::egui::RawInput::default(), |root| {
+        eframe::egui::CentralPanel::default().show(root, |ui| {
             ui.label(format!("StowLock {APP_VERSION} {}", ui::icon::REFRESH));
         });
     });
+    // Nothing draws this frame: let go of the font pictures on purpose.
+    out.textures_delta.clear();
     let rgba = icon::rgba(64);
     if rgba.len() != 64 * 64 * 4 {
         return Err("the app icon didn't render".into());

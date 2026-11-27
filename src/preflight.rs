@@ -239,11 +239,12 @@ const SESSION_VARS: &[&str] = &[
 /// Variables to set, and variables to leave out.
 type EnvChanges = (Vec<(String, String)>, Vec<String>);
 
-fn clean_home(dir: &Path, env: &TestEnv) -> Option<EnvChanges> {
+fn clean_home(dir: &Path, env: &TestEnv, job: &str) -> Option<EnvChanges> {
     let real = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    // Each job its own fresh home, like GitHub's separate machines.
     let home = match &env.build_cache {
-        Some(c) => c.join("stowlock-home"),
-        None => python_env_dir(dir, env).with_extension("home"),
+        Some(c) => c.join("stowlock-home").join(job_folder(job)),
+        None => python_env_dir(dir, env, job).with_extension("home"),
     };
     let _ = std::fs::remove_dir_all(&home);
     let runtime = home.join(".run");
@@ -291,12 +292,32 @@ fn clean_home(dir: &Path, env: &TestEnv) -> Option<EnvChanges> {
 
 /// The failures mention this computer itself (a running program, your real
 /// home folder), not the project: they'd likely pass on GitHub.
+/// Where cargo and rustup keep downloaded libraries and toolchains.
+fn tool_homes() -> Vec<PathBuf> {
+    let home = std::env::var("HOME").ok().filter(|h| h.len() > 1);
+    let mut out = Vec::new();
+    for (var, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+        if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            out.push(PathBuf::from(v));
+        }
+        if let Some(h) = &home {
+            out.push(Path::new(h).join(default));
+        }
+    }
+    out
+}
+
 fn machine_specific(output: &str, dir: &Path, env: &TestEnv) -> bool {
     let mut text = output.to_string();
     // The project's own folder and StowLock's cache are expected in paths.
     text = text.replace(&dir.display().to_string(), "<project>");
     if let Some(c) = &env.build_cache {
         text = text.replace(&c.display().to_string(), "<cache>");
+    }
+    // So are Rust's own folders: a panic inside a library names its source
+    // under ~/.cargo/registry, which says nothing about this computer.
+    for tool_home in tool_homes() {
+        text = text.replace(&format!("{}/", tool_home.display()), "<tools>/");
     }
     let lower = text.to_ascii_lowercase();
     let running = regex::Regex::new(r"(?i)(still running|already running|\(process \d+|\bpid \d+)")
@@ -433,19 +454,42 @@ fn install_hint(tool: &str) -> String {
 fn tools_dir(dir: &Path, env: &TestEnv) -> PathBuf {
     match env.build_cache.as_ref().and_then(|c| c.parent()) {
         Some(p) => p.join("stowlock-tools"),
-        None => python_env_dir(dir, env).with_extension("tools"),
+        None => python_env_dir(dir, env, "tools").with_extension("tools"),
     }
 }
 
 /// StowLock's own Python environment for a project's pip installs.
-fn python_env_dir(dir: &Path, env: &TestEnv) -> PathBuf {
+/// A folder name for a job ("Tests (Ubuntu)" → "tests-ubuntu").
+fn job_folder(job: &str) -> String {
+    let mut out = String::new();
+    for c in job.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "job".into()
+    } else {
+        out
+    }
+}
+
+/// StowLock's own Python environment for one job's pip installs.
+fn python_env_dir(dir: &Path, env: &TestEnv, job: &str) -> PathBuf {
     match &env.build_cache {
-        Some(c) => c.join("stowlock-venv"),
+        Some(c) => c.join("stowlock-venv").join(job_folder(job)),
         None => {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             dir.hash(&mut h);
-            std::env::temp_dir().join(format!("stowlock-venv-{:x}", h.finish()))
+            std::env::temp_dir().join(format!(
+                "stowlock-venv-{:x}-{}",
+                h.finish(),
+                job_folder(job)
+            ))
         }
     }
 }
@@ -458,6 +502,16 @@ fn missing(tool: &str, pkg: &str) -> TestResult {
 }
 
 /// Run the checks for a stack. Steps stop at the first failure.
+/// A GitHub step that failed here (the check goes on with the other jobs).
+struct StepFailure {
+    step: String,
+    what: String,
+    counts: String,
+    note: String,
+    block: String,
+    hint: Option<String>,
+}
+
 /// Run the project's GitHub workflow steps here, as GitHub would.
 fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestResult {
     let start = Instant::now();
@@ -511,12 +565,32 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
     // copy StowLock built earlier never hides the version you installed.
     let mut tool_paths: Vec<PathBuf> = Vec::new();
     let mut ran = 0usize;
-    let (home_env, session_vars) = if env.clean_home {
-        clean_home(dir, env).unwrap_or_default()
-    } else {
-        Default::default()
-    };
+    // GitHub runs each job on its own clean machine, and a failing job doesn't
+    // stop the others: here each job gets its own fresh home and Python
+    // environment, and a failure only stops the rest of its own job.
+    let mut current_job: Option<String> = None;
+    let mut home_env: Vec<(String, String)> = Vec::new();
+    let mut session_vars: Vec<String> = Vec::new();
+    let mut failed_jobs: Vec<String> = Vec::new();
+    let mut failures: Vec<StepFailure> = Vec::new();
     for (i, step) in plan.steps.iter().enumerate() {
+        if current_job.as_deref() != Some(step.job.as_str()) {
+            current_job = Some(step.job.clone());
+            py_env.clear();
+            tool_paths.clear();
+            (home_env, session_vars) = if env.clean_home {
+                clean_home(dir, env, &step.job).unwrap_or_default()
+            } else {
+                Default::default()
+            };
+        }
+        if failed_jobs.contains(&step.job) {
+            done.push(format!(
+                "Not run: [{}] {} (an earlier step in this job failed)",
+                step.job, step.name
+            ));
+            continue;
+        }
         let mut cmd = match &env.build_cache {
             Some(c) => crate::workflows::use_build_cache(&step.run, c),
             None => step.run.clone(),
@@ -530,7 +604,7 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         if step.python_deps {
             // pip installs go into StowLock's own environment, never system-wide.
             if py_env.is_empty() {
-                let venv = python_env_dir(dir, env);
+                let venv = python_env_dir(dir, env, &step.job);
                 // A fresh environment every check, as on GitHub, so nothing
                 // built by an earlier check (an older version of the project)
                 // can stand in. pip's download cache keeps this quick.
@@ -750,16 +824,65 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         } else {
             String::new()
         };
+        ran += 1;
+        done.push(format!("Failed: {label}"));
+        failed_jobs.push(step.job.clone());
+        failures.push(StepFailure {
+            step: step.name.clone(),
+            what: what.to_string(),
+            counts,
+            note,
+            block,
+            hint,
+        });
+    }
+    // Each job's result, when there's more than one ("test failed, rust passed").
+    let mut job_order: Vec<&str> = Vec::new();
+    for st in &plan.steps {
+        if !job_order.contains(&st.job.as_str()) {
+            job_order.push(&st.job);
+        }
+    }
+    let jobs_line = if job_order.len() > 1 {
+        let each: Vec<String> = job_order
+            .iter()
+            .map(|j| {
+                let state = if failed_jobs.iter().any(|f| f == j) {
+                    "failed"
+                } else if done
+                    .iter()
+                    .any(|d| d.starts_with(&format!("Passed: [{j}]")))
+                {
+                    "passed"
+                } else {
+                    "couldn't run here"
+                };
+                format!("{j} {state}")
+            })
+            .collect();
+        format!(" · jobs: {}", each.join(", "))
+    } else {
+        String::new()
+    };
+    if let Some(first) = failures.first() {
+        let blocks: Vec<String> = failures.iter().map(|f| f.block.clone()).collect();
         return finish(
             &done,
             TestStatus::Failed,
             format!(
-                "GitHub step \"{}\" {what} · {}{counts}{note}",
-                step.name,
-                ran_of(ran + 1)
+                "GitHub step \"{}\" {} · {}{}{}{jobs_line}",
+                first.step,
+                first.what,
+                ran_of(ran),
+                first.counts,
+                failures
+                    .iter()
+                    .map(|f| f.note.as_str())
+                    .find(|n| !n.is_empty())
+                    .unwrap_or("")
             ),
-            &block,
-            hint,
+            &blocks.join("\n"),
+            failures.iter().find_map(|f| f.hint.clone()),
         );
     }
     let counts = result_summary(&transcript)
@@ -775,7 +898,7 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         return finish(
             &done,
             TestStatus::Passed,
-            format!("Passed: {}{skipped}{counts}", ran_of(ran)),
+            format!("Passed: {}{skipped}{counts}{jobs_line}", ran_of(ran)),
             "",
             None,
         );
@@ -803,7 +926,7 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
     finish(
         &done,
         TestStatus::Passed,
-        format!("Passed: {}{counts} · {note}", ran_of(ran)),
+        format!("Passed: {}{counts} · {note}{jobs_line}", ran_of(ran)),
         "",
         hint,
     )
@@ -1215,7 +1338,7 @@ mod tests {
         let r = run_tests(d.path(), Stack::Python, &e);
         // pip ran in StowLock's own environment, and later steps use it.
         assert!(
-            cache.path().join("stowlock-venv/bin/python").exists(),
+            cache.path().join("stowlock-venv/test/bin/python").exists(),
             "{} {}",
             r.summary,
             r.tail
@@ -1331,6 +1454,22 @@ mod tests {
             "{:?}",
             r.hint
         );
+    }
+
+    #[test]
+    fn a_panic_inside_a_rust_library_isnt_about_this_computer() {
+        // From a real report: a test failed inside egui_kittest, whose source
+        // lives under ~/.cargo/registry. That's a real failure, not this computer.
+        let home = std::env::var("HOME").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let e = env(&log);
+        let lib = format!(
+            "thread 'ui' panicked at {home}/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/egui_kittest-0.37.0/src/lib.rs:520:18:\n5 widget(s) lack accessible name"
+        );
+        assert!(!machine_specific(&lib, d.path(), &e), "{lib}");
+        let mine = format!("Error: can't read {home}/Documents/settings.json");
+        assert!(machine_specific(&mine, d.path(), &e), "{mine}");
     }
 
     #[test]
@@ -1665,7 +1804,7 @@ mod tests {
         );
         // Something an earlier check left in the environment…
         std::fs::write(
-            cache.path().join("stowlock-venv/stale-from-last-check"),
+            cache.path().join("stowlock-venv/t/stale-from-last-check"),
             "old build",
         )
         .unwrap();
@@ -1683,5 +1822,49 @@ mod tests {
         let i = parts.iter().position(|s| *s == local).unwrap();
         let usr = parts.iter().position(|s| *s == "/usr/bin").unwrap();
         assert!(usr < i, "{p}");
+    }
+
+    #[test]
+    fn a_failing_job_doesnt_stop_the_others_and_each_job_starts_clean() {
+        // Like Sluice: the "test" job fails, the "rust" job still runs, and
+        // the jobs don't share a home folder.
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            "on: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Leave a mark\n        run: touch \"$HOME/from-test-job\"\n      - name: Tests\n        run: |\n          echo '1 failed, 10 passed in 0.5s'\n          exit 1\n      - name: After the failure\n        run: touch after-failure-ran\n  rust:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Engine tests\n        run: |\n          test ! -e \"$HOME/from-test-job\"\n          touch rust-job-ran\n          echo 'test result: ok. 5 passed; 0 failed'\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().to_path_buf());
+        let r = run_tests(d.path(), Stack::Rust, &e);
+        assert_eq!(r.status, TestStatus::Failed, "{}", r.summary);
+        assert!(
+            d.path().join("rust-job-ran").exists(),
+            "the rust job didn't run: {}",
+            r.tail
+        );
+        assert!(
+            !d.path().join("after-failure-ran").exists(),
+            "the failed job kept going"
+        );
+        assert!(
+            r.summary.contains("GitHub step \"Tests\" failed"),
+            "{}",
+            r.summary
+        );
+        assert!(
+            r.summary.contains("jobs: test failed, rust passed"),
+            "{}",
+            r.summary
+        );
+        assert!(
+            r.tail.contains("Not run: [test] After the failure"),
+            "{}",
+            r.tail
+        );
     }
 }

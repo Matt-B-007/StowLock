@@ -1,14 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="StowLock">
-  <rect width="256" height="256" rx="60" fill="#181C24"/>
-  <rect x="52" y="58" width="152" height="148" rx="24" fill="#38BDF8"/>
-  <path d="M52 104 V82 A24 24 0 0 1 76 58 H180 A24 24 0 0 1 204 82 V104 Z" fill="#34D399"/>
-  <g fill="#181C24">
-    <rect x="52" y="104" width="152" height="7"/>
-    <rect x="116" y="119" width="12" height="8" rx="2"/>
-    <rect x="128" y="127" width="12" height="8" rx="2"/>
-    <rect x="116" y="135" width="12" height="8" rx="2"/>
-    <rect x="128" y="143" width="12" height="8" rx="2"/>
-    <circle cx="128" cy="169" r="15"/>
-    <polygon points="121,174 135,174 140,194 116,194" stroke="#181C24" stroke-width="4" stroke-linejoin="round"/>
+  <rect width="256" height="256" rx="56" fill="#0F1620"/>
+  <rect x="40" y="44" width="176" height="172" rx="28" fill="#38BDF8"/>
+  <path d="M40 96 V72 A28 28 0 0 1 68 44 H188 A28 28 0 0 1 216 72 V96 Z" fill="#34D399"/>
+  <g fill="#0F1620">
+    <rect x="40" y="96" width="176" height="12"/>
+    <circle cx="128" cy="150" r="24"/>
+    <polygon points="114,158 142,158 150,196 106,196"/>
   </g>
 </svg>

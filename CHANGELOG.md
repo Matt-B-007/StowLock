@@ -4,6 +4,31 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.2.0-beta.1] - 2026-11-27
+
+The family look, keyboard shortcuts and a tour, a newer egui underneath, and checks that behave more like GitHub.
+
+### Fixed
+- **Each workflow job gets its own fresh setup,** as on GitHub's separate machines: its own clean home folder and its own Python environment. One job can't leave anything behind for another.
+- **One failing job no longer stops the others.** Only the rest of the failing job is skipped (and listed as "Not run"). The other jobs still run, and the result says how each job went, for example "jobs: test failed, rust passed".
+- **Copying from the checks card hides private things,** the same way bug reports do. "Copy output" copies the result and output with your name, folders and other private things hidden. The checks text can no longer be copied by selecting it with the mouse, which would have skipped the hiding.
+- A few symbols drew as empty boxes. Every symbol the app uses is now checked against its fonts by a test.
+- **Every text field and dropdown has a name a screen reader can say** (several in Settings and Stage had none). A test now checks every screen.
+- **A test failing inside a Rust library is no longer called "specific to this computer".** Paths under `~/.cargo` and `~/.rustup` are where libraries and toolchains live, so they say nothing about your computer.
+
+### Added
+- **Help menu** at the bottom of the sidebar: find a command, keyboard shortcuts, the tour, bug report, check for updates, and the version.
+- **Keyboard shortcuts:** Ctrl+K finds any command by typing. Ctrl+1 to Ctrl+5 go to Stage, Projects, History, Health and Bug report. Ctrl+, opens Settings, Ctrl+O opens a zip, F1 lists every shortcut, and Esc closes the palette, the list or the tour.
+- **A short tour** of the window. It starts by itself only on a new install; if you're upgrading, you can take it any time from Help.
+
+### Changed
+- **House Standard v1.3 colours:** a navy base with StowLock's emerald (#34D399 dark, #047857 light). Filled buttons use ink text in dark mode and white in light. Every text colour is tested for at least 4.5:1 contrast in both themes, including on hovered rows.
+- **A bolder icon that still reads at 16 px:** a bigger keyhole, a thicker lid line, no small teeth, and a navy background.
+- **The bug report's main actions are Save… and Copy.** "Keep a copy" and "Open on GitHub…" come after them, and GitHub still asks first because issues are public.
+- **egui 0.31 → 0.37** (the toolkit StowLock is drawn with).
+- **The window's code is split into smaller files** (Stage, Projects, Health, Settings, the action bar and so on). Nothing changes in use; all the click-through tests pass unchanged.
+- Settings files move to layout version 2, migrated on their own.
+
 ## [0.1.0-beta.11] - 2026-11-27
 
 Fixes from real use, one-click tool installs, and a sturdier core.

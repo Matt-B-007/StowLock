@@ -1,6 +1,6 @@
 [package]
 name = "stowlock"
-version = "0.1.0-beta.11"
+version = "0.2.0-beta.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Drop in a project zip, get a clean, tested GitHub repo, with old versions neatly archived."
@@ -10,7 +10,7 @@ keywords = ["github", "git", "zip", "egui", "linux"]
 categories = ["development-tools"]
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["glow", "wayland", "x11", "accesskit", "default_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "accesskit", "default_fonts"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
@@ -28,7 +28,7 @@ minisign-verify = "0.3.0"
 ureq = { version = "2", default-features = false, features = ["tls", "native-certs"] }
 
 [dev-dependencies]
-egui_kittest = { version = "0.31.1", features = ["eframe"] }
+egui_kittest = { version = "0.37", features = ["eframe"] }
 minisign = "0.10.0"
 
 [profile.release]

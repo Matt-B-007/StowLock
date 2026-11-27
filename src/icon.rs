@@ -2,7 +2,7 @@
 //! The window icon, drawn in code from the same shapes as
 //! `assets/stowlock.svg` (so no image libraries are needed).
 
-const BG: [u8; 3] = [0x18, 0x1C, 0x24];
+const BG: [u8; 3] = [0x0F, 0x16, 0x20];
 const SKY: [u8; 3] = [0x38, 0xBD, 0xF8];
 const EMERALD: [u8; 3] = [0x34, 0xD3, 0x99];
 
@@ -19,41 +19,31 @@ fn in_rect(x: f32, y: f32, rx: f32, ry: f32, w: f32, h: f32) -> bool {
     x >= rx && x <= rx + w && y >= ry && y <= ry + h
 }
 
+/// The keyhole: bold enough to still read at 16 px.
 fn in_keyhole(x: f32, y: f32) -> bool {
-    if (x - 128.0).powi(2) + (y - 169.0).powi(2) <= 15.0f32.powi(2) {
+    if (x - 128.0).powi(2) + (y - 150.0).powi(2) <= 24.0f32.powi(2) {
         return true;
     }
-    // Trapezoid 121,174 → 135,174 → 140,194 → 116,194, grown by ~2.
-    if (172.0..=196.0).contains(&y) {
-        let t = ((y - 174.0) / 20.0).clamp(0.0, 1.0);
-        let left = 121.0 - 5.0 * t - 2.0;
-        let right = 135.0 + 5.0 * t + 2.0;
-        return x >= left && x <= right;
+    // Stem 114,158 → 142,158 → 150,196 → 106,196.
+    if (158.0..=196.0).contains(&y) {
+        let t = (y - 158.0) / 38.0;
+        return x >= 114.0 - 8.0 * t && x <= 142.0 + 8.0 * t;
     }
     false
 }
 
-/// Colour at a point in the 256×256 design, or None for transparent.
+/// Colour at a point in the 256×256 design (same shapes as
+/// `assets/stowlock.svg`), or None for transparent.
 fn sample(x: f32, y: f32) -> Option<[u8; 3]> {
-    if !in_rrect(x, y, 0.0, 0.0, 256.0, 256.0, 60.0) {
+    if !in_rrect(x, y, 0.0, 0.0, 256.0, 256.0, 56.0) {
         return None;
     }
-    let teeth = [
-        (116.0, 119.0),
-        (128.0, 127.0),
-        (116.0, 135.0),
-        (128.0, 143.0),
-    ];
-    let dark = in_rect(x, y, 52.0, 104.0, 152.0, 7.0)
-        || teeth
-            .iter()
-            .any(|(tx, ty)| in_rect(x, y, *tx, *ty, 12.0, 8.0))
-        || in_keyhole(x, y);
-    if in_rrect(x, y, 52.0, 58.0, 152.0, 148.0, 24.0) {
+    if in_rrect(x, y, 40.0, 44.0, 176.0, 172.0, 28.0) {
+        let dark = in_rect(x, y, 40.0, 96.0, 176.0, 12.0) || in_keyhole(x, y);
         if dark {
             return Some(BG);
         }
-        return Some(if y < 104.0 { EMERALD } else { SKY });
+        return Some(if y < 96.0 { EMERALD } else { SKY });
     }
     Some(BG)
 }
@@ -104,9 +94,20 @@ mod tests {
     fn draws_expected_colours() {
         let px = rgba(256);
         let at = |x: usize, y: usize| &px[(y * 256 + x) * 4..(y * 256 + x) * 4 + 4];
-        assert_eq!(&at(128, 80)[..3], &EMERALD, "lid");
+        assert_eq!(&at(128, 70)[..3], &EMERALD, "lid");
         assert_eq!(&at(70, 180)[..3], &SKY, "body");
-        assert_eq!(&at(128, 169)[..3], &BG, "keyhole");
+        assert_eq!(&at(128, 150)[..3], &BG, "keyhole");
         assert_eq!(at(1, 1)[3], 0, "rounded corner is transparent");
+    }
+
+    /// Writes previews at 16, 32 and 128 px when STOWLOCK_ICON_PREVIEW names
+    /// a folder (raw RGBA; used to check the icon still reads when small).
+    #[test]
+    fn previews_when_asked() {
+        if let Ok(dir) = std::env::var("STOWLOCK_ICON_PREVIEW") {
+            for size in [16, 32, 128] {
+                std::fs::write(format!("{dir}/icon-{size}.rgba"), rgba(size)).unwrap();
+            }
+        }
     }
 }
