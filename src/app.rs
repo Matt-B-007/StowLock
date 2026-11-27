@@ -3435,9 +3435,13 @@ impl App {
                     let (txt, col) = match c.tests.status {
                         TestStatus::Passed => ("Tests passed", SUCCESS()),
                         TestStatus::Failed => ("Tests failed", ERROR()),
+                        TestStatus::Skipped if c.tests.summary.starts_with("Can't run here") => {
+                            ("Can't run here", WARNING())
+                        }
                         TestStatus::Skipped => ("Tests skipped", MUTED()),
                         TestStatus::Cancelled => ("Tests cancelled", WARNING()),
                     };
+                    let cant_run = txt == "Can't run here";
                     ui.horizontal_wrapped(|ui| {
                         ui::badge(ui, txt, col);
                         ui.label(ui::muted(format!(
@@ -3446,9 +3450,25 @@ impl App {
                             c.tests.duration.as_secs_f32()
                         )));
                     });
+                    if cant_run {
+                        ui.add(
+                            egui::Label::new(
+                                "Something this step needs isn't on this computer, so it couldn't run here. That doesn't mean your project is broken. Install what's missing and Re-check, or push: GitHub runs this step with everything installed, and StowLock watches the build.",
+                            )
+                            .wrap(),
+                        );
+                        if c.tests.summary.contains("`") {
+                            ui.add(
+                                egui::Label::new(ui::muted(
+                                    "If it's a Python tool, listing it in the project's requirements file lets StowLock install it here too, in its own environment.",
+                                ).size(12.5))
+                                .wrap(),
+                            );
+                        }
+                    }
                     if let Some(h) = &c.tests.hint {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(ui::mono(h));
+                            ui.add(egui::Label::new(ui::mono(h)).wrap());
                             if ui.small_button("Copy").clicked() {
                                 ui.ctx().copy_text(h.clone());
                             }

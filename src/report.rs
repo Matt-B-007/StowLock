@@ -80,10 +80,7 @@ fn serial_re() -> &'static Regex {
 fn gh_url_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(
-            r"(?:https?://|git@)github\.com[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?\b",
-        )
-        .unwrap()
+        Regex::new(r"(?:https?://|git@)github\.com[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)").unwrap()
     })
 }
 
@@ -161,10 +158,18 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
             list.len()
         }
     };
-    let url_owners: Vec<(String, String)> = gh_url_re()
+    // Whole repo names only (my-app-preflight is not my-app), longest first,
+    // so a name inside another can't leave part of the longer one behind.
+    let mut url_owners: Vec<(String, String)> = gh_url_re()
         .captures_iter(&s)
-        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .map(|c| {
+            let repo = c[2].trim_end_matches('.');
+            let repo = repo.strip_suffix(".git").unwrap_or(repo);
+            (c[1].to_string(), repo.to_string())
+        })
         .collect();
+    url_owners.sort_by_key(|(o, r)| std::cmp::Reverse(o.len() + r.len()));
+    url_owners.dedup();
     for (owner, repo) in &url_owners {
         let is_org = rc.orgs.iter().any(|o| o.eq_ignore_ascii_case(owner));
         let owner_ph = if is_org {
@@ -210,8 +215,10 @@ pub fn redact(text: &str, rc: &RedactContext) -> String {
     for (i, org) in rc.orgs.iter().enumerate() {
         s = replace_word(&s, org, &format!("<org-{}>", i + 1));
     }
-    let names = repo_names.clone();
-    for (i, name) in names.iter().enumerate() {
+    let mut names: Vec<(usize, String)> = repo_names.iter().cloned().enumerate().collect();
+    names.sort_by_key(|(_, n)| std::cmp::Reverse(n.len()));
+    for (i, name) in names.iter() {
+        let (i, name) = (*i, name);
         s = replace_word(&s, name, &format!("<repo-{}>", i + 1));
     }
     // Kept (opted-in) GitHub logins must survive the Linux username/host rules.
@@ -393,6 +400,26 @@ pub fn privacy_filter(lines: &[String]) -> Vec<String> {
         out.push(l.clone());
     }
     flush(&mut out, &mut files, &mut tests, &prefix_for_note);
+    out
+}
+
+/// The most recent failing test command and its lines (nothing from earlier
+/// runs), for the AI fix prompt.
+pub fn last_failure_block(lines: &[String]) -> Vec<String> {
+    let is_header = |l: &str| split_line(l).1.trim_start().starts_with("$ ");
+    let Some(start) = lines
+        .iter()
+        .rposition(|l| is_header(l) && split_line(l).0.contains("[tests]"))
+    else {
+        return Vec::new();
+    };
+    let mut out = vec![lines[start].clone()];
+    for l in &lines[start + 1..] {
+        if is_header(l) || !split_line(l).0.contains("[tests]") {
+            break;
+        }
+        out.push(l.clone());
+    }
     out
 }
 
@@ -587,10 +614,21 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
             f.name == "Pre-flight tests"
                 && !crate::health::counts_against_stowlock(&f.name, &f.detail)
         });
-    if !project_tests.is_empty() {
+    // Only when the latest check of the project failed (not an older one).
+    let latest_check_failed = all_steps
+        .iter()
+        .rev()
+        .find(|st| st.name == "Pre-flight tests")
+        .is_some_and(|st| st.status == StepStatus::Failed);
+    if !project_tests.is_empty() && latest_check_failed {
         s.push_str("\n## AI fix prompt (for your project)\n\n```text\n");
-        let summary = project_tests[0].detail.lines().next().unwrap_or("");
-        s.push_str(&project_fix_prompt(summary, &problems));
+        // The latest failed check, and only the step that failed in it.
+        let summary = project_tests
+            .last()
+            .map(|t| t.detail.lines().next().unwrap_or(""))
+            .unwrap_or("");
+        let last = last_failure_block(&privacy_filter(&input.problem_lines));
+        s.push_str(&project_fix_prompt(summary, &last));
         s.push_str("```\n");
     }
     if !stowlock_faults.is_empty() || input.panic.is_some() {
@@ -1007,5 +1045,68 @@ mod tests {
                 && text.contains("Failed")
         );
         assert!(!text.contains("matt") && !text.contains("sluice"));
+    }
+
+    #[test]
+    fn a_repo_name_inside_another_never_leaks() {
+        let mut c = rc();
+        c.repos = vec![("Sluice".into(), false), ("Sluice-Preflight".into(), true)];
+        let text = "Push Matt-B-007/Sluice-Preflight v0.1.0\n\
+            From https://github.com/Matt-B-007/Sluice-Preflight\n\
+            To https://github.com/Matt-B-007/Sluice-Preflight.git\n\
+            https://github.com/Matt-B-007/Sluice/releases/tag/v1\n\
+            Loaded ~/Downloads/sluice-preflight-v0.1.0.zip and sluice-v2.zip";
+        let out = redact(text, &c);
+        assert!(!out.to_lowercase().contains("preflight"), "{out}");
+        assert!(!out.to_lowercase().contains("sluice"), "{out}");
+        // One repo, one label, everywhere.
+        let labels: std::collections::BTreeSet<&str> = out
+            .match_indices("<repo-")
+            .map(|(i, _)| &out[i..i + 8])
+            .collect();
+        assert_eq!(labels.len(), 2, "{out}");
+        let preflight = out
+            .lines()
+            .next()
+            .unwrap()
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(out.lines().nth(1).unwrap().ends_with(&preflight), "{out}");
+    }
+
+    #[test]
+    fn the_ai_prompt_uses_only_the_latest_failure() {
+        let lines: Vec<String> = [
+            "18:07:46 WARN  [tests] $ [test] Check Qt libraries  (exit Some(1), 26 ms)",
+            "18:07:46 WARN  [tests]   ::error title=The test machine is missing libraries",
+            "18:22:33 WARN  [tests] $ [test] Tests  (exit Some(127), 3 ms)",
+            "18:22:33 WARN  [tests]   bash: line 1: pytest: command not found",
+            "18:22:33 INFO  [tests]   tests/test_secret_feature.py private detail",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let kept = privacy_filter(&lines);
+        assert!(
+            kept.iter().any(|l| l.contains("pytest: command not found")),
+            "{kept:?}"
+        );
+        assert!(
+            !kept.iter().any(|l| l.contains("secret_feature")),
+            "{kept:?}"
+        );
+        let last = last_failure_block(&kept);
+        assert!(last[0].contains("[test] Tests"), "{last:?}");
+        assert!(
+            !last
+                .iter()
+                .any(|l| l.contains("Check Qt libraries") || l.contains("missing libraries")),
+            "{last:?}"
+        );
     }
 }

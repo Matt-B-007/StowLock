@@ -16,6 +16,9 @@ pub struct PlanStep {
     pub env: Vec<(String, String)>,
     /// Relative to the project folder.
     pub workdir: Option<String>,
+    /// Installs Python packages with pip: run here in StowLock's own
+    /// throwaway environment, never system-wide.
+    pub python_deps: bool,
 }
 
 /// A step only GitHub can run, and why.
@@ -24,6 +27,18 @@ pub struct Skipped {
     pub job: String,
     pub name: String,
     pub why: String,
+    /// The command (for "install it yourself" hints), when it's a run step.
+    pub run: Option<String>,
+    /// How many steps to run here came before it (so a later failure can
+    /// tell it may depend on this skipped step).
+    pub before: usize,
+}
+
+impl Skipped {
+    /// A skipped step that installs things the later steps may need.
+    pub fn is_install(&self) -> bool {
+        self.why.starts_with("installs")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -115,9 +130,39 @@ fn env_of(v: &serde_yaml::Value) -> Vec<(String, String)> {
     out
 }
 
+/// pip installs StowLock can run here in its own environment.
+fn pip_words() -> [&'static str; 4] {
+    [
+        "pip install",
+        "pip3 install",
+        "-m pip install",
+        "pipx install",
+    ]
+}
+
+/// A step that only installs Python packages with pip (nothing system-wide).
+pub fn is_python_install(run: &str) -> bool {
+    let r = run.to_ascii_lowercase();
+    let mut rest = r.clone();
+    for w in pip_words() {
+        rest = rest.replace(w, " ");
+    }
+    pip_words().iter().any(|w| r.contains(w))
+        && !r.contains("pipx install")
+        && github_only_inner(&rest).is_none()
+        && !r.contains("${{")
+}
+
 /// Why a `run:` command only works on GitHub, if it doesn't work here.
 fn github_only(run: &str) -> Option<&'static str> {
-    let r = run.to_ascii_lowercase();
+    if is_python_install(run) {
+        return None;
+    }
+    github_only_inner(&run.to_ascii_lowercase())
+}
+
+fn github_only_inner(r: &str) -> Option<&'static str> {
+    let r = r.to_string();
     if r.contains("${{") {
         return Some("uses GitHub's own variables");
     }
@@ -196,6 +241,8 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                 job: name.clone(),
                 name: "whole file".into(),
                 why: "couldn't be read".into(),
+                run: None,
+                before: plan.steps.len(),
             });
             continue;
         };
@@ -232,10 +279,13 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                             .get("name")
                             .and_then(s)
                             .unwrap_or_else(|| st.get("run").and_then(s).unwrap_or("step"));
+                        let before = plan.steps.len();
                         plan.skipped.push(Skipped {
                             job: job_name.clone(),
                             name: first_line(n),
                             why: why.to_string(),
+                            run: None,
+                            before,
                         });
                     }
                 }
@@ -269,6 +319,8 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                             job: job_name.clone(),
                             name: n.to_string(),
                             why: "a GitHub Action (runs only on GitHub)".into(),
+                            run: None,
+                            before: plan.steps.len(),
                         });
                     }
                     continue;
@@ -298,6 +350,8 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                         job: job_name.clone(),
                         name: step_name,
                         why: why.into(),
+                        run: Some(run.to_string()),
+                        before: plan.steps.len(),
                     });
                     continue;
                 }
@@ -317,6 +371,7 @@ pub fn plan(dir: &Path) -> Option<Plan> {
                     job: job_name.clone(),
                     name: step_name,
                     run: run.to_string(),
+                    python_deps: is_python_install(run),
                     env,
                     workdir,
                 });

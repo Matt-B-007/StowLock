@@ -147,9 +147,22 @@ fn run_step_with(
     env: &TestEnv,
     extra: &[(String, String)],
 ) -> Output {
+    run_step_labelled(dir, program, args, env, extra, None, env.timeout_secs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_step_labelled(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    env: &TestEnv,
+    extra: &[(String, String)],
+    label: Option<&str>,
+    timeout_secs: u64,
+) -> Output {
     let opts = Opts {
         cwd: Some(dir.to_path_buf()),
-        timeout: Some(Duration::from_secs(env.timeout_secs)),
+        timeout: Some(Duration::from_secs(timeout_secs)),
         cancel: Some(env.cancel.clone()),
         scrub_env: !env.pass_env,
         env: {
@@ -163,8 +176,46 @@ fn run_step_with(
         stdin: None,
     };
     let o = proc::run(program, args, &opts);
-    env.log.command("tests", &o);
+    match label {
+        Some(l) => env.log.command_as("tests", l, &o),
+        None => env.log.command("tests", &o),
+    }
     o
+}
+
+/// The command a "command not found" line names.
+fn missing_command(output: &str) -> Option<String> {
+    output.lines().find_map(|l| {
+        let l = l.trim();
+        let rest = l.strip_suffix(": command not found")?;
+        let name = rest.rsplit(": ").next()?.trim();
+        (!name.is_empty() && !name.contains(' ')).then(|| name.to_string())
+    })
+}
+
+/// How to get a missing tool on CachyOS / Arch.
+fn install_hint(tool: &str) -> String {
+    const PY: [&str; 8] = [
+        "pytest", "ruff", "black", "mypy", "flake8", "pylint", "tox", "isort",
+    ];
+    if PY.contains(&tool) {
+        format!("sudo pacman -S python-{tool}")
+    } else {
+        format!("sudo pacman -S {tool}")
+    }
+}
+
+/// StowLock's own Python environment for a project's pip installs.
+fn python_env_dir(dir: &Path, env: &TestEnv) -> PathBuf {
+    match &env.build_cache {
+        Some(c) => c.join("stowlock-venv"),
+        None => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            dir.hash(&mut h);
+            std::env::temp_dir().join(format!("stowlock-venv-{:x}", h.finish()))
+        }
+    }
 }
 
 fn missing(tool: &str, pkg: &str) -> TestResult {
@@ -178,6 +229,8 @@ fn missing(tool: &str, pkg: &str) -> TestResult {
 /// Run the project's GitHub workflow steps here, as GitHub would.
 fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestResult {
     let start = Instant::now();
+    // What the earlier steps did, one line each; the failing step in full.
+    let mut done: Vec<String> = Vec::new();
     let mut transcript = String::new();
     let skipped_note = || -> String {
         if plan.skipped.is_empty() {
@@ -189,20 +242,28 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         }
         n
     };
-    let finish = |status: TestStatus, summary: String, transcript: &str| TestResult {
-        status,
-        summary,
-        tail: format!(
-            "{}{}",
-            crate::logbook::shorten(transcript).join("\n"),
-            skipped_note()
-        ),
-        duration: start.elapsed(),
-        hint: None,
-    };
+    let finish =
+        |done: &[String], status: TestStatus, summary: String, last: &str, hint: Option<String>| {
+            let mut tail = done.join("\n");
+            if !last.is_empty() {
+                if !tail.is_empty() {
+                    tail.push('\n');
+                }
+                tail.push_str(&crate::logbook::shorten(last).join("\n"));
+            }
+            tail.push_str(&skipped_note());
+            TestResult {
+                status,
+                summary,
+                tail,
+                duration: start.elapsed(),
+                hint,
+            }
+        };
     let ran_of = |n: usize| format!("Ran {n} of {} GitHub steps here", plan.total());
+    let mut py_env: Vec<(String, String)> = Vec::new();
     for (i, step) in plan.steps.iter().enumerate() {
-        let cmd = match &env.build_cache {
+        let mut cmd = match &env.build_cache {
             Some(c) => crate::workflows::use_build_cache(&step.run, c),
             None => step.run.clone(),
         };
@@ -210,37 +271,130 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             Some(w) if !w.contains("..") => dir.join(w),
             _ => dir.to_path_buf(),
         };
-        let o = run_step_with(
+        let label = format!("[{}] {}", step.job, step.name);
+        let mut timeout = env.timeout_secs;
+        if step.python_deps {
+            // pip installs go into StowLock's own environment, never system-wide.
+            if py_env.is_empty() {
+                let venv = python_env_dir(dir, env);
+                if !venv.join("bin").join("python").exists() {
+                    let v = venv.display().to_string();
+                    let o = run_step_with(dir, "python3", &["-m", "venv", &v], env, &[]);
+                    if !o.ok() {
+                        return finish(&done, TestStatus::Skipped,
+                            format!(
+                                "Can't run here: StowLock couldn't make a Python environment for \"{}\" · {}",
+                                step.name,
+                                ran_of(i)
+                            ),
+                            &format!("$ python3 -m venv\n{}", o.combined()),
+                            Some("sudo pacman -S python".into()),
+                        );
+                    }
+                }
+                let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+                py_env = vec![
+                    ("VIRTUAL_ENV".into(), venv.display().to_string()),
+                    (
+                        "PATH".into(),
+                        format!("{}:{path}", venv.join("bin").display()),
+                    ),
+                    ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
+                ];
+            }
+            cmd = cmd.replace(" --user", "");
+            timeout = timeout.max(900);
+        }
+        let mut step_env = step.env.clone();
+        step_env.extend(py_env.iter().cloned());
+        let o = run_step_labelled(
             &wd,
             "bash",
             &["-e", "-o", "pipefail", "-c", &cmd],
             env,
-            &step.env,
+            &step_env,
+            Some(&label),
+            timeout,
         );
-        transcript.push_str(&format!(
-            "$ [{}] {}\n{}\n",
-            step.job,
-            step.name,
-            o.combined()
-        ));
+        let out = o.combined();
+        let block = format!("$ {label}\n{out}\n");
+        transcript.push_str(&block);
         if o.cancelled {
-            return finish(TestStatus::Cancelled, "Cancelled".into(), &transcript);
-        }
-        if !o.ok() {
-            let what = if o.timed_out { "timed out" } else { "failed" };
-            let counts = result_summary(&transcript)
-                .map(|c| format!(" · {}", with_failed_names(c, &transcript)))
-                .unwrap_or_default();
             return finish(
-                TestStatus::Failed,
-                format!(
-                    "GitHub step \"{}\" {what} · {}{counts}",
-                    step.name,
-                    ran_of(i + 1)
-                ),
-                &transcript,
+                &done,
+                TestStatus::Cancelled,
+                "Cancelled".into(),
+                &block,
+                None,
             );
         }
+        if o.ok() {
+            let counts = result_summary(&block)
+                .map(|c| format!(" · {c}"))
+                .unwrap_or_default();
+            done.push(format!("Passed: {label}{counts}"));
+            continue;
+        }
+        // Something this step needs isn't on this computer: it can't run here,
+        // which isn't the same as the project's tests failing.
+        let needs = plan
+            .skipped
+            .iter()
+            .rev()
+            .find(|sk| sk.job == step.job && sk.is_install() && sk.before <= i);
+        let missing_evidence = out.lines().any(crate::logbook::is_missing_line);
+        if o.code == Some(127) {
+            let tool = missing_command(&out).unwrap_or_else(|| "a command it uses".into());
+            let shown = if tool.contains(' ') {
+                tool.clone()
+            } else {
+                format!("`{tool}`")
+            };
+            return finish(&done, TestStatus::Skipped,
+                format!(
+                    "Can't run here: GitHub step \"{}\" needs {shown}, which isn't installed on this computer · {} · GitHub will run it",
+                    step.name,
+                    ran_of(i)
+                ),
+                &block,
+                Some(install_hint(&tool)),
+            );
+        }
+        if let (Some(sk), true) = (needs, missing_evidence) {
+            return finish(&done, TestStatus::Skipped,
+                format!(
+                    "Can't run here: GitHub step \"{}\" needs what \"{}\" installs on GitHub · {} · GitHub will run it",
+                    step.name,
+                    sk.name,
+                    ran_of(i)
+                ),
+                &block,
+                sk.run.as_ref().map(|r| {
+                    format!("GitHub installs it with: {}", r.lines().find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).unwrap_or(r).trim())
+                }),
+            );
+        }
+        let what = if o.timed_out { "timed out" } else { "failed" };
+        let counts = result_summary(&block)
+            .map(|c| format!(" · {}", with_failed_names(c, &block)))
+            .unwrap_or_default();
+        let hint = needs.map(|sk| {
+            format!(
+                "This step comes after \"{}\", which only runs on GitHub. If it needs what that step installs, it can't pass here.",
+                sk.name
+            )
+        });
+        return finish(
+            &done,
+            TestStatus::Failed,
+            format!(
+                "GitHub step \"{}\" {what} · {}{counts}",
+                step.name,
+                ran_of(i + 1)
+            ),
+            &block,
+            hint,
+        );
     }
     let counts = result_summary(&transcript)
         .map(|c| format!(" · {c}"))
@@ -251,9 +405,11 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         format!(" · {} GitHub-only skipped", plan.skipped.len())
     };
     finish(
+        &done,
         TestStatus::Passed,
         format!("Passed: {}{skipped}{counts}", ran_of(plan.steps.len())),
-        &transcript,
+        "",
+        None,
     )
 }
 
@@ -556,5 +712,129 @@ mod tests {
             "{}",
             r.summary
         );
+    }
+
+    fn qt_like_project(check_step: &str) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let wf = d.path().join(".github/workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(
+            wf.join("ci.yml"),
+            format!(
+                "on: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-python@v5\n      - name: Earlier step\n        run: echo EARLIER-OUTPUT\n      - name: Install Qt libraries\n        run: sudo apt-get install -y libegl1 libxkbcommon0\n{check_step}      - name: Install Python packages\n        run: pip install --user -r requirements.txt\n      - name: Uses the environment\n        run: test -n \"$VIRTUAL_ENV\" && command -v python | grep -q stowlock-venv\n      - name: Tests\n        run: QT_QPA_PLATFORM=offscreen stowlock-missing-tool -q\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(d.path().join("requirements.txt"), "# nothing to install\n").unwrap();
+        std::fs::write(d.path().join("app.py"), "print(1)\n").unwrap();
+        d
+    }
+
+    #[test]
+    fn a_step_needing_a_github_only_install_cant_run_here() {
+        let d = qt_like_project(
+            "      - name: Check Qt libraries\n        run: |\n          echo 'libEGL.so.1: cannot open shared object file'\n          exit 1\n",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Python, &env(&log));
+        assert_eq!(r.status, TestStatus::Skipped, "{}", r.summary);
+        assert!(r.summary.starts_with("Can't run here"), "{}", r.summary);
+        assert!(r.summary.contains("Install Qt libraries"), "{}", r.summary);
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("apt-get install"),
+            "{:?}",
+            r.hint
+        );
+        // Only the failing step's output in full; earlier steps as one line.
+        assert!(!r.tail.contains("EARLIER-OUTPUT"), "{}", r.tail);
+        assert!(r.tail.contains("Passed: [test] Earlier step"), "{}", r.tail);
+        assert!(
+            r.tail.contains("cannot open shared object file"),
+            "{}",
+            r.tail
+        );
+    }
+
+    #[test]
+    fn pip_installs_run_privately_and_a_missing_tool_cant_run_here() {
+        if proc::run(
+            "python3",
+            &["-c", "import venv, ensurepip"],
+            &Opts::default_timeout(),
+        )
+        .code
+            != Some(0)
+        {
+            return;
+        }
+        let d = qt_like_project("");
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().to_path_buf());
+        e.timeout_secs = 300;
+        let r = run_tests(d.path(), Stack::Python, &e);
+        // pip ran in StowLock's own environment, and later steps use it.
+        assert!(
+            cache.path().join("stowlock-venv/bin/python").exists(),
+            "{} {}",
+            r.summary,
+            r.tail
+        );
+        assert!(
+            r.tail.contains("Passed: [test] Install Python packages"),
+            "{}",
+            r.tail
+        );
+        assert!(
+            r.tail.contains("Passed: [test] Uses the environment"),
+            "{}",
+            r.tail
+        );
+        // pytest isn't installed: can't run here, not "your tests failed".
+        assert_eq!(r.status, TestStatus::Skipped, "{}", r.summary);
+        assert!(
+            r.summary.contains("needs `stowlock-missing-tool`"),
+            "{}",
+            r.summary
+        );
+        assert!(
+            r.summary.contains("Ran 3 of 5 GitHub steps here"),
+            "{}",
+            r.summary
+        );
+        assert!(install_hint("pytest").contains("sudo pacman -S python-pytest"));
+    }
+
+    #[test]
+    fn a_real_failure_after_a_skipped_install_still_fails() {
+        let d = qt_like_project(
+            "      - name: Lint\n        run: echo 'style problem in app.py' && exit 3\n",
+        );
+        let log = Logger::new(None);
+        let r = run_tests(d.path(), Stack::Python, &env(&log));
+        assert_eq!(r.status, TestStatus::Failed, "{}", r.summary);
+        assert!(
+            r.summary.contains("GitHub step \"Lint\" failed"),
+            "{}",
+            r.summary
+        );
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("only runs on GitHub"),
+            "{:?}",
+            r.hint
+        );
+    }
+
+    #[test]
+    fn names_the_missing_command() {
+        assert_eq!(
+            missing_command("bash: line 1: pytest: command not found\n").as_deref(),
+            Some("pytest")
+        );
+        assert_eq!(missing_command("all good").as_deref(), None);
     }
 }

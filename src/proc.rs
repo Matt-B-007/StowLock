@@ -214,10 +214,15 @@ pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
         let _ = se.read_to_end(&mut v);
         v
     });
+    // Check often at first (most commands finish in a few milliseconds),
+    // then settle at every 25 ms for long ones.
+    let mut pause = Duration::from_millis(1);
+    let mut ended = None;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 out.code = status.code();
+                ended = Some(start.elapsed());
                 break;
             }
             Ok(None) => {}
@@ -239,7 +244,8 @@ pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
                 break;
             }
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(25));
     }
     out.stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
     out.stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
@@ -249,7 +255,7 @@ pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
             "\n[stowlock] stopped after {secs} seconds (timeout)"
         ));
     }
-    out.duration = start.elapsed();
+    out.duration = ended.unwrap_or_else(|| start.elapsed());
     out
 }
 
@@ -355,5 +361,12 @@ mod tests {
         std::env::set_var("STOWLOCK_TEST_SECRET", "abc");
         let o = run("sh", &["-c", "echo ${STOWLOCK_TEST_SECRET:-none}"], &opts);
         assert_eq!(o.stdout.trim(), "none");
+    }
+
+    #[test]
+    fn quick_commands_are_timed_honestly() {
+        let o = run("true", &[], &Opts::default_timeout());
+        assert!(o.ok());
+        assert!(o.duration < Duration::from_millis(20), "{:?}", o.duration);
     }
 }

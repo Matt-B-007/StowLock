@@ -101,9 +101,22 @@ pub(crate) fn is_important(line: &str) -> bool {
         || is_failure_message(&l)
 }
 
+/// Something the project needs isn't on this computer. These lines name a
+/// tool, module or library, never the project's own code, so reports keep them.
+pub(crate) fn is_missing_line(l: &str) -> bool {
+    let l = l.to_ascii_lowercase();
+    l.contains("command not found")
+        || l.contains("no module named")
+        || l.contains("modulenotfounderror")
+        || l.contains("cannot open shared object file")
+        || l.contains("missing librar")
+        || (l.contains("not found") && l.contains("no such file"))
+}
+
 /// The lines that say *what* failed: assertion messages and their values.
 fn is_failure_message(l: &str) -> bool {
-    l.starts_with("assertion")
+    is_missing_line(l)
+        || l.starts_with("assertion")
         || l.starts_with("left:")
         || l.starts_with("right:")
         || l.starts_with("e  ")
@@ -264,6 +277,15 @@ impl Logger {
     }
 
     /// Log a finished command: the command line, then its output (trimmed).
+    /// Log a command under a readable name (a GitHub step's name instead of
+    /// its whole script).
+    pub fn command_as(&self, stage: &str, label: &str, out: &crate::proc::Output) {
+        let mut o = out.clone();
+        o.program = label.to_string();
+        o.args.clear();
+        self.command(stage, &o);
+    }
+
     pub fn command(&self, stage: &str, out: &crate::proc::Output) {
         let lvl = if out.ok() { Level::Info } else { Level::Warn };
         self.log(

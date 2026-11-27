@@ -4,6 +4,20 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.1.0-beta.7] - 2026-11-26
+
+### Fixed
+- **A missing tool no longer counts as your tests failing.** When a GitHub step needs a command that isn't installed here (exit code 127, for example `pytest`), Stage & check says "Can't run here", names the command and shows how to install it. The push isn't blocked: GitHub runs the step with everything installed, and StowLock watches the build. (Before beta.5, StowLock skipped pytest when it wasn't installed; matching GitHub's steps lost that.)
+- A step that checks the result of an install step only GitHub can run (for example, a Qt library check after `apt-get install`) is marked "Can't run here" when it fails for something missing, instead of "your tests failed". A different failure after such a step still fails, with a note.
+- **The AI fix prompt uses only the step that just failed.** It no longer includes output from earlier runs. Check output now shows earlier steps as one line each and the failing step in full.
+- **Bug reports no longer reveal part of a private repo name** when one repo name contains another (for example `name` and `name-Preflight`). Repo names are matched whole and longest first, so each repo keeps one label.
+- Bug reports keep the lines that explain a failure ("command not found", "No module named …", missing libraries). The rest of your project's output stays private.
+- Logs show a GitHub step's name ("[test] Tests") instead of its whole script.
+- Quick commands are timed correctly (they all showed about 26 ms) and finish without the extra wait.
+
+### Changed
+- **Python packages are installed the way GitHub does.** Steps like `pip install -r requirements.txt` now run here too, in StowLock's own Python environment for the project, never system-wide. Later steps use that environment.
+
 ## [0.1.0-beta.6] - 2026-11-26
 
 ### Changed
