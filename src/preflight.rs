@@ -146,7 +146,7 @@ fn github_fonts_conf(dir: &Path, env: &TestEnv, system_fonts: &Path) -> Option<P
 /// Does the failure look like text or layout that depends on the font?
 fn font_related(output: &str) -> bool {
     regex::Regex::new(
-        r"(?i)(text cut off|cut off|elid|truncat|font|glyph|too (wide|narrow|small)|doesn't fit|does not fit|overflow)",
+        r"(?i)(text cut off|\bcut off\b|doesn't fit|does not fit|not enough (room|space)|\bglyph|\belided\b|font (not found|missing|fallback))",
     )
     .unwrap()
     .is_match(output)
@@ -415,6 +415,14 @@ fn machine_specific(output: &str, dir: &Path, env: &TestEnv) -> bool {
         .filter(|h| h.len() > 1)
         .is_some_and(|h| lower.contains(&format!("{}/", h.to_ascii_lowercase())));
     running || home
+}
+
+/// Did any tests fail? ("1 failed, 1190 passed")
+fn some_failed(text: &str) -> bool {
+    regex::Regex::new(r"(\d+) failed")
+        .unwrap()
+        .captures_iter(text)
+        .any(|c| c[1].parse::<u64>().unwrap_or(0) > 0)
 }
 
 /// Did any tests pass? ("1154 passed", "75 passed, 0 failed")
@@ -902,7 +910,12 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
             .map(|c| format!(" · {}", with_failed_names(c, &block)))
             .unwrap_or_default();
         let machine = machine_specific(&out, dir, env);
-        let fonts = env.github_fonts && !fonts_missing && font_related(&block);
+        // Only a failing test can be a font difference (a build or tool
+        // problem never is), and only with font-shaped words in the output.
+        let fonts = env.github_fonts
+            && !fonts_missing
+            && (!failed_tests(&block).is_empty() || some_failed(&block))
+            && font_related(&block);
         // Only mention a skipped install when it could be the cause: tests
         // that ran (and mostly passed) clearly had what they needed.
         let ran_tests =
@@ -1083,6 +1096,57 @@ fn run_with_act(dir: &Path, env: &TestEnv) -> Option<TestResult> {
 }
 
 pub fn run_tests(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
+    // Builds go to StowLock's cache, but scripts often run
+    // ./target/release/<app> (as on GitHub, where the build is in ./target).
+    // While the check runs, ./target points at the cache; it's removed after,
+    // so it's never committed. A real ./target of your own is used as is.
+    let own_target = dir.join("target");
+    let real_target = own_target.is_dir() && !own_target.is_symlink();
+    let local = TestEnv {
+        timeout_secs: env.timeout_secs,
+        cancel: env.cancel.clone(),
+        pass_env: env.pass_env,
+        log: env.log,
+        build_cache: env.build_cache.clone().filter(|_| !real_target),
+        match_github: env.match_github,
+        exact: env.exact,
+        clean_home: env.clean_home,
+        github_fonts: env.github_fonts,
+    };
+    let _link = local
+        .build_cache
+        .as_ref()
+        .and_then(|c| TargetLink::make(dir, c));
+    run_tests_inner(dir, stack, &local)
+}
+
+/// `./target` pointing at the build cache for the length of a check.
+struct TargetLink(PathBuf);
+
+impl TargetLink {
+    fn make(dir: &Path, cache: &Path) -> Option<Self> {
+        let link = dir.join("target");
+        if link.is_symlink() {
+            // Left from a check that was stopped: replace it.
+            std::fs::remove_file(&link).ok()?;
+        } else if link.exists() {
+            return None;
+        }
+        std::fs::create_dir_all(cache).ok()?;
+        std::os::unix::fs::symlink(cache, &link).ok()?;
+        Some(TargetLink(link))
+    }
+}
+
+impl Drop for TargetLink {
+    fn drop(&mut self) {
+        if self.0.is_symlink() {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+fn run_tests_inner(dir: &Path, stack: Stack, env: &TestEnv) -> TestResult {
     if env.exact {
         if let Some(r) = run_with_act(dir, env) {
             return r;
@@ -1520,6 +1584,43 @@ mod tests {
         .unwrap();
         std::fs::write(d.path().join("app.py"), "print(1)\n").unwrap();
         d
+    }
+
+    #[test]
+    fn only_failing_tests_with_text_that_doesnt_fit_are_font_differences() {
+        assert!(font_related(
+            "('tile', 'text cut off', 'tilename', 'Broadcast', 87, 75)"
+        ));
+        assert!(!font_related("FAILED: self-test: the program wasn't built"));
+        assert!(!font_related("test fonts::loads_bundled_inter ... ok"));
+        assert!(!font_related("warning: integer overflow"));
+    }
+
+    #[test]
+    fn scripts_find_the_build_in_target() {
+        // Like CachyPlay: the check script runs ./target/release/<app>, while
+        // StowLock builds in its cache. ./target must lead to the build during
+        // the check, and be gone after (never committed).
+        let d = one_step_project(
+            "mkdir -p \"$CARGO_TARGET_DIR/release\" && echo built > \"$CARGO_TARGET_DIR/release/app\"\ncat ./target/release/app\necho \"1 passed\"",
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let log = Logger::new(None);
+        let mut e = env(&log);
+        e.build_cache = Some(cache.path().join("build"));
+        let r = run_tests(d.path(), Stack::Python, &e);
+        assert_eq!(r.status, TestStatus::Passed, "{} {}", r.summary, r.tail);
+        // (cat would have failed the step if ./target didn't lead to the build.)
+        assert!(
+            !d.path().join("target").exists(),
+            "./target is removed after the check"
+        );
+        assert!(!d.path().join("target").is_symlink());
+        // A real ./target of the project's own is left alone and used.
+        std::fs::create_dir_all(d.path().join("target/release")).unwrap();
+        let r = run_tests(d.path(), Stack::Python, &e);
+        assert!(d.path().join("target").is_dir() && !d.path().join("target").is_symlink());
+        let _ = r;
     }
 
     #[test]

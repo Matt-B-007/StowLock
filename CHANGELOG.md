@@ -4,6 +4,13 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.2.0-beta.5] - 2026-11-27
+
+### Fixed
+- **Check scripts find the build in `./target`.** StowLock builds in its own cache folder so builds stay quick and the project folder stays clean, but scripts that run `./target/release/<app>` (as on GitHub) couldn't find it ("No such file or directory"). CachyPlay's release self-test and Stream Preflight's self-test ("the program wasn't built") failed this way. While a check runs, `./target` now leads to the cache, and it's removed when the check ends, so it's never committed. If the project has a real `./target` of its own, that one is used.
+- **"Looks like a font difference" only when it is one.** It's now said only when tests actually failed and their output mentions text that doesn't fit ("text cut off", "doesn't fit", a missing glyph). A build or tool problem, like Stream Preflight's "the program wasn't built", is no longer called a font difference.
+- **Cleaner repo names from zip names.** Words like "source", "src", "code", "project", "full", "complete" or "files" at the end are dropped, so "Gimbot 0.1.0 beta.14 source.zip" becomes `gimbot` for a new project (an existing Gimbot repo was already matched in 0.2.0-beta.4).
+
 ## [0.2.0-beta.4] - 2026-11-27
 
 ### Fixed

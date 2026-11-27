@@ -34,7 +34,7 @@ fn suffix_patterns() -> &'static Vec<Regex> {
             r"(?i)[\s_-]*\((v?\d+(\.\d+)*)\)$",
             r"(?i)[\s_-]+v?\d+(\.\d+)+([\s._-]?(beta|alpha|rc)([.\-]?\d+)?)?$",
             r"(?i)[\s_-]+v\d+$",
-            r"(?i)[\s_-]+(main|master|beta|final|backup|latest)$",
+            r"(?i)[\s_-]+(main|master|beta|final|backup|latest|source|src|code|project|full|complete|files)$",
             r"(?i)[\s_-]+\d{4}-\d{2}-\d{2}([\s_-]\d{4,6})?$",
         ]
         .iter()
@@ -535,6 +535,16 @@ mod tests {
             Some("stream-preflight")
         );
         assert_eq!(m("gimbotics.zip"), None, "a different name");
+        // The real one.
+        assert_eq!(
+            m("Gimbot 0.1.0 beta.14 source.zip").as_deref(),
+            Some("Gimbot")
+        );
+        assert_eq!(
+            slug_from_filename("Gimbot 0.1.0 beta.14 source.zip"),
+            "gimbot"
+        );
+        assert_eq!(slug_from_filename("my-app-v2.1-full-source.zip"), "my-app");
         assert_eq!(m("brand-new-app.zip"), None);
         assert_eq!(slug_from_filename("sluice-v2.zip"), "sluice");
         assert_eq!(slug_from_filename("My Cool App (v2).zip"), "my-cool-app");
