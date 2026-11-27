@@ -70,7 +70,17 @@ pub const MACHINE_SPECIFIC: &str = "looks specific to this computer";
 /// Added to a test summary when the failures look like a font difference.
 pub const FONT_SPECIFIC: &str = "looks like a font difference";
 
-/// The DejaVu fonts on this computer (what GitHub's Ubuntu machine has).
+/// A font GitHub's Ubuntu machine also has: DejaVu Sans, Serif and Mono
+/// (fonts-dejavu-core), Liberation (fonts-liberation) and Noto Color Emoji
+/// (fonts-noto-color-emoji).
+fn github_runner_font(name: &str) -> bool {
+    let ttf = name.ends_with(".ttf");
+    (ttf && name.starts_with("DejaVu") && !name.contains("Math"))
+        || (ttf && name.starts_with("Liberation"))
+        || name.starts_with("NotoColorEmoji")
+}
+
+/// The fonts on this computer that GitHub's Ubuntu machine has too.
 fn dejavu_fonts(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
@@ -85,10 +95,7 @@ fn dejavu_fonts(root: &Path) -> Vec<PathBuf> {
             } else if p
                 .file_name()
                 .and_then(|n| n.to_str())
-                // Sans, Serif and Mono, as in Ubuntu's fonts-dejavu-core (not Math).
-                .is_some_and(|n| {
-                    n.starts_with("DejaVu") && n.ends_with(".ttf") && !n.contains("Math")
-                })
+                .is_some_and(github_runner_font)
             {
                 out.push(p);
             }
@@ -100,17 +107,21 @@ fn dejavu_fonts(root: &Path) -> Vec<PathBuf> {
 
 /// Are the DejaVu fonts installed (for the tools list)?
 pub fn has_dejavu(root: &Path) -> bool {
-    !dejavu_fonts(root).is_empty()
+    dejavu_fonts(root).iter().any(|f| {
+        f.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("DejaVu"))
+    })
 }
 
 /// A fontconfig file that offers only DejaVu, like GitHub's machine. Fonts a
 /// project bundles still work when the app loads them itself (as it must on
 /// GitHub too). None when DejaVu isn't installed (pacman: ttf-dejavu).
 fn github_fonts_conf(dir: &Path, env: &TestEnv, system_fonts: &Path) -> Option<PathBuf> {
-    let fonts = dejavu_fonts(system_fonts);
-    if fonts.is_empty() {
+    if !has_dejavu(system_fonts) {
         return None;
     }
+    let fonts = dejavu_fonts(system_fonts);
     let base = match &env.build_cache {
         Some(c) => c.join("stowlock-fonts"),
         None => python_env_dir(dir, env, "fonts").with_extension("fonts"),
@@ -897,7 +908,7 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
         let ran_tests =
             result_summary(&block).is_some_and(|c| some_passed(&c)) || real_failure(&block);
         let hint = if fonts {
-            Some("This looks like a font difference. StowLock ran it with only the fonts GitHub's machine has (DejaVu), so it would fail on GitHub too. The project should bundle its fonts and load them at startup, and let text that might not fit shorten with a tooltip. Copy for AI asks for that.".to_string())
+            Some("This looks like a font difference. StowLock ran it with only the fonts GitHub's machine has (DejaVu, Liberation and emoji), so it would fail on GitHub too. The project should bundle its fonts and load them at startup, and let text that might not fit shorten with a tooltip. Copy for AI asks for that.".to_string())
         } else if machine {
             Some("These failures mention things on this computer that GitHub's machine doesn't have, such as a running copy of the app or your home folder. They'll likely pass on GitHub. Quit the running copy and Re-check, or push anyway.".to_string())
         } else {
@@ -1516,7 +1527,14 @@ mod tests {
         // A fake system font folder: DejaVu plus a font GitHub doesn't have.
         let sys = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(sys.path().join("TTF")).unwrap();
-        for f in ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf", "Inter-Regular.ttf"] {
+        for f in [
+            "DejaVuSans.ttf",
+            "DejaVuSans-Bold.ttf",
+            "DejaVuMathTeXGyre.ttf",
+            "LiberationSans-Regular.ttf",
+            "Inter-Regular.ttf",
+            "NotoSans-Regular.ttf",
+        ] {
             std::fs::write(sys.path().join("TTF").join(f), b"font").unwrap();
         }
         let cache = tempfile::tempdir().unwrap();
@@ -1533,7 +1551,14 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["DejaVuSans-Bold.ttf", "DejaVuSans.ttf"]);
+        assert_eq!(
+            names,
+            [
+                "DejaVuSans-Bold.ttf",
+                "DejaVuSans.ttf",
+                "LiberationSans-Regular.ttf"
+            ]
+        );
         // With the real fontconfig: only DejaVu, and other families fall back to it.
         if proc::which("fc-match").is_some() {
             let real = tempfile::tempdir().unwrap();

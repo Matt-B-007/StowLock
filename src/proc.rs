@@ -200,6 +200,30 @@ pub fn command(program: &str, args: &[&str], opts: &Opts) -> Command {
     cmd
 }
 
+/// Stop a command and everything it started: ask nicely, then insist.
+fn stop_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let signal = |sig: &str| {
+        let _ = Command::new("kill")
+            .args([sig, "--", &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    signal("-TERM");
+    for _ in 0..20 {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Whatever is left (a test program that ignores TERM) is stopped for sure.
+    signal("-KILL");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run a command to completion (or timeout / cancel) and capture its output.
 pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
     let start = Instant::now();
@@ -215,6 +239,13 @@ pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
     };
     let mut cmd = command(program, args, opts);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Its own process group, so Cancel and the time limit stop everything it
+    // started (a check script's cargo, rustc and test programs), not only
+    // the script itself.
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.stdin(if opts.stdin.is_some() {
         Stdio::piped()
     } else {
@@ -266,16 +297,14 @@ pub fn run(program: &str, args: &[&str], opts: &Opts) -> Output {
         }
         if let Some(t) = opts.timeout {
             if start.elapsed() > t {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group(&mut child);
                 out.timed_out = true;
                 break;
             }
         }
         if let Some(c) = &opts.cancel {
             if c.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group(&mut child);
                 out.cancelled = true;
                 break;
             }
@@ -347,6 +376,45 @@ pub fn xdg_open(target: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cancel_stops_everything_the_command_started() {
+        // Like a check script running cargo: the script waits on programs it
+        // started. Cancel must stop them too, not wait for them to finish.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            c2.store(true, Ordering::Relaxed);
+        });
+        let mut opts = Opts::default_timeout();
+        opts.cancel = Some(cancel);
+        let t = Instant::now();
+        let o = run("sh", &["-c", "sleep 30 & sleep 30; wait"], &opts);
+        assert!(o.cancelled);
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_time_limit_stops_everything_too() {
+        let t = Instant::now();
+        let o = run(
+            "sh",
+            &["-c", "sh -c 'trap \"\" TERM; sleep 30' & sleep 30; wait"],
+            &Opts::default_timeout().with_timeout(1),
+        );
+        assert!(o.timed_out);
+        assert!(
+            t.elapsed() < Duration::from_secs(6),
+            "took {:?}",
+            t.elapsed()
+        );
+    }
+
     use super::*;
 
     #[test]

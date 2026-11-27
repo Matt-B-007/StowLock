@@ -169,8 +169,26 @@ pub(crate) fn mark_important(lines: &[&str]) -> Vec<bool> {
         } else {
             after_panic = after_panic.saturating_sub(1);
         }
+        // A check script's own verdict ("Check failed: the release build
+        // fails its quick self-test") usually comes right after the reason:
+        // keep the few lines before it too.
+        if is_verdict(t) {
+            for k in keep.iter_mut().take(i).skip(i.saturating_sub(8)) {
+                *k = true;
+            }
+        }
     }
     keep
+}
+
+/// A check script's closing "this failed" line.
+fn is_verdict(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.starts_with("check failed")
+        || l.starts_with("failed:")
+        || l.starts_with("error: process completed")
+        || l.contains("self-test failed")
+        || l.contains("fails its")
 }
 
 /// Shorten long command output for the log: build progress lines collapse
@@ -442,6 +460,20 @@ impl Logger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reason_before_a_check_scripts_verdict_is_kept() {
+        let lines = [
+            "==> Release self-test",
+            "Running target/release/cachyplay --self-test --quick",
+            "self-test: can't open the audio device: no such file",
+            "",
+            "Check failed: the release build fails its quick self-test",
+        ];
+        let keep = mark_important(&lines);
+        assert!(keep[2], "the reason is kept: {keep:?}");
+        assert!(keep[4]);
+    }
 
     #[test]
     fn failing_test_survives_long_build_output() {

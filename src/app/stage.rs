@@ -120,9 +120,15 @@ impl App {
             self.apply_update(t);
         }
         if let Some(p) = restart {
+            // A clean exit: save settings and clear the "running" mark first,
+            // so the new version doesn't think this one closed unexpectedly.
+            self.save_config();
+            report::mark_stopped(&self.paths);
             if updater::restart(&p).is_ok() {
                 std::process::exit(0);
             }
+            // The new version didn't start: this one keeps running.
+            let _ = report::mark_running(&self.paths);
         }
         if let Some(prev) = self.rollback_offer.clone() {
             let mut go_back = false;

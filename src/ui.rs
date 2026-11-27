@@ -800,6 +800,20 @@ mod tests {
 mod glyph_tests {
     use super::*;
 
+    /// Copy buttons need the window toolkit's clipboard support, which is a
+    /// separate switch since egui 0.37 (without it, Copy silently does nothing).
+    #[test]
+    fn the_clipboard_is_switched_on() {
+        let toml = include_str!("../Cargo.toml");
+        let line = toml
+            .lines()
+            .find(|l| l.starts_with("eframe"))
+            .expect("eframe in Cargo.toml");
+        for feature in ["\"clipboard\"", "\"links\""] {
+            assert!(line.contains(feature), "eframe needs {feature}: {line}");
+        }
+    }
+
     /// Every symbol the app writes can be drawn by its fonts (a missing one
     /// shows as an empty box).
     #[test]

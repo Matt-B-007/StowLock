@@ -4,6 +4,19 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.2.0-beta.3] - 2026-11-27
+
+Fixes from the first day of beta.2.
+
+### Fixed
+- **Copy buttons work again.** Since the move to egui 0.37, clipboard support is a separate switch that wasn't on, so every Copy button did nothing. A test now checks it stays on. Web links open again too.
+- **Cancel stops a running check straight away.** Cancel and the time limit only stopped the check script itself, while the programs it started (cargo, rustc, the tests) kept running until they finished. Now they stop too.
+- **Updating no longer looks like a crash.** After an update, the new version thought the old one had closed unexpectedly, and Health marked "Settings & state" as broken. Quitting after an uninstall had the same problem.
+- **Reports keep the reason a check script gives.** When a project's own check script ends with its verdict (for example "Check failed: the release build fails its quick self-test"), the few lines before it, which usually say why, are kept in the log and the bug report.
+
+### Changed
+- **"Only GitHub's fonts" matches GitHub's machine more closely:** DejaVu, Liberation and Noto Color Emoji (each when installed here), not DejaVu alone. Any other font name still falls back to DejaVu Sans, as on GitHub.
+
 ## [0.2.0-beta.2] - 2026-11-27
 
 Checks that catch font problems before GitHub does, a clear view of which zip you loaded, and the exact House Standard v1.3 colours.
