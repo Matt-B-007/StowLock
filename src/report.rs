@@ -843,7 +843,12 @@ pub fn mark_running(paths: &AppPaths) -> Option<String> {
         let alive = std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .map(|c| c.trim().starts_with("stowlock"))
             .unwrap_or(false);
-        (!alive).then_some(version)
+        // The version we just updated from, handing over to this one (older
+        // versions didn't clear the mark before restarting): not a crash.
+        let handover = version != crate::config::APP_VERSION
+            && crate::updater::previous_version(paths)
+                .is_some_and(|p| p.trim_start_matches('v') == version.trim_start_matches('v'));
+        (!alive && !handover).then_some(version)
     });
     let _ = util::ensure_private_dir(&paths.state_dir);
     let _ = util::atomic_write(
@@ -1391,6 +1396,15 @@ mod tests {
         assert!(std::fs::read_to_string(report.trim())
             .unwrap()
             .contains("closed unexpectedly"));
+        // The version we just updated from didn't clear its mark before
+        // restarting into this one: that's the update, not a crash.
+        let _ = std::fs::remove_file(paths.crash_marker());
+        let prev = crate::updater::previous_dir(&paths);
+        std::fs::create_dir_all(&prev).unwrap();
+        std::fs::write(prev.join("stowlock"), b"old").unwrap();
+        std::fs::write(prev.join("version"), "0.2.0-beta.2").unwrap();
+        std::fs::write(running_marker(&paths), "4194300 0.2.0-beta.2").unwrap();
+        assert_eq!(mark_running(&paths), None, "an update isn't a crash");
         // A clean stop leaves nothing behind.
         mark_stopped(&paths);
         assert!(!running_marker(&paths).exists());

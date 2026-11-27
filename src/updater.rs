@@ -231,7 +231,7 @@ pub fn check(paths: &AppPaths, repo: &str, beta: bool) -> Res<CheckResult> {
 
 // ---- Going back to the previous version ----
 
-fn previous_dir(paths: &AppPaths) -> PathBuf {
+pub(crate) fn previous_dir(paths: &AppPaths) -> PathBuf {
     paths.state_dir.join("previous")
 }
 

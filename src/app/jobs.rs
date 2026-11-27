@@ -165,6 +165,17 @@ impl App {
         let mut s = Session::new(&self.config);
         s.slug = detect::slug_from_filename(&name);
         s.owner = self.env.login.clone().unwrap_or_default();
+        // A longer zip name ("gimbot-v0.4.2-house-standard") still belongs to
+        // the existing project it starts with.
+        {
+            let mut known: Vec<String> = self.projects.iter().map(|p| p.slug.clone()).collect();
+            if let Some(r) = self.github_repos(&s.owner) {
+                known.extend(r.iter().cloned());
+            }
+            if let Some(m) = detect::existing_match(&s.slug, known.iter().map(String::as_str)) {
+                s.slug = m;
+            }
+        }
         s.description = format!("{}, a vibe-coded project", detect::title_from_slug(&s.slug));
         s.zip = Some(zip.clone());
         s.zip_info = crate::zipinfo::read(&zip);

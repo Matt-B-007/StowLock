@@ -4,6 +4,12 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.2.0-beta.4] - 2026-11-27
+
+### Fixed
+- **No "closed unexpectedly" notice after an update,** even when updating from a version that didn't clear its "running" mark before restarting (0.2.0-beta.2 and older): the hand-over from the version you just updated from isn't a crash.
+- **A zip with a longer name goes to the existing project.** "gimbot-v0.4.2-house-standard.zip" or "Gimbot_fixed_fonts.zip" now picks your existing Gimbot repo, with its exact spelling, instead of making up a new, longer repo name. It matches names in your workspace and on GitHub; the longest match wins, and "gimbotics" isn't mistaken for "gimbot".
+
 ## [0.2.0-beta.3] - 2026-11-27
 
 Fixes from the first day of beta.2.

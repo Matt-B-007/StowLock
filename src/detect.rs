@@ -88,6 +88,22 @@ pub fn slug_from_filename(file_name: &str) -> String {
     }
 }
 
+/// The existing project a zip belongs to, when its name starts with one
+/// ("gimbot-fixed-fonts" or "Gimbot_house_standard" → "Gimbot"). The longest
+/// match wins, and the existing name keeps its exact spelling.
+pub fn existing_match<'a>(slug: &str, known: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let s = slug.to_ascii_lowercase();
+    known
+        .into_iter()
+        .filter(|k| !k.is_empty())
+        .filter(|k| {
+            let k = k.to_ascii_lowercase();
+            s == k || s.strip_prefix(&k).is_some_and(|rest| rest.starts_with('-'))
+        })
+        .max_by_key(|k| k.len())
+        .map(str::to_string)
+}
+
 /// Valid as a GitHub repository name: 1–100 of letters, digits, `.`, `_`
 /// and `-`, and not `.` or `..`. Capitals are allowed (existing repos keep
 /// their exact names); new names are formatted with `format_typing`/`kebab`.
@@ -506,6 +522,20 @@ mod tests {
 
     #[test]
     fn slugs_from_filenames() {
+        let known = ["Gimbot", "stream-preflight", "stream", "sluice"];
+        let m = |zip: &str| existing_match(&slug_from_filename(zip), known);
+        assert_eq!(
+            m("gimbot-v0.4.2-house-standard.zip").as_deref(),
+            Some("Gimbot")
+        );
+        assert_eq!(m("Gimbot_fixed_fonts.zip").as_deref(), Some("Gimbot"));
+        assert_eq!(m("gimbot.zip").as_deref(), Some("Gimbot"));
+        assert_eq!(
+            m("stream-preflight-v1.2.zip").as_deref(),
+            Some("stream-preflight")
+        );
+        assert_eq!(m("gimbotics.zip"), None, "a different name");
+        assert_eq!(m("brand-new-app.zip"), None);
         assert_eq!(slug_from_filename("sluice-v2.zip"), "sluice");
         assert_eq!(slug_from_filename("My Cool App (v2).zip"), "my-cool-app");
         assert_eq!(slug_from_filename("My App (1).zip"), "my-app");
