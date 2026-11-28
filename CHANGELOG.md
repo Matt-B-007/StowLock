@@ -4,6 +4,21 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.2.0-beta.7] - 2026-11-27
+
+The last House Standard items.
+
+### Changed
+- **The bug report's main buttons are Save to file, Copy report and Open log folder,** as in the House Standard. "Keep a copy" and "Open on GitHub…" come after them.
+- **Opening a GitHub issue:**
+  - It warns "This creates a PUBLIC issue" (or, for a private repo, that only the owner can see it).
+  - GitHub's form is filled in with the summary and system details only, never the logs.
+  - The full report is saved as a file, and its folder opens so you can drag the file into the issue.
+- **The icon's lock is all emerald:** a deeper emerald body under the lighter lid, so the whole symbol is StowLock's accent (it used to have a sky-blue body, close to Sluice's colour). It still reads at 16 px.
+
+### Added
+- **Bug reports say how checks ran,** for example "Checks: sandboxed · clean home · GitHub's fonts".
+
 ## [0.2.0-beta.6] - 2026-11-27
 
 Checks that behave like GitHub's machine, and quicker fixing when they fail.

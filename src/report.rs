@@ -295,6 +295,8 @@ pub struct EnvInfo {
     pub kernel: String,
     pub tools: Vec<(String, String)>,
     pub gh_status: String,
+    /// How checks run ("sandboxed · GitHub's fonts · clean home").
+    pub checks: String,
 }
 
 pub fn collect_env(signed_in: Option<bool>, secure: Option<bool>) -> EnvInfo {
@@ -334,6 +336,7 @@ pub fn collect_env(signed_in: Option<bool>, secure: Option<bool>) -> EnvInfo {
         kernel,
         tools,
         gh_status,
+        checks: String::new(),
     }
 }
 
@@ -585,6 +588,49 @@ fn status_word(s: StepStatus) -> &'static str {
     }
 }
 
+/// The start of a report for a GitHub issue: the header and what you wrote,
+/// not the logs (House Standard: summary and header only), and a request to
+/// attach the saved file.
+pub fn issue_body(report: &str, file_name: &str) -> String {
+    let mut out = String::new();
+    for block in report.split("\n## ") {
+        let keep = out.is_empty()
+            || block.starts_with("What I was doing")
+            || block.starts_with("What I expected");
+        if !keep {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n## ");
+        }
+        out.push_str(block.trim_end());
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n---\nThe full report is saved as `{file_name}`. Please attach it to this issue (drag the file into this box).\n"
+    ));
+    out
+}
+
+/// A link that opens GitHub's new-issue form, filled in.
+pub fn new_issue_url(repo: &str, title: &str, body: &str) -> String {
+    fn enc(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+    format!(
+        "https://github.com/{repo}/issues/new?title={}&body={}",
+        enc(title),
+        enc(body)
+    )
+}
+
 /// Build the report markdown, then redact it.
 pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
     let mut s = format!("# StowLock {}\n\n", input.title);
@@ -592,6 +638,9 @@ pub fn build_report(input: &ReportInput, rc: &RedactContext) -> String {
         "- **StowLock:** {APP_VERSION}\n- **Kernel:** {}\n- **GitHub sign-in:** {}\n",
         input.env.kernel, input.env.gh_status
     ));
+    if !input.env.checks.is_empty() {
+        s.push_str(&format!("- **Checks:** {}\n", input.env.checks));
+    }
     for (t, v) in &input.env.tools {
         s.push_str(&format!("- **{t}:** {v}\n"));
     }
@@ -1305,6 +1354,21 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("Check Qt libraries") || l.contains("missing libraries")),
             "{last:?}"
+        );
+    }
+
+    #[test]
+    fn a_github_issue_gets_the_header_and_summary_only() {
+        let report = "# StowLock bug report\n\n- **StowLock:** 0.2.0\n- **Checks:** sandboxed\n\n## What I was doing\n\nPushing.\n\n## Recent runs\n\nsecret log lines\n\n## Latest log lines\n\nmore\n";
+        let body = issue_body(report, "StowLock-bug-report.txt");
+        assert!(body.contains("**StowLock:** 0.2.0"), "{body}");
+        assert!(body.contains("## What I was doing\n\nPushing."), "{body}");
+        assert!(!body.contains("secret log lines"), "{body}");
+        assert!(body.contains("attach it"), "{body}");
+        let url = new_issue_url("me/app", "Bug report", "a b&c");
+        assert_eq!(
+            url,
+            "https://github.com/me/app/issues/new?title=Bug%20report&body=a%20b%26c"
         );
     }
 

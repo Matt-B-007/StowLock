@@ -5,7 +5,9 @@
 const BG: [u8; 3] = [0x0C, 0x10, 0x16];
 /// The edge: the accent at 35 % over the background (House Standard v1.3).
 const EDGE: [u8; 3] = [0x1A, 0x54, 0x44];
-const SKY: [u8; 3] = [0x38, 0xBD, 0xF8];
+/// The lock's body: a deeper emerald, so the whole symbol is in StowLock's
+/// accent (House Standard v1.3) and the lid still reads apart from it.
+const BODY: [u8; 3] = [0x05, 0x96, 0x69];
 const EMERALD: [u8; 3] = [0x34, 0xD3, 0x99];
 
 fn in_rrect(x: f32, y: f32, rx: f32, ry: f32, w: f32, h: f32, r: f32) -> bool {
@@ -49,7 +51,7 @@ fn sample(x: f32, y: f32) -> Option<[u8; 3]> {
         if dark {
             return Some(BG);
         }
-        return Some(if y < 96.0 { EMERALD } else { SKY });
+        return Some(if y < 96.0 { EMERALD } else { BODY });
     }
     Some(BG)
 }
@@ -101,7 +103,7 @@ mod tests {
         let px = rgba(256);
         let at = |x: usize, y: usize| &px[(y * 256 + x) * 4..(y * 256 + x) * 4 + 4];
         assert_eq!(&at(128, 70)[..3], &EMERALD, "lid");
-        assert_eq!(&at(70, 180)[..3], &SKY, "body");
+        assert_eq!(&at(70, 180)[..3], &BODY, "body");
         assert_eq!(&at(128, 150)[..3], &BG, "keyhole");
         assert_eq!(at(1, 1)[3], 0, "rounded corner is transparent");
     }

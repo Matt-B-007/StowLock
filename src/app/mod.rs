@@ -287,6 +287,8 @@ struct BugForm {
     include_username: bool,
     preview: String,
     confirm_issue: bool,
+    /// The repo the issue goes to is private (only the owner sees it).
+    issue_private: Option<bool>,
     /// When this report was created (used in the download file name).
     created: chrono::DateTime<chrono::Local>,
     /// Where the last download went.
@@ -482,6 +484,7 @@ impl App {
                 include_username: false,
                 preview: String::new(),
                 confirm_issue: false,
+                issue_private: None,
                 created: chrono::Local::now(),
                 saved_to: None,
                 saving: false,

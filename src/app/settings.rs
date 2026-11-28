@@ -479,40 +479,57 @@ impl App {
             .login
             .clone()
             .unwrap_or_else(|| "your account".into());
+        let repo = self.config.update_repo.clone();
+        // Public or private? Asked once, when the banner first shows.
+        if self.bug.issue_private.is_none() {
+            let o = proc::run(
+                "gh",
+                &[
+                    "repo",
+                    "view",
+                    &repo,
+                    "--json",
+                    "visibility",
+                    "-q",
+                    ".visibility",
+                ],
+                &proc::Opts::default_timeout().with_timeout(10),
+            );
+            self.bug.issue_private =
+                Some(o.ok() && o.stdout_trim().eq_ignore_ascii_case("private"));
+        }
+        let private = self.bug.issue_private == Some(true);
         ui::banner(ui, WARNING(), |ui| {
             ui.add(
-                egui::Label::new(format!(
-                    "This will be public on GitHub under the account {who}, on {}.",
-                    self.config.update_repo
-                ))
+                egui::Label::new(if private {
+                    format!("This creates an issue on {repo}, a private repo: only the owner can see it. It's opened under the account {who}.")
+                } else {
+                    format!("This creates a PUBLIC issue on {repo}: anyone can read it. It's opened under the account {who}.")
+                })
                 .wrap(),
             );
+            ui.add(
+                egui::Label::new(ui::muted("GitHub's form is filled in with the summary and system details only. The full report is saved as a file for you to attach.").size(12.5))
+                    .wrap(),
+            );
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Open issue").clicked() {
+                if ui.button("Open the issue form").clicked() {
                     match report::save_report(&self.paths, "bugreport", &self.bug.preview) {
                         Ok(p) => {
-                            let o = proc::run(
-                                "gh",
-                                &[
-                                    "issue",
-                                    "create",
-                                    "--repo",
-                                    &self.config.update_repo,
-                                    "--title",
-                                    "Bug report",
-                                    "--body-file",
-                                    &p.display().to_string(),
-                                ],
-                                &proc::Opts::default_timeout(),
-                            );
-                            self.log.command("report", &o);
-                            if o.ok() {
-                                let url = o.stdout_trim();
-                                self.toast("Issue opened.");
-                                let _ = proc::xdg_open(&url);
-                            } else {
-                                self.fail(&o.combined(), "report");
+                            let name = p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let body = report::issue_body(&self.bug.preview, &name);
+                            let url = report::new_issue_url(&repo, "Bug report", &body);
+                            let _ = proc::xdg_open(&url);
+                            // Show the file so it can be dragged into the form.
+                            if let Some(dir) = p.parent() {
+                                let _ = proc::xdg_open(&dir.display().to_string());
                             }
+                            self.toast(&format!(
+                                "Attach {name} to the issue (its folder is open)."
+                            ));
                         }
                         Err(e) => self.fail(&e, "report"),
                     }

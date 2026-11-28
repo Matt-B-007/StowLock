@@ -86,13 +86,44 @@ impl App {
         self.attempts = crate::attempts::list(&self.config.workspace());
     }
 
+    /// How checks run on this computer, for bug reports.
+    pub(super) fn checks_mode(&self) -> String {
+        let c = &self.config;
+        let mut v = Vec::new();
+        if c.clean_test_home {
+            if c.sandbox_checks && crate::sandbox::available() {
+                v.push("sandboxed");
+            } else if c.sandbox_checks {
+                v.push("not sandboxed (bubblewrap not available)");
+            } else {
+                v.push("not sandboxed");
+            }
+            v.push("clean home");
+        } else {
+            v.push("your own home folder");
+        }
+        if c.github_fonts {
+            v.push("GitHub's fonts");
+        }
+        if c.offline_checks {
+            v.push("offline");
+        }
+        if c.exact_github_checks {
+            v.push("exact mode");
+        }
+        v.join(" · ")
+    }
+
     pub(super) fn build_bug_report(&self) -> String {
         let s = &self.session;
         let input = ReportInput {
             title: "bug report".into(),
             what_doing: self.bug.what.clone(),
             expected: self.bug.expected.clone(),
-            env: report::collect_env(Some(self.env.login.is_some()), self.env.secure()),
+            env: report::EnvInfo {
+                checks: self.checks_mode(),
+                ..report::collect_env(Some(self.env.login.is_some()), self.env.secure())
+            },
             session: if s.slug.is_empty()
                 || self.bug.excluded.iter().any(|x| x == "Current project")
             {

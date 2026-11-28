@@ -172,7 +172,7 @@ impl App {
                     // issue comes last, with a warning before it opens.
                     if ui::primary(
                         ui,
-                        &ui::with_icon(ui::icon::DOWNLOAD, "Save…"),
+                        &ui::with_icon(ui::icon::DOWNLOAD, "Save to file…"),
                         !this.bug.saving,
                     )
                     .on_hover_text("Save the report as a .txt file")
@@ -180,12 +180,23 @@ impl App {
                     {
                         download = true;
                     }
-                    if ui::primary(ui, &ui::with_icon(ui::icon::COPY, "Copy"), true)
+                    if ui::primary(ui, &ui::with_icon(ui::icon::COPY, "Copy report"), true)
                         .on_hover_text("Copy the report, private things already hidden")
                         .clicked()
                     {
                         ui.ctx().copy_text(this.bug.preview.clone());
                         this.toast("Copied. Paste it into a GitHub issue or an AI chat.");
+                    }
+                    if ui::primary(
+                        ui,
+                        &ui::with_icon(ui::icon::FOLDER, "Open log folder"),
+                        true,
+                    )
+                    .on_hover_text("StowLock's log and saved reports")
+                    .clicked()
+                    {
+                        let _ = std::fs::create_dir_all(this.paths.reports_dir());
+                        let _ = proc::xdg_open(&this.paths.state_dir.display().to_string());
                     }
                     if ui::button(ui, ui::icon::SAVE, "Keep a copy")
                         .on_hover_text("Keep a copy in StowLock's reports folder")
@@ -201,6 +212,7 @@ impl App {
                         .clicked()
                     {
                         this.bug.confirm_issue = true;
+                        this.bug.issue_private = None;
                     }
                     if this.bug.saving {
                         ui.spinner();
