@@ -240,6 +240,18 @@ fn github_only_inner(r: &str) -> Option<&'static str> {
 
 /// The project has a workflow that runs on version tags and publishes the
 /// GitHub release itself (so StowLock should push the tag and let it).
+/// Does the project have any GitHub workflow (so a push starts a build)?
+pub fn has_workflows(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join(".github").join("workflows"))
+        .map(|d| {
+            d.flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+                n.ends_with(".yml") || n.ends_with(".yaml")
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn publishes_releases(dir: &Path) -> bool {
     const PUBLISHERS: [&str; 6] = [
         "gh release create",

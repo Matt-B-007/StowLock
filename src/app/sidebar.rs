@@ -44,13 +44,17 @@ impl App {
                 let (broken, attn) = self.health.counts();
                 let saved = self.attempts.len();
                 let update = matches!(self.update, UpdateState::Available(_));
-                let items: [(Tab, &str, &str, Option<String>); 6] = [
+                // GitHub's build countdown follows you to any screen.
+                let building = self.build_countdown();
+                let items: [(Tab, &str, &str, Option<String>); 4] = [
                     (Tab::Stage, ui::icon::UPLOAD, "Stage", None),
                     (
                         Tab::Projects,
                         ui::icon::LAYERS,
                         "Projects",
-                        (saved > 0).then(|| format!("{saved} saved")),
+                        building
+                            .clone()
+                            .or_else(|| (saved > 0).then(|| format!("{saved} saved"))),
                     ),
                     (
                         Tab::History,
@@ -64,27 +68,20 @@ impl App {
                         "Health",
                         (broken + attn > 0).then(|| format!("{}", broken + attn)),
                     ),
-                    (Tab::Report, ui::icon::BUG, "Bug report", None),
-                    (
-                        Tab::Settings,
-                        ui::icon::SLIDERS,
-                        "Settings",
-                        update.then(|| "Update".to_string()),
-                    ),
                 ];
                 ui.spacing_mut().item_spacing.y = 4.0;
                 for (tab, icon, label, badge) in items {
                     if ui::nav_item(ui, icon, label, self.tab == tab, badge.as_deref(), compact)
                         .clicked()
                     {
-                        if tab == Tab::Report {
-                            self.open_bug_report();
-                        } else if tab == Tab::Projects {
+                        if tab == Tab::Projects {
                             self.refresh_attempts();
                         }
                         self.tab = tab;
+                        self.scroll_top = true;
                     }
                 }
+                // Bottom: your account, Settings, and Find anything.
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     let signed_in = self.env.login.clone();
                     let dot = if signed_in.is_some() {
@@ -92,61 +89,60 @@ impl App {
                     } else {
                         WARNING()
                     };
-                    if compact {
-                        let label = signed_in.clone().unwrap_or_else(|| "Not signed in".into());
-                        if ui::nav_item(ui, ui::icon::USER, &label, false, None, true).clicked() {
-                            self.tab = Tab::Settings;
-                        }
-                        self.help_menu(ui, true);
-                        return;
-                    }
-                    let resp = egui::Frame::new()
-                        .fill(ui::CARD())
-                        .stroke(egui::Stroke::new(1.0_f32, BORDER()))
-                        .corner_radius(egui::CornerRadius::same(12))
-                        .inner_margin(egui::Margin::same(if compact { 8 } else { 12 }))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            if compact {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(RichText::new(ui::icon::USER).size(18.0).color(dot));
-                                });
-                            } else {
-                                ui.horizontal(|ui| {
-                                    let (r, _) = ui.allocate_exact_size(
-                                        egui::vec2(10.0, 10.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(r.center(), 4.0, dot);
-                                    ui.add(
-                                        egui::Label::new(ui::semibold(
-                                            signed_in
-                                                .clone()
-                                                .unwrap_or_else(|| "Not signed in".into()),
-                                            13.0,
-                                        ))
-                                        .truncate(),
-                                    );
-                                });
-                                ui.label(
-                                    ui::muted(if self.config.beta_updates() {
-                                        "Beta updates"
-                                    } else {
-                                        "Stable updates"
-                                    })
-                                    .size(12.0),
-                                );
+                    let who = signed_in
+                        .clone()
+                        .map(|l| format!("{l} · signed in"))
+                        .unwrap_or_else(|| "Not signed in".into());
+                    let resp = ui
+                        .horizontal(|ui| {
+                            ui.add_space(10.0);
+                            let (r, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 4.0, dot);
+                            if !compact {
+                                ui.add(egui::Label::new(ui::muted(&who).size(12.5)).truncate());
                             }
                         })
                         .response
                         .interact(egui::Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Account and updates");
+                        .on_hover_text(format!("{who}: account and updates"));
                     if resp.clicked() {
                         self.tab = Tab::Settings;
                     }
-                    ui.add_space(4.0);
-                    self.help_menu(ui, false);
+                    ui.add_space(8.0);
+                    if ui::nav_item(
+                        ui,
+                        ui::icon::SLIDERS,
+                        "Settings",
+                        self.tab == Tab::Settings || self.tab == Tab::Report,
+                        update.then_some("Update"),
+                        compact,
+                    )
+                    .on_hover_text("Settings, help and bug reports · Ctrl+,")
+                    .clicked()
+                    {
+                        self.tab = Tab::Settings;
+                        self.scroll_top = true;
+                    }
+                    let find = if compact {
+                        ui::nav_item(ui, ui::icon::SEARCH, "Find anything", false, None, true)
+                    } else {
+                        ui::nav_item(
+                            ui,
+                            ui::icon::SEARCH,
+                            "Find anything",
+                            false,
+                            Some("Ctrl K"),
+                            false,
+                        )
+                    };
+                    if find
+                        .on_hover_text("Find any command by typing · Ctrl+K")
+                        .clicked()
+                    {
+                        self.palette = Some(help::Palette::default());
+                    }
                 });
             });
     }
@@ -190,8 +186,9 @@ impl App {
     // ------------------------------------------------------------ settings parts
 
     pub(super) fn appearance_and_updates(&mut self, ui: &mut egui::Ui) {
+        self.jump_here(ui, "Updates");
         ui::card(ui, |ui| {
-            ui::section_title(ui, "Updates");
+            ui::section_title(ui, "UPDATES");
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     ui.set_max_width((ui.available_width() - 250.0).max(220.0));
@@ -216,7 +213,8 @@ impl App {
             });
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(
+                ui::switch(
+                    ui,
                     &mut self.config.check_for_updates,
                     "Check for updates when StowLock opens",
                 );
@@ -255,14 +253,12 @@ impl App {
                     self.update_rust();
                 }
             });
-            ui.checkbox(
+            ui::switch(
+                ui,
                 &mut self.config.rust_update_check,
                 "Check for a newer Rust once a day (rustup)",
             );
-            ui.checkbox(
-                &mut self.config.desktop_notifications,
-                "Desktop notifications when a push or GitHub's build finishes (while StowLock isn't in front)",
-            );
+            ui::switch(ui, &mut self.config.desktop_notifications, "Desktop notifications when a push or GitHub's build finishes (while StowLock isn't in front)");
             match &self.update {
                 UpdateState::Available(rel) => {
                     let label = rel.label();
@@ -298,10 +294,26 @@ impl App {
                     }
                 });
             }
+            egui::CollapsingHeader::new(ui::muted("Advanced"))
+                .id_salt("adv")
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Update source");
+                        ui::named(
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.update_repo)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(240.0),
+                            ),
+                            "Update source",
+                        );
+                    });
+                });
         });
         ui.add_space(8.0);
+        self.jump_here(ui, "Appearance");
         ui::card(ui, |ui| {
-            ui::section_title(ui, "Appearance");
+            ui::section_title(ui, "APPEARANCE");
             let sel = match self.config.theme.as_str() {
                 "light" => 1,
                 "dark" => 2,
@@ -310,7 +322,8 @@ impl App {
             if let Some(i) = ui::segmented(ui, &["Follow system", "Light", "Dark"], sel, 340.0) {
                 self.config.theme = ["", "light", "dark"][i].to_string();
             }
-            ui.checkbox(
+            ui::switch(
+                ui,
                 &mut self.config.plain_look,
                 "Plain look: no dot pattern behind the screens",
             );

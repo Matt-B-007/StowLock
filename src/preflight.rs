@@ -280,8 +280,25 @@ fn run_step_labelled(
     label: Option<&str>,
     timeout_secs: u64,
 ) -> Output {
+    if let Some(l) = label {
+        crate::proc::set_live_label(l);
+    }
     // In the sandbox, the program runs inside bubblewrap.
-    let wrapped = sandbox_for(env, extra).map(|sb| sb.wrap(dir, program, args));
+    let asked = (
+        program.to_string(),
+        args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+    );
+    let wrapped = sandbox_for(env, extra).map(|mut sb| {
+        // The build cache appears as ./target (see TargetLink).
+        if let Some(c) = &env.build_cache {
+            let t = dir.join("target");
+            let empty = std::fs::read_dir(&t).is_ok_and(|mut d| d.next().is_none());
+            if t.is_dir() && !t.is_symlink() && empty {
+                sb.binds.push((c.clone(), t));
+            }
+        }
+        sb.wrap(dir, program, args)
+    });
     let (program, args): (&str, Vec<&str>) = match &wrapped {
         Some(w) => ("bwrap", w.iter().map(String::as_str).collect()),
         None => (program, args.to_vec()),
@@ -304,7 +321,12 @@ fn run_step_labelled(
         env_remove: remove.to_vec(),
         live: true,
     };
-    let o = proc::run(program, args, &opts);
+    let mut o = proc::run(program, args, &opts);
+    // Show the command that was asked for, not the sandbox around it.
+    if wrapped.is_some() {
+        o.program = asked.0;
+        o.args = asked.1;
+    }
     match label {
         Some(l) => env.log.command_as("tests", l, &o),
         None => env.log.command("tests", &o),
@@ -312,11 +334,30 @@ fn run_step_labelled(
     o
 }
 
+/// Will steps run in the sandbox?
+fn sandboxed(env: &TestEnv) -> bool {
+    env.sandbox && env.clean_home && env.build_cache.is_some() && crate::sandbox::available()
+}
+
+/// Variables that point tools at certificates: the only files in your home
+/// folder the sandbox shows because the environment names them.
+const CERT_VARS: [&str; 9] = [
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+    "CARGO_HTTP_CAINFO",
+    "PIP_CERT",
+    "AWS_CA_BUNDLE",
+];
+
 /// The sandbox for a step, when sandboxed checks are on and possible: the
 /// project and caches writable, the tools on the PATH readable, the rest of
 /// the home folder hidden.
 fn sandbox_for(env: &TestEnv, extra: &[(String, String)]) -> Option<crate::sandbox::Sandbox> {
-    if !env.sandbox || !env.clean_home || !crate::sandbox::available() {
+    if !sandboxed(env) {
         return None;
     }
     let cache = env.build_cache.as_ref()?;
@@ -331,46 +372,59 @@ fn sandbox_for(env: &TestEnv, extra: &[(String, String)]) -> Option<crate::sandb
             .unwrap_or(default)
     };
     let cargo_home = var("CARGO_HOME", home.join(".cargo"));
+    let rustup_home = var("RUSTUP_HOME", home.join(".rustup"));
+    let gopath = var("GOPATH", home.join("go"));
     let tmp = cache.join("stowlock-tmp");
     std::fs::create_dir_all(&tmp).ok()?;
-    // All of StowLock's build folders (this project's build, its own tools,
-    // Python environments, fresh homes and fonts live under here).
-    let builds = cache.parent().unwrap_or(cache).to_path_buf();
+    // Download caches only. The tools themselves (~/.cargo/bin, rustup's
+    // toolchains, cargo's settings) are read-only, so a check can't swap a
+    // program you run later.
+    for d in ["registry", "git"] {
+        let _ = std::fs::create_dir_all(cargo_home.join(d));
+    }
     let mut writable = vec![
-        builds,
         cache.clone(),
-        cargo_home.clone(),
-        var("RUSTUP_HOME", home.join(".rustup")),
+        cache
+            .parent()
+            .map(|p| p.join("stowlock-tools"))
+            .unwrap_or_else(|| cache.join("stowlock-tools")),
+        cargo_home.join("registry"),
+        cargo_home.join("git"),
         var("PIP_CACHE_DIR", home.join(".cache/pip")),
-        var("npm_config_cache", home.join(".npm")),
-        var("GOPATH", home.join("go")),
+        var("npm_config_cache", home.join(".npm/_cacache")),
+        gopath.join("pkg"),
         var("GOCACHE", home.join(".cache/go-build")),
     ];
     if let Some((_, h)) = extra.iter().find(|(k, _)| k == "HOME") {
         writable.push(PathBuf::from(h));
     }
-    // Tools on the PATH that live in the home folder (~/.local/bin), and
-    // files your environment points tools at (a certificate bundle in
-    // SSL_CERT_FILE, say), read-only.
-    let mut readable: Vec<PathBuf> = extra
-        .iter()
-        .filter(|(k, _)| k == "PATH")
-        .flat_map(|(_, v)| v.split(':').map(PathBuf::from).collect::<Vec<_>>())
-        .chain([home.join(".local/bin"), home.join(".local/lib")])
-        .filter(|p| p.starts_with(&home))
-        .collect();
-    for (k, v) in std::env::vars().chain(extra.iter().cloned()) {
-        // Where you are and your settings folders aren't tools' files.
-        if matches!(k.as_str(), "PWD" | "OLDPWD" | "HOME" | "PATH") || k.starts_with("XDG_") {
-            continue;
-        }
-        for part in v.split(':') {
-            let p = Path::new(part);
-            if p.is_absolute() && p.starts_with(&home) && p.exists() && p != home {
-                readable.push(p.to_path_buf());
+    // Readable: Rust itself, tools on the PATH that live in the home folder
+    // (~/.local/bin), and certificate files the environment points to.
+    let mut readable: Vec<PathBuf> = vec![cargo_home.clone(), rustup_home];
+    readable.extend(
+        extra
+            .iter()
+            .filter(|(k, _)| k == "PATH")
+            .flat_map(|(_, v)| v.split(':').map(PathBuf::from).collect::<Vec<_>>())
+            .chain([home.join(".local/bin"), home.join(".local/lib")])
+            .filter(|p| p.starts_with(&home)),
+    );
+    for name in CERT_VARS {
+        let value = extra
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(name).ok());
+        if let Some(v) = value {
+            let p = PathBuf::from(v);
+            if p.is_absolute() && p.starts_with(&home) && p != home && p.exists() {
+                readable.push(p);
             }
         }
     }
+    readable.sort();
+    readable.dedup();
     Some(crate::sandbox::Sandbox {
         home,
         writable,
@@ -380,6 +434,7 @@ fn sandbox_for(env: &TestEnv, extra: &[(String, String)]) -> Option<crate::sandb
             cargo_home.join("credentials.toml"),
             cargo_home.join("credentials"),
         ],
+        binds: Vec::new(),
         tmp,
         offline: env.offline,
     })
@@ -1077,6 +1132,8 @@ fn run_plan(dir: &Path, plan: &crate::workflows::Plan, env: &TestEnv) -> TestRes
                     .any(|d| d.starts_with(&format!("Passed: [{j}]")))
                 {
                     "passed"
+                } else if !env.only_jobs.is_empty() && !env.only_jobs.iter().any(|o| o == j) {
+                    "not re-checked"
                 } else {
                     "couldn't run here"
                 };
@@ -1248,7 +1305,45 @@ impl TargetLink {
         }
         std::fs::create_dir_all(cache).ok()?;
         std::os::unix::fs::symlink(cache, &link).ok()?;
+        Self::exclude(dir, true);
         Some(TargetLink(link))
+    }
+
+    /// `target/` in a .gitignore matches a folder but not this link, so git
+    /// is told to leave the link alone while it exists.
+    fn exclude(dir: &Path, on: bool) {
+        // (A pattern can't carry a comment on its own line, hence two lines.)
+        const MARK: &str = "# StowLock: build cache link, only while checks run";
+        let file = dir.join(".git").join("info").join("exclude");
+        if !dir.join(".git").is_dir() {
+            return;
+        }
+        let old = std::fs::read_to_string(&file).unwrap_or_default();
+        let mut lines: Vec<&str> = Vec::new();
+        let mut skip = false;
+        for l in old.lines() {
+            if l == MARK {
+                skip = true;
+            } else if skip && l == "/target" {
+                skip = false;
+            } else {
+                skip = false;
+                lines.push(l);
+            }
+        }
+        if on {
+            lines.extend([MARK, "/target"]);
+        }
+        let mut new = lines.join("\n");
+        if !new.is_empty() {
+            new.push('\n');
+        }
+        if new != old {
+            if let Some(p) = file.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&file, new);
+        }
     }
 }
 
@@ -1256,6 +1351,9 @@ impl Drop for TargetLink {
     fn drop(&mut self) {
         if self.0.is_symlink() {
             let _ = std::fs::remove_file(&self.0);
+        }
+        if let Some(dir) = self.0.parent() {
+            Self::exclude(dir, false);
         }
     }
 }
@@ -2357,10 +2455,105 @@ mod tests {
             !d.path().join("rust-job-ran").exists(),
             "only the chosen job ran"
         );
+        // The job left out isn't said to be broken or unable to run.
+        assert!(r.summary.contains("rust not re-checked"), "{}", r.summary);
+        assert!(!r.summary.contains("couldn't run here"), "{}", r.summary);
         assert!(
             r.summary.contains("GitHub step \"Tests\" failed"),
             "{}",
             r.summary
         );
+    }
+
+    #[test]
+    fn a_sandboxed_check_shows_its_own_command() {
+        if proc::which("python3").is_none() || !crate::sandbox::available() {
+            return;
+        }
+        let log = Logger::new(None);
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("main.py"), "print('ok')\n").unwrap();
+        let mut e = env(&log);
+        e.sandbox = true;
+        e.build_cache = Some(d.path().join("builds").join("project"));
+        let r = run_tests(&project, Stack::Python, &e);
+        assert_eq!(r.status, TestStatus::Passed, "{}", r.tail);
+        for text in [&r.summary, &r.tail, &log.text()] {
+            assert!(
+                !text.contains("bwrap") && !text.contains("--ro-bind"),
+                "the sandbox's own command is showing: {text}"
+            );
+        }
+        assert!(r.summary.contains("python"), "{}", r.summary);
+    }
+
+    #[test]
+    fn the_sandbox_shows_tools_and_certificates_only() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let log = Logger::new(None);
+        let d = tempfile::tempdir().unwrap();
+        let home = crate::util::home_dir();
+        let mut e = env(&log);
+        e.sandbox = true;
+        e.build_cache = Some(d.path().join("builds").join("p"));
+        // Variables that point into the home folder: only a certificate one
+        // makes its file visible.
+        let secret = home.join(".stowlock-test-kubeconfig");
+        let cert = home.join(".stowlock-test-ca.pem");
+        if std::fs::write(&secret, "x").is_err() || std::fs::write(&cert, "x").is_err() {
+            return;
+        }
+        let extra = vec![
+            ("KUBECONFIG".to_string(), secret.display().to_string()),
+            ("GNUPGHOME".to_string(), home.display().to_string()),
+            ("SSL_CERT_FILE".to_string(), cert.display().to_string()),
+        ];
+        let sb = sandbox_for(&e, &extra).expect("a sandbox");
+        let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_file(&cert);
+        assert!(!sb.readable.contains(&secret), "KUBECONFIG is readable");
+        assert!(!sb.readable.contains(&home), "the whole home is readable");
+        assert!(sb.readable.contains(&cert), "the certificate file isn't");
+        // Tools are read-only; only download caches can be written.
+        let cargo = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cargo"));
+        assert!(!sb.writable.contains(&cargo), "~/.cargo is writable");
+        assert!(!sb.writable.iter().any(|w| w.ends_with("bin")));
+        assert!(sb.writable.contains(&cargo.join("registry")));
+        assert!(sb.readable.contains(&cargo));
+        assert!(!sb.writable.iter().any(|w| w.ends_with(".rustup")));
+    }
+
+    #[test]
+    fn the_build_cache_link_stays_out_of_git() {
+        if proc::which("git").is_none() {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("project");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(crate::git::git(&dir, &["init", "-b", "main"]).ok());
+        // StowLock's own Rust template: a folder pattern, which a link
+        // doesn't match.
+        std::fs::write(dir.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        let before = crate::git::status_lines(&dir);
+        {
+            let _link = TargetLink::make(&dir, &d.path().join("cache")).expect("a link");
+            assert!(dir.join("target").is_symlink());
+            assert_eq!(
+                crate::git::status_lines(&dir),
+                before,
+                "the link shows as a new file"
+            );
+        }
+        assert!(!dir.join("target").exists());
+        let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap_or_default();
+        assert!(!exclude.contains("/target"), "left behind: {exclude}");
     }
 }

@@ -158,6 +158,9 @@ pub mod icon {
     pub const X: &str = "\u{e1b2}";
     pub const CIRCLE_HELP: &str = "\u{e082}";
     pub const KEYBOARD: &str = "\u{e284}";
+    pub const SEARCH: &str = "\u{e151}";
+    pub const TIMER: &str = "\u{e1e0}";
+    pub const SHIELD_ALERT: &str = "\u{e1fe}";
     pub const CIRCLE_CHECK: &str = "\u{e226}";
     pub const CIRCLE_ALERT: &str = "\u{e077}";
     pub const TRIANGLE_ALERT: &str = "\u{e193}";
@@ -394,7 +397,7 @@ pub fn card_active<R>(ui: &mut Ui, active: bool, add: impl FnOnce(&mut Ui) -> R)
     let focused_inside = ctx
         .memory(|m| m.focused())
         .and_then(|id| ctx.read_response(id))
-        .is_some_and(|r| rect.contains_rect(r.rect));
+        .is_some_and(|r| r.layer_id == ui.layer_id() && rect.contains_rect(r.rect));
     if active || focused_inside {
         corner_brackets(ui.painter(), rect);
     }
@@ -415,6 +418,69 @@ fn corner_brackets(p: &egui::Painter, r: egui::Rect) {
         p.line_segment([corner, corner + Vec2::new(dx * len, 0.0)], s);
         p.line_segment([corner, corner + Vec2::new(0.0, dy * len)], s);
     }
+}
+
+/// An on/off switch with its label (one control: clicking either part
+/// flips it). Long labels wrap.
+pub fn switch(ui: &mut Ui, on: &mut bool, text: &str) -> egui::Response {
+    let track = Vec2::new(34.0, 20.0);
+    let gap = 10.0;
+    let wrap = (ui.available_width() - track.x - gap).max(80.0);
+    let color = if ui.is_enabled() { TEXT() } else { MUTED() };
+    let galley = ui.painter().layout(
+        text.to_string(),
+        egui::FontId::proportional(14.0),
+        color,
+        wrap,
+    );
+    let size = Vec2::new(
+        track.x + gap + galley.size().x,
+        galley.size().y.max(track.y) + 4.0,
+    );
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let (enabled, state, label) = (ui.is_enabled(), *on, text.to_string());
+    resp.widget_info(move || {
+        egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, state, &label)
+    });
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool(resp.id, *on);
+        let tr = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.top() + 2.0), track);
+        let p = ui.painter();
+        let off = if resp.hovered() { BORDER() } else { CONTROL() };
+        let fill = off.lerp_to_gamma(ACCENT_BTN(), t);
+        let fade = if enabled { 1.0 } else { 0.5 };
+        p.rect(
+            tr,
+            CornerRadius::same(10),
+            fill.gamma_multiply(fade),
+            Stroke::new(1.0_f32, BORDER().lerp_to_gamma(ACCENT(), t)),
+            egui::StrokeKind::Inside,
+        );
+        let x = egui::lerp((tr.left() + 10.0)..=(tr.right() - 10.0), t);
+        let knob = MUTED().lerp_to_gamma(ON_ACCENT(), t);
+        p.circle_filled(egui::pos2(x, tr.center().y), 6.5, knob.gamma_multiply(fade));
+        if resp.has_focus() {
+            p.rect_stroke(
+                tr.expand(2.0),
+                CornerRadius::same(12),
+                Stroke::new(1.5_f32, ACCENT()),
+                egui::StrokeKind::Outside,
+            );
+        }
+        p.galley(
+            egui::pos2(
+                tr.right() + gap,
+                rect.top() + 2.0 + (track.y - 18.0).max(0.0) / 2.0,
+            ),
+            galley,
+            color,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A quieter inset panel inside a card.
@@ -459,6 +525,272 @@ pub fn badge(ui: &mut Ui, text: &str, color: Color32) {
         .show(ui, |ui| {
             ui.label(semibold(text, 12.0).color(color));
         });
+}
+
+/// An outlined pill ("UPDATE", "BETA"): small capitals in a colour.
+pub fn pill(ui: &mut Ui, text: &str, color: Color32, filled: bool) {
+    let mut f = egui::Frame::new()
+        .corner_radius(CornerRadius::same(255))
+        .inner_margin(Margin::symmetric(8, 2));
+    f = if filled {
+        f.fill(CONTROL())
+    } else {
+        f.stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.45)))
+    };
+    f.show(ui, |ui| {
+        ui.label(semibold(text, 11.5).color(color));
+    });
+}
+
+/// Where a step of the flow is.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Flow {
+    Todo,
+    Active,
+    Done,
+    Failed,
+    /// Stopped by you before it finished.
+    Stopped,
+    /// Left out (checks turned off, or nothing to build).
+    Skipped,
+}
+
+/// The flow along the top of Stage: Zip → Route → Check → Review → GitHub build.
+pub fn step_rail(ui: &mut Ui, steps: &[(&str, Flow)]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (i, (name, st)) in steps.iter().enumerate() {
+            if i > 0 {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(16.0, 20.0), egui::Sense::hover());
+                ui.painter().line_segment(
+                    [r.left_center(), r.right_center()],
+                    Stroke::new(1.0_f32, BORDER()),
+                );
+            }
+            let (col, mark) = match st {
+                Flow::Done => (SUCCESS(), icon::CHECK),
+                Flow::Failed => (ERROR(), icon::X),
+                Flow::Active => (ACCENT(), ""),
+                Flow::Stopped => (WARNING(), ""),
+                Flow::Todo | Flow::Skipped => (MUTED(), ""),
+            };
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(20.0), egui::Sense::hover());
+            let p = ui.painter();
+            match st {
+                Flow::Done | Flow::Failed => {
+                    p.circle_filled(r.center(), 10.0, col.gamma_multiply(0.18));
+                    p.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        mark,
+                        egui::FontId::proportional(11.0),
+                        col,
+                    );
+                }
+                Flow::Active => {
+                    p.circle_stroke(r.center(), 9.0, Stroke::new(2.0_f32, col));
+                }
+                Flow::Stopped => {
+                    p.circle_filled(r.center(), 10.0, col.gamma_multiply(0.18));
+                    p.rect_filled(
+                        egui::Rect::from_center_size(r.center(), Vec2::splat(7.0)),
+                        CornerRadius::same(1),
+                        col,
+                    );
+                }
+                Flow::Skipped => {
+                    p.circle_stroke(r.center(), 9.5, Stroke::new(1.0_f32, BORDER()));
+                    p.line_segment(
+                        [
+                            r.center() - Vec2::new(4.0, 0.0),
+                            r.center() + Vec2::new(4.0, 0.0),
+                        ],
+                        Stroke::new(1.5_f32, col),
+                    );
+                }
+                Flow::Todo => {
+                    p.circle_stroke(r.center(), 9.5, Stroke::new(1.0_f32, BORDER()));
+                }
+            }
+            let t = RichText::new(*name).size(13.0).color(col);
+            ui.label(if *st == Flow::Active { t.strong() } else { t });
+        }
+    });
+}
+
+/// How a job is doing, for its row on the checks card.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Lane {
+    Waiting,
+    Running,
+    Passed,
+    Failed,
+    CantRun,
+    GitHubOnly,
+    /// Ran; its result shows when every job has finished.
+    Finished,
+    /// You stopped the checks before or while it ran.
+    Stopped,
+    /// Left out of a re-check of another job; no result yet.
+    NotRun,
+}
+
+/// One job's row: status mark, name and detail, a bar or a word, and time.
+pub fn job_lane(ui: &mut Ui, name: &str, detail: &str, lane: Lane, right: &str) {
+    let running = lane == Lane::Running;
+    let mut f = egui::Frame::new()
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(14, 10));
+    f = if running {
+        f.fill(CONTROL())
+    } else {
+        f.stroke(Stroke::new(1.0_f32, BORDER()))
+    };
+    f.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+            let p = ui.painter();
+            match lane {
+                Lane::Running => {
+                    let t = ui.input(|i| i.time) as f32;
+                    let glow = 0.25 + 0.15 * (t * 3.0).sin().abs();
+                    p.circle_filled(r.center(), 8.0, ACCENT().gamma_multiply(glow));
+                    p.circle_filled(r.center(), 5.0, ACCENT());
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Lane::Passed => {
+                    p.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icon::CHECK,
+                        egui::FontId::proportional(14.0),
+                        SUCCESS(),
+                    );
+                }
+                Lane::Failed => {
+                    p.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icon::X,
+                        egui::FontId::proportional(14.0),
+                        ERROR(),
+                    );
+                }
+                Lane::CantRun => {
+                    p.circle_stroke(r.center(), 6.0, Stroke::new(1.5_f32, WARNING()));
+                }
+                Lane::Stopped => {
+                    p.rect_filled(
+                        egui::Rect::from_center_size(r.center(), Vec2::splat(8.0)),
+                        CornerRadius::same(1),
+                        WARNING(),
+                    );
+                }
+                Lane::Waiting | Lane::GitHubOnly | Lane::NotRun => {
+                    p.circle_stroke(r.center(), 6.0, Stroke::new(1.0_f32, MUTED()));
+                }
+                Lane::Finished => {
+                    p.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icon::CHECK,
+                        egui::FontId::proportional(14.0),
+                        MUTED(),
+                    );
+                }
+            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                // Room is kept for the status on the right, so a long job
+                // name shortens with … instead of running under it.
+                ui.set_max_width((ui.available_width() - 190.0).max(80.0));
+                let n = semibold(name, 14.0);
+                ui.add(
+                    egui::Label::new(if lane == Lane::GitHubOnly {
+                        n.color(MUTED())
+                    } else {
+                        n
+                    })
+                    .truncate(),
+                )
+                .on_hover_text(name);
+                if !detail.is_empty() {
+                    ui.add(egui::Label::new(muted(detail).size(12.5)).truncate());
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (word, col) = match lane {
+                    Lane::Waiting => ("Waiting", MUTED()),
+                    Lane::Running => ("", ACCENT()),
+                    Lane::Passed => ("Passed", SUCCESS()),
+                    Lane::Failed => ("Failed", ERROR()),
+                    Lane::CantRun => ("Can't run here", WARNING()),
+                    Lane::GitHubOnly => ("On GitHub", MUTED()),
+                    Lane::Finished => ("Done", MUTED()),
+                    Lane::Stopped => ("Stopped", WARNING()),
+                    Lane::NotRun => ("Not run", MUTED()),
+                };
+                if !right.is_empty() {
+                    ui.label(mono(right).size(12.5).color(MUTED()));
+                }
+                if running {
+                    // An indeterminate bar: a band sweeping across.
+                    let (r, _) =
+                        ui.allocate_exact_size(Vec2::new(120.0, 6.0), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(r, CornerRadius::same(3), BORDER());
+                    let t = (ui.input(|i| i.time) as f32 * 0.6).fract();
+                    let w = r.width() * 0.35;
+                    let x = r.left() + (r.width() + w) * t - w;
+                    let band = egui::Rect::from_min_max(
+                        egui::pos2(x.max(r.left()), r.top()),
+                        egui::pos2((x + w).min(r.right()), r.bottom()),
+                    );
+                    if band.width() > 0.0 {
+                        p.rect_filled(band, CornerRadius::same(3), ACCENT());
+                    }
+                } else {
+                    ui.label(RichText::new(word).size(12.5).color(col));
+                }
+            });
+        });
+    });
+}
+
+/// The countdown ring: how far along, with big text in the middle.
+pub fn ring(ui: &mut Ui, diameter: f32, fraction: f32, big: &str, small: &str) {
+    let (r, _) = ui.allocate_exact_size(Vec2::splat(diameter), egui::Sense::hover());
+    let p = ui.painter();
+    let c = r.center();
+    let radius = diameter / 2.0 - 6.0;
+    p.circle_stroke(c, radius, Stroke::new(8.0_f32, BORDER()));
+    let n = 72;
+    let end = (n as f32 * fraction.clamp(0.0, 1.0)) as usize;
+    let pts: Vec<egui::Pos2> = (0..=end)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + i as f32 / n as f32 * std::f32::consts::TAU;
+            c + Vec2::new(a.cos(), a.sin()) * radius
+        })
+        .collect();
+    if pts.len() > 1 {
+        p.add(egui::Shape::line(pts, Stroke::new(8.0_f32, ACCENT())));
+    }
+    p.text(
+        c - Vec2::new(0.0, 8.0),
+        egui::Align2::CENTER_CENTER,
+        big,
+        egui::FontId::new(diameter * 0.22, FontFamily::Name("display".into())),
+        TEXT(),
+    );
+    p.text(
+        c + Vec2::new(0.0, diameter * 0.16),
+        egui::Align2::CENTER_CENTER,
+        small,
+        egui::FontId::proportional(12.0),
+        MUTED(),
+    );
 }
 
 pub fn mono(text: impl Into<String>) -> RichText {

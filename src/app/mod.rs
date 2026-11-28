@@ -101,6 +101,8 @@ enum Msg {
     Pushed(Result<PushOutcome, String>),
     /// GitHub's build for a pushed commit: (watch id, status).
     Build(u64, Result<crate::github::Build, String>),
+    /// How far GitHub's build has got (for the countdown).
+    BuildProgress(u64, crate::github::BuildProgress),
     /// GitHub started (or refused) a re-run of the failed jobs.
     Rerun(Result<(), String>),
     /// Finish the release / Remove the tag / Delete release finished.
@@ -165,6 +167,16 @@ struct Session {
     same_zip: bool,
     /// The browser saved a newer copy of this download beside it.
     newer_copy: Option<PathBuf>,
+    /// The project's workflow jobs (folder, jobs run here, GitHub-only jobs).
+    jobs: Option<(PathBuf, Vec<String>, Vec<String>)>,
+    /// Each job's last result, kept while another job is re-checked alone.
+    job_memo: std::collections::BTreeMap<String, (ui::Lane, String)>,
+    /// The jobs being re-checked alone (empty = everything).
+    rechecking: Vec<String>,
+    /// The job running now and when it started (for its elapsed time).
+    job_clock: Option<(String, Instant)>,
+    /// Show the Route and Details cards again after staging.
+    edit_route: bool,
     slug: String,
     owner: String,
     mode: Mode,
@@ -206,6 +218,10 @@ struct Session {
     /// Open the review window by itself once the checks pass.
     review_when_ready: bool,
     outcome: Option<PushOutcome>,
+    /// The release notes shown on the review page (read once per version).
+    review_notes: Option<(String, Option<String>)>,
+    /// The files of a first push, listed on the review page.
+    review_files: Vec<String>,
     show_changes: bool,
     /// Version found in the zip (Archive Only), and whether `tag` was filled from it.
     found_version: Option<detect::FoundVersion>,
@@ -219,6 +235,11 @@ impl Session {
             zip_info: None,
             same_zip: false,
             newer_copy: None,
+            jobs: None,
+            job_memo: Default::default(),
+            rechecking: Vec::new(),
+            job_clock: None,
+            edit_route: false,
             slug: String::new(),
             owner: String::new(),
             mode: Mode::New,
@@ -251,6 +272,8 @@ impl Session {
             older_ack: false,
             review_when_ready: false,
             outcome: None,
+            review_notes: None,
+            review_files: Vec::new(),
             show_changes: false,
             found_version: None,
             tag_auto: false,
@@ -278,6 +301,8 @@ struct BuildWatch {
     /// The local checks passed (so a failure on GitHub is a mismatch).
     local_passed: bool,
     dismissed: bool,
+    /// Each job's step and the usual build length, for the countdown.
+    progress: Option<crate::github::BuildProgress>,
 }
 
 struct BugForm {
@@ -340,11 +365,15 @@ pub struct App {
     identity_name: String,
     identity_email: String,
     show_uninstall: bool,
+    /// Scroll the screen back to its top on the next frame.
+    scroll_top: bool,
     /// The command palette (Ctrl+K), while open.
     palette: Option<help::Palette>,
     show_shortcuts: bool,
     /// Which tour card is showing, if any.
     tour_step: Option<usize>,
+    /// A Settings section to scroll to (from the section list).
+    settings_jump: Option<&'static str>,
     show_log: bool,
     bug: BugForm,
     uninstall: UninstallUi,
@@ -473,9 +502,11 @@ impl App {
             identity_name: String::new(),
             identity_email: String::new(),
             show_uninstall: false,
+            scroll_top: false,
             palette: None,
             show_shortcuts: false,
             tour_step: None,
+            settings_jump: None,
             show_log: false,
             bug: BugForm {
                 what: String::new(),
@@ -601,7 +632,9 @@ fn wants_light(choice: &str, system: Option<egui::Theme>) -> bool {
 
 /// How many details were hidden in a report (placeholders and removals).
 fn count_hidden(text: &str) -> usize {
-    let re = regex::Regex::new(r"<(account|repo|org|user|host|email|hidden|workspace)(-\d+)?>|\[removed\]|\[REDACTED[^\]]*\]|left out\]").unwrap();
+    // Every placeholder the report writes in place of something private,
+    // and each home-folder path shortened to "~/…".
+    let re = regex::Regex::new(r"<(account|repo|org|user|host|email|hidden|workspace|ip|mac|secret|steamid)(-\d+)?>|\[removed\]|\[REDACTED[^\]]*\]|left out\]|(^|[\s\x22'=(:\[])~/").unwrap();
     re.find_iter(text).count()
 }
 
@@ -741,6 +774,10 @@ impl eframe::App for App {
         if self.tab == Tab::Projects && self.prev_tab != Tab::Projects {
             self.refresh_project_owners(false);
         }
+        // Each screen opens at its top.
+        if self.tab != self.prev_tab {
+            self.scroll_top = true;
+        }
         self.prev_tab = self.tab;
         if let Some(child) = self.run_child.as_mut() {
             if let Ok(Some(_)) = child.try_wait() {
@@ -795,41 +832,41 @@ impl eframe::App for App {
                 if !self.config.plain_look {
                     ui::dot_grid(ui.painter(), ui.max_rect());
                 }
-                self.banners(ui);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let w = ui.available_width().min(1100.0);
-                        ui.set_max_width(w);
-                        match self.tab {
-                            Tab::Stage => {
-                                ui::title(
-                                    ui,
-                                    "Stage",
-                                    "Turn a project zip into a tested GitHub release.",
-                                );
-                                ui.add_space(8.0);
-                                self.stage_tab(ui, hovering)
-                            }
-                            Tab::Projects => {
-                                ui::title(
-                                    ui,
-                                    "Projects",
-                                    &format!(
-                                        "Everything in {} and on GitHub.",
-                                        util::tilde(&self.config.workspace())
-                                    ),
-                                );
-                                ui.add_space(8.0);
-                                self.projects_tab(ui)
-                            }
-                            Tab::History => self.history_screen(ui),
-                            Tab::Health => self.health_screen(ui),
-                            Tab::Report => self.report_screen(ui),
-                            Tab::Settings => self.settings_screen(ui),
+                // Sideways scrolling only when the window is narrower than
+                // the screens can be: text never wraps a letter per line.
+                let mut area = egui::ScrollArea::both().auto_shrink([false, false]);
+                if std::mem::take(&mut self.scroll_top) && self.settings_jump.is_none() {
+                    area = area.vertical_scroll_offset(0.0);
+                }
+                area.show(ui, |ui| {
+                    let w = ui.available_width().clamp(460.0, 1240.0);
+                    ui.set_max_width(w);
+                    ui.set_min_width(w.min(ui.available_width().max(460.0)));
+                    // Notices scroll with the page instead of taking room
+                    // on every screen.
+                    self.banners(ui);
+                    match self.tab {
+                        // Stage draws its own heading: the welcome, or the project.
+                        Tab::Stage => self.stage_tab(ui, hovering),
+                        Tab::Projects => {
+                            ui::title(
+                                ui,
+                                "Projects",
+                                &format!(
+                                    "Everything in {} and on GitHub.",
+                                    util::tilde(&self.config.workspace())
+                                ),
+                            );
+                            ui.add_space(8.0);
+                            self.projects_tab(ui)
                         }
-                        ui.add_space(16.0);
-                    });
+                        Tab::History => self.history_screen(ui),
+                        Tab::Health => self.health_screen(ui),
+                        Tab::Report => self.report_screen(ui),
+                        Tab::Settings => self.settings_screen(ui),
+                    }
+                    ui.add_space(16.0);
+                });
             });
         self.windows(ctx);
         self.help_windows(ctx);

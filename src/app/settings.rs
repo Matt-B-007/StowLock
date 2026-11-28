@@ -2,258 +2,291 @@
 //! The App's settings code (part of the StowLock window).
 use super::*;
 
+/// The Settings sections, in the order they're on the page.
+const SETTINGS_SECTIONS: [&str; 8] = [
+    "Updates",
+    "Appearance",
+    "GitHub account",
+    "Folders & defaults",
+    "Checks",
+    "Privacy",
+    "Help",
+    "About",
+];
+
 impl App {
-    pub(super) fn settings_screen(&mut self, ui: &mut egui::Ui) {
-        {
-            ui::title(ui, "Settings", "");
-            ui.add_space(8.0);
-            self.appearance_and_updates(ui);
-            ui.add_space(8.0);
-            ui::card(ui, |ui| self.account_panel(ui));
-            ui.add_space(8.0);
-            ui::card(ui, |ui| {
-                ui::section_title(ui, "GENERAL");
-                egui::Grid::new("general")
-                    .max_col_width((ui.available_width() - 130.0).max(160.0))
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Workspace folder");
-                        ui::named(
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.config.workspace_dir)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(300.0),
-                            ),
-                            "Workspace folder",
-                        );
-                        ui.end_row();
-                        ui.label("New repos");
-                        ui.checkbox(&mut self.config.default_private, "Private by default");
-                        ui.end_row();
-                        ui.label("Default license");
-                        let cb = egui::ComboBox::from_id_salt("deflic")
-                            .selected_text(self.config.default_license.clone())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.config.default_license,
-                                    "none".to_string(),
-                                    "none",
-                                );
-                                ui.selectable_value(
-                                    &mut self.config.default_license,
-                                    "MIT".to_string(),
-                                    "MIT",
-                                );
-                                ui.selectable_value(
-                                    &mut self.config.default_license,
-                                    "GPL-3.0".to_string(),
-                                    "GPL-3.0",
-                                );
-                            });
-                        ui::named(cb.response, "Default license");
-                        ui.end_row();
-                        ui.label("License holder");
-                        ui::named(
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.config.license_holder)
-                                    .hint_text("Your name")
-                                    .desired_width(300.0),
-                            ),
-                            "License holder",
-                        );
-                        ui.end_row();
-                        ui.label("After push");
-                        ui.horizontal_wrapped(|ui| {
-                            ui.checkbox(&mut self.config.archive_after_push, "Archive the zip");
-                            ui.radio_value(
-                                &mut self.config.archive_mode,
-                                "move".to_string(),
-                                "Move",
-                            );
-                            ui.radio_value(
-                                &mut self.config.archive_mode,
-                                "copy".to_string(),
-                                "Copy",
-                            );
-                        });
-                        ui.end_row();
-                        ui.label("Tag prefix");
-                        ui::named(
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.config.tag_prefix)
-                                    .desired_width(60.0),
-                            ),
-                            "Tag prefix",
-                        );
-                        ui.end_row();
-                    });
-                ui.separator();
-                ui::section_title(ui, "CHECKS");
-                ui.checkbox(
-                    &mut self.config.run_tests_before_push,
-                    "Run tests before pushing",
-                );
-                ui.checkbox(
-                    &mut self.config.match_github_checks,
-                    "Match GitHub's checks: run the project's own GitHub workflow steps",
-                )
-                .on_hover_text("Uses the same commands and settings as the project's .github/workflows files, and lists the steps only GitHub can run.");
-                ui.checkbox(
-                    &mut self.config.clean_test_home,
-                    "Like GitHub's clean machine: a fresh home folder, without your desktop session",
-                )
-                .on_hover_text("Tests don't see your settings, app data or running desktop, as on GitHub. Tool caches are kept, so it stays fast.");
-                ui.checkbox(
-                    &mut self.config.github_fonts,
-                    "Only GitHub's fonts: run checks with just the fonts GitHub's machine has (DejaVu, Liberation, emoji)",
-                )
-                .on_hover_text("Text that only fits with your own fonts fails here too, before you push. Fonts a project bundles and loads itself still work.");
-                let bwrap = crate::sandbox::available();
-                ui.add_enabled_ui(bwrap && self.config.clean_test_home, |ui| {
-                    ui.checkbox(
-                        &mut self.config.sandbox_checks,
-                        "Sandbox: checks can't see your home folder, keys or running apps (bubblewrap)",
-                    )
-                    .on_hover_text("The project's scripts and tests see only the project, the build tools and a fresh home, like GitHub's machine. Stopping a check stops everything in it.");
-                    ui.add_enabled_ui(self.config.sandbox_checks, |ui| {
-                        ui.checkbox(
-                            &mut self.config.offline_checks,
-                            "Offline: no network during checks (finds steps that quietly download)",
-                        );
-                    });
-                });
-                if !bwrap {
-                    ui.add(
-                        egui::Label::new(
-                            ui::muted("The sandbox needs bubblewrap: sudo pacman -S bubblewrap (or Install missing tools in Health)")
-                                .size(12.5),
-                        )
-                        .wrap(),
-                    );
+    /// Scroll to this place when its section was picked from the list.
+    pub(super) fn jump_here(&mut self, ui: &mut egui::Ui, name: &str) {
+        if self.settings_jump == Some(name) {
+            ui.scroll_to_cursor(Some(egui::Align::TOP));
+            self.settings_jump = None;
+        }
+    }
+
+    /// Help: shortcuts, the tour, bug reports, what's new (what the Help menu had).
+    fn help_card(&mut self, ui: &mut egui::Ui) {
+        self.jump_here(ui, "Help");
+        let mut cmd = None;
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "HELP");
+            ui.horizontal_wrapped(|ui| {
+                if ui::button(ui, ui::icon::SEARCH, "Find a command  Ctrl+K").clicked() {
+                    self.palette = Some(help::Palette::default());
                 }
-                let act_ready = proc::which("act").is_some() && proc::which("docker").is_some();
-                ui.add_enabled_ui(act_ready, |ui| {
-                    ui.checkbox(
-                        &mut self.config.exact_github_checks,
-                        "Exact mode: run the workflows exactly as GitHub would (act)",
-                    );
-                });
-                if !act_ready {
-                    ui.add(
-                        egui::Label::new(
-                            ui::muted("Exact mode needs act and Docker: sudo pacman -S act docker")
-                                .size(12.5),
-                        )
-                        .wrap(),
-                    );
+                if ui::button(ui, ui::icon::KEYBOARD, "Keyboard shortcuts  F1").clicked() {
+                    cmd = Some(help::Cmd::Shortcuts);
                 }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Test time limit");
-                    ui.add(
-                        egui::DragValue::new(&mut self.config.test_timeout_secs)
-                            .range(30..=3600)
-                            .suffix(" s"),
-                    );
-                });
-                ui.checkbox(
-                    &mut self.config.block_on_secrets,
-                    "Block pushes when possible secrets are found",
-                );
-                ui.horizontal_wrapped(|ui| {
-                    if self.cache_size.is_none() {
-                        self.cache_size = Some(u64::MAX); // measuring
-                        let paths = self.paths.clone();
-                        self.spawn_bg(move || Msg::CacheSize(pipeline::cache_size(&paths)));
-                    }
-                    let size = match self.cache_size {
-                        Some(u64::MAX) | None => "measuring…".to_string(),
-                        Some(n) => util::human_size(n),
-                    };
-                    ui.label(format!("Check caches: {size}"))
-                        .on_hover_text("Builds, Python environments and tools StowLock keeps so checks are fast. A project's cache is removed after 30 days without a check.");
-                    if ui
-                        .add_enabled(self.busy.is_none(), egui::Button::new("Clear").small())
-                        .clicked()
-                    {
-                        let paths = self.paths.clone();
-                        self.spawn_bg(move || Msg::CachesCleared(pipeline::clear_caches(&paths)));
-                    }
-                });
-                ui.separator();
-                ui::section_title(ui, "PRIVACY");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Delete logs and reports after");
-                    ui.add(
-                        egui::DragValue::new(&mut self.config.report_retention_days)
-                            .range(1..=365)
-                            .suffix(" days"),
-                    );
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Clear logs and reports").clicked() {
-                        match report::clear_logs_and_reports(&self.paths, &self.log) {
-                            Ok(n) => self.toast(&format!("Removed {n} file(s).")),
-                            Err(e) => self.fail(&e, "privacy"),
-                        }
-                    }
-                    if ui.button("Clear push history").clicked() {
-                        let _ = History::clear(&self.paths);
-                        self.history = History::default();
-                        self.toast("Push history cleared.");
-                    }
-                });
-                egui::CollapsingHeader::new("What StowLock stores and sends").id_salt("privacy").show(ui, |ui| {
-                ui.label("Sends to GitHub (through gh and git): the repos you choose to push, sign-in, your repo list.");
-                ui.label(format!("Checks {} for new versions at most every 6 hours (no personal data sent).", self.config.update_repo));
-                ui.label("Bug reports leave your computer only when you copy them or open an issue, after a preview.");
-                ui.label("No tracking, analytics or automatic crash uploads.");
-                ui.label(format!("Stores settings in {} and history, logs and reports in {} (only your account can read them).", util::tilde(&self.paths.config_dir), util::tilde(&self.paths.state_dir)));
+                if ui::button(ui, ui::icon::PLAY, "Take the tour").clicked() {
+                    cmd = Some(help::Cmd::Tour);
+                }
+                if ui::button(ui, ui::icon::BUG, "Write a bug report").clicked() {
+                    cmd = Some(help::Cmd::Go(Tab::Report));
+                }
+                if ui::button(ui, ui::icon::EXTERNAL, "What's new").clicked() {
+                    let _ = proc::xdg_open(&format!(
+                        "https://github.com/{}/releases",
+                        crate::config::UPDATE_REPO
+                    ));
+                }
             });
-                ui.separator();
-                ui::section_title(ui, "UPDATES");
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(
-                        &mut self.config.check_for_updates,
-                        "Check for updates automatically",
+        });
+        if let Some(c) = cmd {
+            self.run_cmd(c);
+        }
+    }
+
+    pub(super) fn settings_screen(&mut self, ui: &mut egui::Ui) {
+        ui::title(
+            ui,
+            "Settings",
+            "Saved as you change them · Ctrl+, opens this page",
+        );
+        ui.add_space(6.0);
+        // The sections, to jump straight to one.
+        ui.horizontal_wrapped(|ui| {
+            for s in SETTINGS_SECTIONS {
+                if ui.selectable_label(false, s).clicked() {
+                    self.settings_jump = Some(s);
+                }
+            }
+        });
+        ui.add_space(8.0);
+        self.appearance_and_updates(ui);
+        ui.add_space(8.0);
+        self.jump_here(ui, "GitHub account");
+        ui::card(ui, |ui| self.account_panel(ui));
+        ui.add_space(8.0);
+        self.jump_here(ui, "Folders & defaults");
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "FOLDERS & DEFAULTS");
+            egui::Grid::new("general")
+                .max_col_width((ui.available_width() - 130.0).max(160.0))
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Workspace folder");
+                    ui::named(
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.workspace_dir)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(300.0),
+                        ),
+                        "Workspace folder",
                     );
-                    if ui.button("Check now").clicked() {
-                        self.check_updates(true);
-                    }
-                });
-                egui::CollapsingHeader::new(ui::muted("Advanced"))
-                    .id_salt("adv")
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("Update source");
-                            ui::named(
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.config.update_repo)
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(240.0),
-                                ),
-                                "Update source",
+                    ui.end_row();
+                    ui.label("New repos");
+                    ui::switch(ui, &mut self.config.default_private, "Private by default");
+                    ui.end_row();
+                    ui.label("Default license");
+                    let cb = egui::ComboBox::from_id_salt("deflic")
+                        .selected_text(self.config.default_license.clone())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.config.default_license,
+                                "none".to_string(),
+                                "none",
+                            );
+                            ui.selectable_value(
+                                &mut self.config.default_license,
+                                "MIT".to_string(),
+                                "MIT",
+                            );
+                            ui.selectable_value(
+                                &mut self.config.default_license,
+                                "GPL-3.0".to_string(),
+                                "GPL-3.0",
                             );
                         });
+                    ui::named(cb.response, "Default license");
+                    ui.end_row();
+                    ui.label("License holder");
+                    ui::named(
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.license_holder)
+                                .hint_text("Your name")
+                                .desired_width(300.0),
+                        ),
+                        "License holder",
+                    );
+                    ui.end_row();
+                    ui.label("After push");
+                    ui.horizontal_wrapped(|ui| {
+                        ui::switch(ui, &mut self.config.archive_after_push, "Archive the zip");
+                        ui.radio_value(&mut self.config.archive_mode, "move".to_string(), "Move");
+                        ui.radio_value(&mut self.config.archive_mode, "copy".to_string(), "Copy");
                     });
-                ui.separator();
-                ui::section_title(ui, "ABOUT");
-                ui.label(format!(
-                    "StowLock {APP_VERSION} · Free software under the GNU GPL v3 · github.com/{}",
-                    crate::config::UPDATE_REPO
-                ));
-                ui.add_space(8.0);
+                    ui.end_row();
+                    ui.label("Tag prefix");
+                    ui::named(
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.tag_prefix)
+                                .desired_width(60.0),
+                        ),
+                        "Tag prefix",
+                    );
+                    ui.end_row();
+                });
+        });
+        ui.add_space(8.0);
+        self.jump_here(ui, "Checks");
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "CHECKS");
+            ui::switch(
+                ui,
+                &mut self.config.run_tests_before_push,
+                "Run tests before pushing",
+            );
+            ui::switch(ui, &mut self.config.match_github_checks, "Match GitHub's checks: run the project's own GitHub workflow steps")
+            .on_hover_text("Uses the same commands and settings as the project's .github/workflows files, and lists the steps only GitHub can run.");
+            ui::switch(ui, &mut self.config.clean_test_home, "Like GitHub's clean machine: a fresh home folder, without your desktop session")
+            .on_hover_text("Tests don't see your settings, app data or running desktop, as on GitHub. Tool caches are kept, so it stays fast.");
+            ui::switch(ui, &mut self.config.github_fonts, "Only GitHub's fonts: run checks with just the fonts GitHub's machine has (DejaVu, Liberation, emoji)")
+            .on_hover_text("Text that only fits with your own fonts fails here too, before you push. Fonts a project bundles and loads itself still work.");
+            let bwrap = crate::sandbox::available();
+            ui.add_enabled_ui(bwrap && self.config.clean_test_home, |ui| {
+                ui::switch(ui, &mut self.config.sandbox_checks, "Sandbox: checks can't see your home folder, keys or running apps (bubblewrap)")
+                .on_hover_text("The project's scripts and tests see only the project, the build tools and a fresh home, like GitHub's machine. Stopping a check stops everything in it.");
+                ui.add_enabled_ui(self.config.sandbox_checks, |ui| {
+                    ui::switch(ui, &mut self.config.offline_checks, "Offline: no network during checks (finds steps that quietly download)");
+                });
+            });
+            if !bwrap {
+                ui.add(
+                    egui::Label::new(
+                        ui::muted("The sandbox needs bubblewrap: sudo pacman -S bubblewrap (or Install missing tools in Health)")
+                            .size(12.5),
+                    )
+                    .wrap(),
+                );
+            }
+            let act_ready = proc::which("act").is_some() && proc::which("docker").is_some();
+            ui.add_enabled_ui(act_ready, |ui| {
+                ui::switch(
+                    ui,
+                    &mut self.config.exact_github_checks,
+                    "Exact mode: run the workflows exactly as GitHub would (act)",
+                );
+            });
+            if !act_ready {
+                ui.add(
+                    egui::Label::new(
+                        ui::muted("Exact mode needs act and Docker: sudo pacman -S act docker")
+                            .size(12.5),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Test time limit");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.test_timeout_secs)
+                        .range(30..=3600)
+                        .suffix(" s"),
+                );
+            });
+            ui::switch(
+                ui,
+                &mut self.config.block_on_secrets,
+                "Block pushes when possible secrets are found",
+            );
+            ui.horizontal_wrapped(|ui| {
+                if self.cache_size.is_none() {
+                    self.cache_size = Some(u64::MAX); // measuring
+                    let paths = self.paths.clone();
+                    self.spawn_bg(move || Msg::CacheSize(pipeline::cache_size(&paths)));
+                }
+                let size = match self.cache_size {
+                    Some(u64::MAX) | None => "measuring…".to_string(),
+                    Some(n) => util::human_size(n),
+                };
+                ui.label(format!("Check caches: {size}"))
+                    .on_hover_text("Builds, Python environments and tools StowLock keeps so checks are fast. A project's cache is removed after 30 days without a check.");
                 if ui
-                    .button(RichText::new("Uninstall StowLock…").color(ERROR()))
+                    .add_enabled(self.busy.is_none(), egui::Button::new("Clear").small())
                     .clicked()
                 {
-                    self.show_uninstall = true;
-                    self.uninstall.result = None;
-                    self.uninstall.plan = None;
-                    self.uninstall.typed.clear();
+                    let paths = self.paths.clone();
+                    self.spawn_bg(move || Msg::CachesCleared(pipeline::clear_caches(&paths)));
                 }
             });
-        }
+        });
+        ui.add_space(8.0);
+        self.jump_here(ui, "Privacy");
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "PRIVACY");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Delete logs and reports after");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.report_retention_days)
+                        .range(1..=365)
+                        .suffix(" days"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Clear logs and reports").clicked() {
+                    match report::clear_logs_and_reports(&self.paths, &self.log) {
+                        Ok(n) => self.toast(&format!("Removed {n} file(s).")),
+                        Err(e) => self.fail(&e, "privacy"),
+                    }
+                }
+                if ui.button("Clear push history").clicked() {
+                    let _ = History::clear(&self.paths);
+                    self.history = History::default();
+                    self.toast("Push history cleared.");
+                }
+            });
+            egui::CollapsingHeader::new("What StowLock stores and sends").id_salt("privacy").show(ui, |ui| {
+            ui.label("Sends to GitHub (through gh and git): the repos you choose to push, sign-in, your repo list.");
+            ui.label(format!("Checks {} for new versions at most every 6 hours (no personal data sent).", self.config.update_repo));
+            ui.label("Bug reports leave your computer only when you copy them or open an issue, after a preview.");
+            ui.label("No tracking, analytics or automatic crash uploads.");
+            ui.label(format!("Stores settings in {} and history, logs and reports in {} (only your account can read them).", util::tilde(&self.paths.config_dir), util::tilde(&self.paths.state_dir)));
+        });
+        });
+        ui.add_space(8.0);
+        self.help_card(ui);
+        ui.add_space(8.0);
+        self.jump_here(ui, "About");
+        ui::card(ui, |ui| {
+            ui::section_title(ui, "ABOUT");
+            ui.add(
+                egui::Label::new(format!(
+                    "StowLock {APP_VERSION} · Free software under the GNU GPL v3 · github.com/{}",
+                    crate::config::UPDATE_REPO
+                ))
+                .wrap(),
+            );
+            ui.add_space(8.0);
+            if ui
+                .button(RichText::new("Uninstall StowLock…").color(ERROR()))
+                .clicked()
+            {
+                self.show_uninstall = true;
+                self.uninstall.result = None;
+                self.uninstall.plan = None;
+                self.uninstall.typed.clear();
+            }
+        });
     }
 
     pub(super) fn account_panel(&mut self, ui: &mut egui::Ui) {

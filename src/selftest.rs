@@ -86,7 +86,16 @@ impl SelfTestReport {
 
     pub fn summary_line(&self) -> String {
         let (p, f, s) = self.counts();
-        format!("{p} working · {f} need fixing · {s} skipped")
+        format!(
+            "{p} passed · {f} failed · {s} skipped ({})",
+            if s == 1 {
+                "it needs something that isn't set up here"
+            } else if s == 0 {
+                "nothing left out"
+            } else {
+                "they need something that isn't set up here"
+            }
+        )
     }
 
     pub fn ai_prompts(&self) -> String {

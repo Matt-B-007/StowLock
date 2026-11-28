@@ -125,6 +125,69 @@ pub fn files_to_commit(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// The project's files as they were before the checks ran, so that what a
+/// check writes (a new Cargo.lock, __pycache__, reformatted files) is not
+/// pushed: what goes to GitHub is what was in the zip.
+pub struct Snapshot {
+    dir: PathBuf,
+    index: PathBuf,
+}
+
+impl Snapshot {
+    fn run(&self, args: &[&str]) -> Output {
+        let mut o = Opts::in_dir(&self.dir);
+        o.env
+            .push(("GIT_INDEX_FILE".into(), self.index.display().to_string()));
+        proc::run("git", args, &o)
+    }
+
+    pub fn take(dir: &Path) -> Option<Self> {
+        if !is_repo(dir) {
+            return None;
+        }
+        let index = dir.join(".git").join("stowlock-before-checks");
+        let _ = std::fs::remove_file(&index);
+        let s = Snapshot {
+            dir: dir.to_path_buf(),
+            index,
+        };
+        s.run(&["add", "-A"]).ok().then_some(s)
+    }
+
+    /// Put the files back; returns what was undone ("removed Cargo.lock").
+    pub fn restore(self) -> Vec<String> {
+        let mut undone = Vec::new();
+        let new = self.run(&["ls-files", "--others", "--exclude-standard", "-z"]);
+        for f in new.stdout.split('\0').filter(|s| !s.is_empty()) {
+            let p = self.dir.join(f);
+            if p.is_symlink() || p.is_file() {
+                if std::fs::remove_file(&p).is_ok() {
+                    undone.push(format!("removed {f}"));
+                }
+                // Folders the check made and that are now empty.
+                let mut up = p.parent();
+                while let Some(d) = up {
+                    if d == self.dir || std::fs::remove_dir(d).is_err() {
+                        break;
+                    }
+                    up = d.parent();
+                }
+            }
+        }
+        let changed = self.run(&["diff-files", "--name-only", "-z"]);
+        let names: Vec<&str> = changed
+            .stdout
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !names.is_empty() && self.run(&["checkout-index", "-a", "-f"]).ok() {
+            undone.extend(names.iter().map(|f| format!("restored {f}")));
+        }
+        let _ = std::fs::remove_file(&self.index);
+        undone
+    }
+}
+
 pub fn remote_url(dir: &Path) -> Option<String> {
     let o = git(dir, &["remote", "get-url", "origin"]);
     if o.ok() {
@@ -386,5 +449,58 @@ mod tests {
         assert_eq!(c.removed, vec!["old.txt"]);
         assert_eq!(c.changed, vec!["src/a.rs", "b"]);
         assert_eq!(c.short(), "+2 ~2 −1");
+    }
+
+    #[test]
+    fn files_written_by_checks_are_put_back() {
+        if proc::which("git").is_none() {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        assert!(git(dir, &["init", "-b", "main"]).ok());
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let before = files_to_commit(dir);
+        let snap = Snapshot::take(dir).expect("a snapshot");
+        // What a check does: a lock file, a cache folder, a reformatted file,
+        // a deleted file, and build output (ignored).
+        std::fs::write(dir.join("Cargo.lock"), "# made by cargo test\n").unwrap();
+        std::fs::create_dir_all(dir.join("__pycache__")).unwrap();
+        std::fs::write(dir.join("__pycache__/x.pyc"), "x").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main(){}\n").unwrap();
+        std::fs::remove_file(dir.join("Cargo.toml")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/built"), "x").unwrap();
+        let undone = snap.restore();
+        assert!(
+            undone.iter().any(|u| u == "removed Cargo.lock"),
+            "{undone:?}"
+        );
+        assert!(
+            undone.iter().any(|u| u == "restored src/main.rs"),
+            "{undone:?}"
+        );
+        assert_eq!(
+            files_to_commit(dir),
+            before,
+            "only the zip's files are left"
+        );
+        assert!(
+            !dir.join("__pycache__").exists(),
+            "the empty folder goes too"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(dir.join("Cargo.toml").exists(), "a deleted file comes back");
+        assert!(
+            dir.join("target/built").exists(),
+            "ignored build output stays"
+        );
+        assert!(!dir.join(".git/stowlock-before-checks").exists());
     }
 }

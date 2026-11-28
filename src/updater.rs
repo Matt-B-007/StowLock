@@ -163,8 +163,11 @@ pub fn explain_fetch_error(err: &str) -> String {
     let e = err.to_ascii_lowercase();
     if e.contains("404") {
         "StowLock couldn't see its releases on GitHub. If the StowLock repository is private, sign in to GitHub (Settings) so updates can use your account.".into()
-    } else if e.contains("403") || e.contains("429") || e.contains("rate limit") {
+    } else if e.contains("429") || e.contains("rate limit") {
         "GitHub is limiting requests from your network right now. Try again in an hour.".into()
+    } else if e.contains("403") {
+        // Refused, but not for asking too often.
+        "GitHub refused the request for StowLock's releases (403). If the StowLock repository is private, sign in to GitHub (Settings) so updates can use your account; otherwise try again later.".into()
     } else if e.contains("couldn't reach")
         || e.contains("resolve")
         || e.contains("dns")
@@ -610,8 +613,11 @@ mod tests {
         );
         assert!(
             explain_fetch_error("curl: (22) The requested URL returned error: 403")
-                .contains("limiting")
+                .contains("refused"),
+            "a plain 403 isn't a rate limit"
         );
+        assert!(explain_fetch_error("HTTP 403 (rate limit)").contains("limiting"));
+        assert!(explain_fetch_error("HTTP 429 (rate limit)").contains("limiting"));
         assert!(
             explain_fetch_error("curl: (6) Could not resolve host: api.github.com")
                 .contains("internet")

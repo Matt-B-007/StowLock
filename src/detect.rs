@@ -43,11 +43,51 @@ fn suffix_patterns() -> &'static Vec<Regex> {
     })
 }
 
+/// The plain letter for an accented one ("ÿ" → "y", "ø" → "o", "ß" → "ss"),
+/// so "Mÿ Prøject" becomes my-project, not m-pr-ject.
+pub fn plain_letters(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let lower = c.to_lowercase().next().unwrap_or(c);
+        let plain = match lower {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+            'ç' | 'ć' | 'č' => "c",
+            'ď' | 'đ' => "d",
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ę' | 'ě' => "e",
+            'ğ' => "g",
+            'ì' | 'í' | 'î' | 'ï' | 'ī' | 'ı' => "i",
+            'ł' => "l",
+            'ñ' | 'ń' | 'ň' => "n",
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => "o",
+            'ř' => "r",
+            'ś' | 'š' | 'ş' => "s",
+            'ť' => "t",
+            'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' => "u",
+            'ý' | 'ÿ' => "y",
+            'ź' | 'ż' | 'ž' => "z",
+            'ß' => "ss",
+            'æ' => "ae",
+            'œ' => "oe",
+            'þ' => "th",
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        if c.is_uppercase() {
+            out.push_str(&plain.to_uppercase());
+        } else {
+            out.push_str(plain);
+        }
+    }
+    out
+}
+
 /// Lowercase letters, digits and single hyphens; max 100 characters.
 pub fn kebab(s: &str) -> String {
     let mut out = String::new();
     let mut dash = false;
-    for c in s.chars() {
+    for c in plain_letters(s).chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
             dash = false;
@@ -137,7 +177,7 @@ pub fn name_problem(s: &str) -> Option<String> {
 /// hyphens collapse. A trailing hyphen is kept so typing can continue.
 pub fn format_typing(s: &str) -> String {
     let mut out = String::new();
-    for c in s.chars() {
+    for c in plain_letters(s).chars() {
         let c = if c == ' ' || c == '_' {
             '-'
         } else {
@@ -194,6 +234,29 @@ fn full_version_re() -> &'static Regex {
         Regex::new(r"(?i)(?:^|[\s_-])v?(\d+\.\d+\.\d+(?:-[0-9a-z]+(?:\.[0-9a-z]+)*)?)$").unwrap()
     })
 }
+/// A version written loosely in a file name, perhaps followed by words like
+/// "source": "Slow App 1.2.0 beta.3 source" → 1.2.0-beta.3.
+fn loose_version(stem: &str) -> Option<String> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|[\s_-])v?(\d+\.\d+\.\d+)(?:[\s._-]?(alpha|beta|rc)(?:[\s._-]?(\d+))?)?(?:[\s_-]+(?:main|master|final|backup|latest|source|src|code|project|full|complete|files))*$",
+        )
+        .unwrap()
+    });
+    let c = re.captures(stem)?;
+    let mut v = c[1].to_string();
+    if let Some(pre) = c.get(2) {
+        v.push('-');
+        v.push_str(&pre.as_str().to_ascii_lowercase());
+        if let Some(n) = c.get(3) {
+            v.push('.');
+            v.push_str(n.as_str());
+        }
+    }
+    Some(v)
+}
+
 fn short_version_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"(?i)[\s_-](v\d+(?:\.\d+)?)$").unwrap())
@@ -315,6 +378,12 @@ pub fn detect_version(zip: &Path, prefix: &str) -> Option<FoundVersion> {
     if let Some(c) = full_version_re().captures(&stem) {
         return Some(FoundVersion {
             tag: format!("{prefix}{}", &c[1]),
+            source: "the file name".into(),
+        });
+    }
+    if let Some(v) = loose_version(&stem) {
+        return Some(FoundVersion {
+            tag: format!("{prefix}{v}"),
             source: "the file name".into(),
         });
     }
@@ -560,6 +629,31 @@ mod tests {
             "clip-sorter"
         );
         assert_eq!(slug_from_filename("v2.zip"), "v2");
+    }
+
+    #[test]
+    fn accents_become_plain_letters() {
+        assert_eq!(kebab("Mÿ Prøject"), "my-project");
+        assert_eq!(slug_from_filename("Café Señor-final.zip"), "cafe-senor");
+        assert_eq!(format_typing("Straße"), "strasse");
+    }
+
+    #[test]
+    fn version_in_a_loosely_written_name() {
+        assert_eq!(
+            loose_version("Slow App 1.2.0 beta.3 source").as_deref(),
+            Some("1.2.0-beta.3")
+        );
+        assert_eq!(
+            loose_version("Gimbot 0.1.0 beta.14 source").as_deref(),
+            Some("0.1.0-beta.14")
+        );
+        assert_eq!(loose_version("app_2.0.1_final").as_deref(), Some("2.0.1"));
+        assert_eq!(
+            loose_version("app 1.0.0 rc1").as_deref(),
+            Some("1.0.0-rc.1")
+        );
+        assert_eq!(loose_version("notes 2024"), None);
     }
 
     #[test]

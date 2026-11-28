@@ -195,9 +195,54 @@ fn cli_uninstall(args: &[String], paths: &AppPaths) -> i32 {
     }
 }
 
+/// Every option StowLock understands.
+const OPTIONS: [&str; 20] = [
+    "--dry-run",
+    "--everything",
+    "--help",
+    "--install",
+    "--online",
+    "--open-screen",
+    "--permanent",
+    "--purge",
+    "--quick",
+    "--report",
+    "--rollback",
+    "--self-test",
+    "--uninstall",
+    "--update",
+    "--version",
+    "--window-size",
+    "--yes",
+    "--yes-delete-projects",
+    "-V",
+    "-h",
+];
+
+/// The first option that isn't one of StowLock's (a mistyped one, say).
+fn unknown_option(args: &[String]) -> Option<&String> {
+    args.iter()
+        .find(|a| a.starts_with('-') && a.len() > 1 && !OPTIONS.contains(&a.as_str()))
+}
+
+/// Why the window can't open, in plain words.
+fn window_problem(error: &str) -> String {
+    let no_display =
+        std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none();
+    if no_display {
+        "StowLock couldn't open its window: there's no desktop session here (no DISPLAY or WAYLAND_DISPLAY). Start it from your desktop, or use the command-line options: stowlock --help".to_string()
+    } else {
+        format!("StowLock couldn't open its window. The desktop refused it: {error}")
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |f: &str| args.iter().any(|a| a == f);
+    if let Some(bad) = unknown_option(&args) {
+        eprintln!("StowLock doesn't have an option called {bad}. See: stowlock --help");
+        std::process::exit(2);
+    }
     let paths = AppPaths::detect();
 
     if has("--version") || has("-V") {
@@ -343,7 +388,7 @@ fn main() {
         .iter()
         .enumerate()
         .find(|(i, a)| {
-            !a.starts_with("--")
+            !a.starts_with('-')
                 && (*i == 0 || (args[i - 1] != "--window-size" && args[i - 1] != "--open-screen"))
         })
         .map(|(_, a)| PathBuf::from(a));
@@ -406,7 +451,7 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.split_once('x'))
         .and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?]))
-        .unwrap_or([680.0, 840.0]);
+        .unwrap_or([1120.0, 800.0]);
     let icon = eframe::egui::IconData {
         rgba: icon::rgba(128),
         width: 128,
@@ -417,7 +462,7 @@ fn main() {
             .with_title("StowLock")
             .with_app_id("stowlock")
             .with_inner_size(size)
-            .with_min_inner_size([520.0, 600.0])
+            .with_min_inner_size([760.0, 560.0])
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
@@ -429,7 +474,34 @@ fn main() {
     );
     report::mark_stopped(&paths_at_exit);
     if let Err(e) = result {
-        eprintln!("StowLock couldn't open its window: {e}");
+        eprintln!("{}", window_problem(&e.to_string()));
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mistyped_option_is_named() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(unknown_option(&args(&["--self-test", "--quick"])), None);
+        assert_eq!(unknown_option(&args(&["my app.zip"])), None);
+        assert_eq!(
+            unknown_option(&args(&["--window-size", "1120x800", "--selftest"])).map(String::as_str),
+            Some("--selftest")
+        );
+        assert_eq!(
+            unknown_option(&args(&["-x"])).map(String::as_str),
+            Some("-x")
+        );
+        // Every option in the help text is one StowLock knows.
+        for word in HELP.split_whitespace() {
+            let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+            if w.starts_with("--") && w.len() > 2 {
+                assert!(OPTIONS.contains(&w), "{w} is in --help but not in OPTIONS");
+            }
+        }
     }
 }

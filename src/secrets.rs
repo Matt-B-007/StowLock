@@ -6,7 +6,11 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub const PATTERNS: [(&str, &str); 7] = [
+pub const PATTERNS: [(&str, &str); 8] = [
+    (
+        "AWS secret key",
+        r#"(?i)aws_?secret_?(access_?)?key["']?\s*[=:]\s*["']?[A-Za-z0-9/+]{40}\b"#,
+    ),
     ("GitHub token", r"ghp_[A-Za-z0-9]{36}"),
     ("GitHub fine-grained token", r"github_pat_[A-Za-z0-9_]{50,}"),
     ("API key (sk-)", r"sk-[A-Za-z0-9_-]{20,}"),
@@ -209,5 +213,24 @@ mod own_source {
             hits.is_empty(),
             "token-shaped text in StowLock's own files: {hits:?}"
         );
+    }
+
+    #[test]
+    fn an_aws_secret_key_is_found_and_never_shown() {
+        use super::*;
+        // Built in pieces so this file passes its own scan.
+        let key = format!("wJalrXUtnFEMI/K7MDENG/bPxRfiCY{}", "EXAMPLEKEY");
+        let id = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+        let text = format!("AWS_ACCESS_KEY_ID={id}\nAWS_SECRET_ACCESS_KEY={key}\naws_secret_access_key: \"{key}\"\n");
+        let hits = scan_text(".env", &text);
+        assert_eq!(
+            hits.iter().filter(|h| h.kind == "AWS secret key").count(),
+            2,
+            "{hits:?}"
+        );
+        assert!(hits.iter().all(|h| !h.masked.contains("wJal")));
+        assert!(!redact_secrets(&text).contains(&key));
+        // Talking about the setting isn't a secret.
+        assert!(scan_text("README.md", "Set AWS_SECRET_ACCESS_KEY in your shell.").is_empty());
     }
 }

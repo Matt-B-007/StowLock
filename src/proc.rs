@@ -77,6 +77,19 @@ static LIVE: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 const LIVE_LINES: usize = 6;
 
+static LIVE_LABEL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Which step is running ("[test] Tests"), for the job rows.
+pub fn live_label() -> String {
+    LIVE_LABEL.lock().map(|l| l.clone()).unwrap_or_default()
+}
+
+pub fn set_live_label(label: &str) {
+    if let Ok(mut l) = LIVE_LABEL.lock() {
+        *l = label.to_string();
+    }
+}
+
 /// The newest lines of the running check's output.
 pub fn live_lines() -> Vec<String> {
     LIVE.lock()

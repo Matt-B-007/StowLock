@@ -2,7 +2,31 @@
 //! The App's after push code (part of the StowLock window).
 use super::*;
 
+/// Seconds as "3:48".
+pub(super) fn clock(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn now_secs() -> i64 {
+    chrono::Local::now().timestamp()
+}
+
 impl App {
+    /// "3:48" while GitHub builds the last push, when there's a history to
+    /// estimate from (for the sidebar).
+    pub(super) fn build_countdown(&self) -> Option<String> {
+        let w = self.build.as_ref()?;
+        if w.dismissed || !matches!(w.status, None | Some(crate::github::Build::Running { .. })) {
+            return None;
+        }
+        let left = w.progress.as_ref()?.secs_left(now_secs())?;
+        Some(if left == 0 {
+            "soon".into()
+        } else {
+            clock(left)
+        })
+    }
+
     /// The GitHub build card (and the failed-release card) after a push.
     pub(super) fn after_push_cards(&mut self, ui: &mut egui::Ui) {
         // The tag is on GitHub but the release failed.
@@ -63,25 +87,103 @@ impl App {
         use crate::github::Build;
         match &w.status {
             None | Some(Build::Running { .. }) => {
-                ui::banner(ui, ACCENT(), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spinner();
-                        let by_workflow = self
-                            .session
-                            .outcome
-                            .as_ref()
-                            .is_some_and(|o| o.release_by_workflow);
-                        ui.label(match (&w.tag, by_workflow) {
-                            (Some(t), true) => format!("GitHub is building and publishing {t}…"),
-                            (Some(t), false) => format!("GitHub is building {t}…"),
-                            (None, _) => "GitHub is building this push…".to_string(),
-                        });
-                        if let Some(Build::Running { url }) = &w.status {
-                            if ui.link("Watch on GitHub").clicked() {
-                                let _ = proc::xdg_open(url);
+                let by_workflow = self
+                    .session
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|o| o.release_by_workflow);
+                let title = match (&w.tag, by_workflow) {
+                    (Some(t), true) => format!("GITHUB IS BUILDING AND PUBLISHING {t}"),
+                    (Some(t), false) => format!("GITHUB IS BUILDING {t}"),
+                    (None, _) => "GITHUB IS BUILDING THIS PUSH".to_string(),
+                };
+                let url = match &w.status {
+                    Some(Build::Running { url }) => Some(url.clone()),
+                    _ => None,
+                };
+                let progress = w.progress.clone().unwrap_or_default();
+                let now = now_secs();
+                ui::card_active(ui, true, |ui| {
+                    ui::section_title(ui, &title);
+                    ui.horizontal(|ui| {
+                        let left = progress.secs_left(now);
+                        let (big, small) = match left {
+                            Some(0) => ("soon".to_string(), "any moment".to_string()),
+                            Some(s) => (clock(s), "left, about".to_string()),
+                            None => (
+                                format!("{}%", (progress.fraction(now) * 100.0) as u32),
+                                "of the steps".to_string(),
+                            ),
+                        };
+                        ui::ring(ui, 120.0, progress.fraction(now), &big, &small);
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| {
+                            match (left, progress.started) {
+                                (Some(s), _) if s > 0 => {
+                                    let at = chrono::Local::now()
+                                        + chrono::Duration::seconds(s as i64);
+                                    ui.label(ui::semibold(
+                                        format!("Ready around {}", at.format("%H:%M")),
+                                        17.0,
+                                    ));
+                                }
+                                _ => {
+                                    ui.label(ui::semibold("Building on GitHub", 17.0));
+                                }
                             }
-                        }
+                            let started = progress
+                                .started
+                                .map(|t| format!("Started {} min ago. ", ((now - t).max(0)) / 60))
+                                .unwrap_or_default();
+                            let basis = match progress.typical_secs {
+                                Some(t) => format!("This project's recent builds took about {} min, so this is a good guess, not a promise: GitHub sometimes queues a build first.", (t + 30) / 60),
+                                None => "There's no earlier build to go by yet, so this shows the steps instead of a time.".to_string(),
+                            };
+                            ui.add(
+                                egui::Label::new(ui::muted(format!("{started}{basis}")).size(13.0))
+                                    .wrap(),
+                            );
+                            ui.label(
+                                ui::muted("You'll get a desktop notification when it's done.")
+                                    .size(12.5),
+                            );
+                            if let Some(u) = &url {
+                                if ui.link("Watch on GitHub").clicked() {
+                                    let _ = proc::xdg_open(u);
+                                }
+                            }
+                        });
                     });
+                    if progress.jobs.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spinner();
+                            ui.label(ui::muted("Waiting for GitHub to start…"));
+                        });
+                    }
+                    for j in &progress.jobs {
+                        let lane = match (j.status.as_str(), j.conclusion.as_str()) {
+                            ("completed", "success") => ui::Lane::Passed,
+                            ("completed", "skipped") => ui::Lane::GitHubOnly,
+                            ("completed", _) => ui::Lane::Failed,
+                            ("in_progress", _) => ui::Lane::Running,
+                            _ => ui::Lane::Waiting,
+                        };
+                        let detail = if lane == ui::Lane::Running && j.steps > 0 {
+                            format!(
+                                "Step {} of {} · {}",
+                                (j.done + 1).min(j.steps),
+                                j.steps,
+                                j.current
+                            )
+                        } else if j.steps > 0 {
+                            format!("{} steps", j.steps)
+                        } else {
+                            String::new()
+                        };
+                        ui::job_lane(ui, &j.name, &detail, lane, "");
+                    }
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs(1));
                 });
             }
             Some(Build::None) => {}

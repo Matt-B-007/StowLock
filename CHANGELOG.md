@@ -4,6 +4,82 @@ All notable changes to StowLock. When StowLock pushes a release, the section
 for that version becomes the GitHub release notes and the "What's new" text in
 the update notice.
 
+## [0.3.0-beta.2] - 2026-11-27
+
+Fixes for everything found by going through 0.3.0-beta.1 screen by screen.
+
+### Fixed: checks and the sandbox
+- **A project without workflows showed the sandbox's own long command** as its result, which ran off the review window. It shows the project's command again (`python3 -m pytest`), in the summary, the output and the log.
+- **Files a check writes are no longer pushed.** A `Cargo.lock` from `cargo test`, `__pycache__`, or a reformatted file is put back when the checks end: what goes to GitHub is what was in the zip. The log lists what was put back.
+- **The sandbox shows less of your home folder.**
+  - A variable such as `KUBECONFIG` or `GNUPGHOME` no longer makes the file it points to readable. Only certificate files (`SSL_CERT_FILE` and the like) are.
+  - `~/.cargo` and `~/.rustup` are read-only. Only the download caches inside them can be written, so a check can't replace a tool you run later.
+    If a project pins a Rust version you don't have yet, install it once yourself (`rustup toolchain install <version>`): a check can no longer install it.
+  - Removable drives (`/run/media`, `/media`, `/mnt`) are hidden.
+- **The build cache link no longer shows as a new file** in projects whose `.gitignore` has `target/` or `/target/`.
+- **A damaged, half-downloaded, missing or empty zip is named when you load it**, with what to do, instead of "Something went wrong" after staging.
+- The secret scan finds `AWS_SECRET_ACCESS_KEY=…`.
+- Re-checking one job: the other job keeps its result (and the summary says "not re-checked", not "couldn't run here").
+- Stopping the checks says so. It no longer shows the advice for failed tests, and jobs read "Stopped".
+- A failed format or lint step is headed "Checks failed", not "Tests failed".
+- Possible secrets are listed above the advice, in their own red box.
+- "Re-check this job only" and "Copy output" are always visible, not inside the folded output.
+- An explanation (a font difference, say) is shown as text, not as a command with a Copy button.
+- Job rows follow the workflow of the zip just loaded, show how long the running job has taken, and shorten long names.
+- The version is read from names like `Slow App 1.2.0 beta.3 source.zip`.
+- Accented letters become plain ones in repo names (`Mÿ Prøject` → `my-project`).
+
+### Changed: Stage
+- **Review is a page, not a pop-up.** It shows where the push goes, the version, the commit message, the checks, who gets it, **the files that changed** and **the release notes** (from the project's CHANGELOG). Back and the push button are in the bar at the bottom; Ctrl+Enter pushes, Esc goes back.
+- **After a push, GitHub's build and its countdown are at the top**, not below everything else.
+- **The side panel sits beside the work at the default window size** (it needed a wider window before), and long lines in it shorten instead of running off the edge.
+- The steps along the top: Review is the current step once the checks pass; stopped and skipped checks have their own marks; a project with no workflows has no "GitHub build" step.
+- The old six-box pipeline is gone from the Unpacked card.
+- After a push the heading says PUSHED, and "Try it" and "Edit route" are hidden.
+- A project with no version shows NO RELEASE instead of STABLE.
+- "After" in the side panel is the release before this one, never this one.
+- "Next fix" and "Next feature" are offered only when the project already has a release to count from.
+- The bar at the bottom says why Stage & check can't be pressed, says "Checking" while checking, and has the only Cancel button.
+
+### Changed: Settings, Health and the rest
+- **Settings is separate cards** (Updates, Appearance, GitHub account, Folders & defaults, Checks, Privacy, Help, About) with switches. Every link in the row at the top goes to its own card. There is one "Check for updates" setting.
+- **Health starts with the self-test** and its results. Starting it from Ctrl+K opens Health.
+- Health says "1 area needs attention"; the self-test says "passed · failed · skipped".
+- A failed Rust check is explained in plain words.
+- A 403 from GitHub is no longer always called a rate limit.
+- The bug report counts every hidden detail, and shows the form before the preview on narrow windows.
+- Each screen opens at its top. Clicking the screen you're on goes back to the top.
+- Setup and install reminders show on Stage only, and scroll with the page.
+- Ctrl+K stays in one place; the shortcuts list shows every row; the tour sits in the corner at one size; Esc closes the uninstall window.
+- The window can't be made smaller than 760 × 560, and text never wraps a letter per line.
+- A mistyped command-line option is named instead of ignored, and starting without a desktop says so plainly.
+- The build countdown asks GitHub for the project's past build times once per build, not every 15 seconds.
+- README brought up to date.
+
+## [0.3.0-beta.1] - 2026-11-27
+
+The redesign: one flight path, one main button.
+
+### Changed
+- **Stage follows the flow along the top:** Zip → Route → Check → Review → GitHub build, each step marked done, current, failed or still to come.
+  - With a zip loaded, the heading is the project itself: its name, version, NEW REPO or UPDATE, and BETA or STABLE, with the zip's size and when it was saved underneath.
+  - Once staged, the route shrinks to a one-line summary ("Edit route and details" brings the full cards back).
+  - The bar at the bottom always holds the next thing to do.
+- **The checks card has one row per workflow job:** waiting, running (with the step it's on), passed, failed, can't run here, or on GitHub only. Chips show how the checks run (Sandboxed, Clean home, GitHub's fonts). A failure starts with a plain headline such as "1 test failed in the test job".
+- **A side panel on wide windows** shows this release (version, the one before it, changes, secret scan), what to do when a check fails, and the project's last pushes. On narrow windows it moves under the main cards.
+- **A welcome screen with nothing loaded:** a large place to drop a zip, and your projects, newest first, to open again.
+- **The sidebar has four places** (Stage, Projects, History, Health). Find anything (Ctrl+K), Settings and your account sit at the bottom.
+- **Help and bug reports moved into Settings.** The Help menu is gone. Settings has a Help card (find a command, keyboard shortcuts, the tour, write a bug report, what's new) and a row of its sections to jump to.
+- **StowLock opens at 1120 × 800** instead of 680 × 840, so the side panel fits. Small windows still work, with the sidebar as icons.
+- New README screenshots.
+
+### Added
+- **A countdown for GitHub's build.** After a push, the build card shows:
+  - a ring with roughly how long is left, and when it should be ready,
+  - one row per GitHub job, with the step it's on ("Step 5 of 9 · cargo test").
+
+  The estimate comes from how long the project's recent successful builds took; it's labelled as a guess, since GitHub sometimes queues a build first. With no earlier build to go by, it shows how far through the steps it is. The countdown also shows on Projects in the sidebar and at the top of the Projects screen, so you can stage something else meanwhile.
+
 ## [0.2.0-beta.7] - 2026-11-27
 
 The last House Standard items.

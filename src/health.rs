@@ -116,8 +116,10 @@ impl HealthState {
     pub fn summary(&self) -> String {
         match self.counts() {
             (0, 0) => "All working".into(),
-            (0, a) => format!("{a} need attention"),
-            (b, _) => format!("{b} broken"),
+            (0, 1) => "1 area needs attention".into(),
+            (0, a) => format!("{a} areas need attention"),
+            (1, _) => "1 area is broken".into(),
+            (b, _) => format!("{b} areas are broken"),
         }
     }
     pub fn lines(&self) -> Vec<String> {
@@ -231,7 +233,7 @@ mod tests {
         HealthState::record(&paths, "Archive", true, "");
         HealthState::record(&paths, "Tests", false, "cargo missing");
         let h = HealthState::load(&paths);
-        assert_eq!(h.summary(), "1 broken");
+        assert_eq!(h.summary(), "1 area is broken");
         assert_eq!(h.get("Archive").status, Health::Working);
         assert_eq!(areas_for_step("Commit & push", true), vec!["Update sync"]);
         let ex = areas_for_step("Extract & clean", true);

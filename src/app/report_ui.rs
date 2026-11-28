@@ -18,8 +18,16 @@ impl App {
             });
         });
         ui.add_space(8.0);
-        let wide = ui.available_width() > 860.0;
-        let left_w = if wide { 340.0 } else { ui.available_width() };
+        // Side by side from the default window size up; stacked below that,
+        // with the form first.
+        let wide = ui.available_width() >= 720.0;
+        let left_w = if !wide {
+            ui.available_width()
+        } else if ui.available_width() >= 900.0 {
+            340.0
+        } else {
+            300.0
+        };
         let mut left = |this: &mut Self, ui: &mut egui::Ui| {
             ui::card(ui, |ui| {
                 ui::section_title(ui, "What happened?");
@@ -268,9 +276,9 @@ impl App {
                 });
             });
         } else {
-            right(self, ui);
-            ui.add_space(8.0);
             left(self, ui);
+            ui.add_space(8.0);
+            right(self, ui);
         }
         if rebuild {
             self.bug.preview = self.build_bug_report();

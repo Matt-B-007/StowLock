@@ -31,6 +31,59 @@ pub fn read(path: &Path) -> Option<ZipInfo> {
     })
 }
 
+/// What's wrong with a zip, in plain words, before anything is staged
+/// (None = it opens and has files in it).
+pub fn problem(path: &Path) -> Option<String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Some(format!(
+            "{name} isn't there any more. It may have been moved or deleted: choose it again."
+        ));
+    };
+    if meta.is_dir() {
+        return Some(format!("{name} is a folder, not a zip file."));
+    }
+    if meta.len() == 0 {
+        return Some(format!(
+            "{name} is empty (0 bytes). The download didn't finish: download it again."
+        ));
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return Some(format!(
+            "{name} can't be read. Check the file's permissions."
+        ));
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => {
+            return Some(format!(
+                "{name} isn't a complete zip file. It's damaged or only partly downloaded: download it again."
+            ))
+        }
+    };
+    let mut files = 0;
+    for i in 0..archive.len() {
+        match archive.by_index_raw(i) {
+            Ok(e) if !e.is_dir() => files += 1,
+            Ok(_) => {}
+            Err(_) => {
+                return Some(format!(
+                    "{name} is damaged: part of it can't be read. Download it again."
+                ))
+            }
+        }
+    }
+    if files == 0 {
+        return Some(format!(
+            "{name} has no files in it, so there's nothing to stage."
+        ));
+    }
+    None
+}
+
 impl ZipInfo {
     /// "870 KB · saved today 10:59" (or "saved 26 Nov 18:38").
     pub fn describe(&self) -> String {
@@ -156,5 +209,42 @@ mod tests {
             "{}",
             first.describe()
         );
+    }
+
+    #[test]
+    fn a_bad_zip_is_named_before_staging() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("gone.zip");
+        assert!(problem(&missing).unwrap().contains("isn't there any more"));
+        let empty_file = d.path().join("zero.zip");
+        std::fs::write(&empty_file, b"").unwrap();
+        assert!(problem(&empty_file).unwrap().contains("0 bytes"));
+        // A real zip, then the same one cut short (a download that stopped).
+        let good = d.path().join("good.zip");
+        {
+            use std::io::Write;
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&good).unwrap());
+            let o = zip::write::SimpleFileOptions::default();
+            z.start_file("app/main.py", o).unwrap();
+            z.write_all(&b"print('hi')\n".repeat(200)).unwrap();
+            z.finish().unwrap();
+        }
+        assert_eq!(problem(&good), None);
+        let bytes = std::fs::read(&good).unwrap();
+        let cut = d.path().join("cut.zip");
+        std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(problem(&cut).unwrap().contains("download it again"));
+        let not_zip = d.path().join("text.zip");
+        std::fs::write(&not_zip, b"this is not a zip at all").unwrap();
+        assert!(problem(&not_zip).unwrap().contains("isn't a complete zip"));
+        // Folders only: nothing to stage.
+        let hollow = d.path().join("hollow.zip");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&hollow).unwrap());
+            z.add_directory("app/", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.finish().unwrap();
+        }
+        assert!(problem(&hollow).unwrap().contains("no files in it"));
     }
 }

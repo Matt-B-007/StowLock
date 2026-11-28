@@ -45,6 +45,8 @@ pub struct Sandbox {
     pub readable: Vec<PathBuf>,
     /// Files hidden even inside writable folders (cargo's login token).
     pub hidden_files: Vec<PathBuf>,
+    /// One folder shown at another place (the build cache as ./target).
+    pub binds: Vec<(PathBuf, PathBuf)>,
     /// The step's own /tmp.
     pub tmp: PathBuf,
     /// No network at all.
@@ -80,6 +82,10 @@ impl Sandbox {
             Path::new("/home"),
             self.home.as_path(),
             Path::new("/run/user"),
+            // Removable drives and other mounts.
+            Path::new("/run/media"),
+            Path::new("/media"),
+            Path::new("/mnt"),
         ] {
             if hide.is_dir() {
                 a.extend(["--tmpfs".into(), s(hide)]);
@@ -99,6 +105,9 @@ impl Sandbox {
         }
         if !dir.as_os_str().is_empty() {
             a.extend(["--bind".into(), s(dir), s(dir), "--chdir".into(), s(dir)]);
+        }
+        for (from, to) in &self.binds {
+            a.extend(["--bind".into(), s(from), s(to)]);
         }
         if self.offline {
             a.push("--unshare-net".into());
@@ -130,6 +139,7 @@ mod tests {
             writable: vec![root.join("cache")],
             readable: vec![],
             hidden_files: vec![],
+            binds: vec![],
             tmp,
             offline: false,
         }

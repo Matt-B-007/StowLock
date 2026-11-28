@@ -123,6 +123,11 @@ impl App {
                         self.session.tag = String::new();
                     }
                     self.session.stage = Some(st);
+                    self.session.jobs = None;
+                    // Unpacked; the checks run next.
+                    if self.busy.is_some() {
+                        self.busy = Some("Checking".into());
+                    }
                     self.record_health(self.session.mode == Mode::Update);
                     HealthState::record(&self.paths, "Zip intake", true, "");
                     HealthState::record(&self.paths, "Clean-up", true, "");
@@ -142,6 +147,11 @@ impl App {
                 }
                 Err(e) => self.fail(&e, "build"),
             },
+            Msg::BuildProgress(id, p) => {
+                if let Some(w) = self.build.as_mut().filter(|w| w.id == id) {
+                    w.progress = Some(p);
+                }
+            }
             Msg::Build(id, r) => {
                 let Some(w) = self.build.as_mut().filter(|w| w.id == id) else {
                     return;
@@ -204,6 +214,8 @@ impl App {
                 self.record_health(self.session.mode == Mode::Update);
             }
             Msg::Pushed(r) => {
+                // What happened is at the top of the page.
+                self.scroll_top = true;
                 self.record_health(self.session.mode == Mode::Update);
                 let owner = self.session.owner.clone();
                 self.refresh_repos(&owner, true);

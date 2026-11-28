@@ -95,7 +95,6 @@ fn click_through_the_app() {
         ("Projects", "projects in"),
         ("History", "Nothing pushed yet"),
         ("Health", "Run self-test"),
-        ("Bug report", "Also hide these words"),
         ("Settings", "Update channel"),
     ] {
         click_nav(&mut h, nav);
@@ -104,6 +103,10 @@ fn click_through_the_app() {
             "{nav} screen didn't show \"{marker}\""
         );
     }
+    // Bug reports are in Settings › Help now.
+    click_button(&mut h, "Write a bug report");
+    assert!(h.query_by_label_contains("Also hide these words").is_some());
+    click_nav(&mut h, "Settings");
 
     // Settings: the update channel and the theme switch.
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Stable")
@@ -164,10 +167,10 @@ fn click_through_the_app() {
     });
     steps(&mut h, 2);
 
-    // The review window opens by itself; an instant click can't push.
+    // The review page opens by itself; an instant click can't push.
     assert!(
         h.state().session.confirm,
-        "review window didn't open by itself"
+        "the review page didn't open by itself"
     );
     assert!(
         h.query_by_label_contains("Everyone using an older version")
@@ -196,15 +199,38 @@ fn click_through_the_app() {
     steps(&mut h, 2);
     // GitHub's build will fail, to check the build card.
     std::fs::create_dir_all(d.path().join("gh")).unwrap();
+    // First GitHub builds: a countdown from the project's past builds.
+    std::fs::write(d.path().join("gh/build.json"), r#"{"state":"running"}"#).unwrap();
+    let started = chrono::Local::now().timestamp() - 120;
     std::fs::write(
-        d.path().join("gh/build.json"),
-        r#"{"state":"failed","step":"arch (cargo test --locked)","log":"test x ... FAILED"}"#,
+        d.path().join("gh/progress.json"),
+        format!(
+            r#"{{"started":{started},"typical":600,"jobs":{{"jobs":[{{"name":"arch","status":"in_progress","conclusion":"","steps":[{{"name":"Set up","status":"completed"}},{{"name":"cargo test","status":"in_progress"}}]}}]}}}}"#
+        ),
     )
     .unwrap();
     click_button(&mut h, "to demo-app");
     wait_until(&mut h, "push", |a| {
         a.session.outcome.is_some() && a.busy.is_none()
     });
+    wait_until(&mut h, "the countdown", |a| {
+        a.build.as_ref().is_some_and(|b| b.progress.is_some())
+    });
+    steps(&mut h, 2);
+    assert!(h
+        .query_by_label_contains("Step 2 of 2 · cargo test")
+        .is_some());
+    let left = h
+        .state()
+        .build_countdown()
+        .expect("a countdown in the sidebar");
+    assert!(left.starts_with('7') || left.starts_with('8'), "{left}");
+    // Then it fails.
+    std::fs::write(
+        d.path().join("gh/build.json"),
+        r#"{"state":"failed","step":"arch (cargo test --locked)","log":"test x ... FAILED"}"#,
+    )
+    .unwrap();
 
     // Finished state: no "already exists" warning, the next steps instead.
     assert!(h.query_by_label_contains("View on GitHub").is_some());
@@ -348,7 +374,7 @@ fn help_shortcuts_palette_and_tour() {
     for _ in 1..help::TOUR.len() - 1 {
         click_button(&mut h, "Next");
     }
-    assert_eq!(h.state().tab, Tab::Report, "the tour shows each part");
+    assert_eq!(h.state().tab, Tab::Settings, "the tour shows each part");
     click_button(&mut h, "Next");
     click_button(&mut h, "Done");
     assert_eq!(h.state().tour_step, None);
@@ -382,7 +408,7 @@ fn help_shortcuts_palette_and_tour() {
     assert!(!h.state().show_shortcuts);
 
     // The Help menu offers the tour again.
-    click_button(&mut h, "Help");
+    click_nav(&mut h, "Settings");
     click_button(&mut h, "Take the tour");
     assert_eq!(h.state().tour_step, Some(0));
     h.key_press(egui::Key::Escape);
@@ -432,4 +458,19 @@ fn every_screen_names_its_controls() {
     h.state_mut().tour_step = Some(0);
     steps(&mut h, 3);
     assert!(h.unnamed_widgets().is_empty(), "{:#?}", h.unnamed_widgets());
+}
+
+#[test]
+fn hints_and_hidden_counts_read_right() {
+    // A sentence isn't shown as a command to paste.
+    assert!(super::stage::is_command(
+        "sudo pacman -S --needed ttf-dejavu"
+    ));
+    assert!(super::stage::is_command("pip install pytest"));
+    assert!(!super::stage::is_command(
+        "This looks like a font difference: the text is wider with GitHub's fonts."
+    ));
+    // Every hidden thing is counted, home-folder paths included.
+    let report = "user <user> on <host>\nrepo <repo-1> by <account-1>\nfolder ~/Projects/x\nkey <secret> at <ip>\n";
+    assert_eq!(count_hidden(report), 7);
 }

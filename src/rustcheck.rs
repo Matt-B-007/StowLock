@@ -119,14 +119,36 @@ pub fn check(paths: &AppPaths) -> RustState {
     match parse_check(&o.combined()) {
         Some(s) => s,
         None if o.ok() => RustState::Unknown("rustup's answer had no stable Rust in it".into()),
-        None => RustState::Unknown(
-            o.combined()
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("rustup couldn't reach the internet")
-                .trim()
-                .to_string(),
-        ),
+        None => RustState::Unknown(plain_reason(&o.combined())),
+    }
+}
+
+/// rustup's error in plain words (its own wording is for programmers).
+pub fn plain_reason(output: &str) -> String {
+    let t = crate::util::strip_ansi(output).to_ascii_lowercase();
+    if t.trim().is_empty()
+        || [
+            "could not download",
+            "error sending request",
+            "dns",
+            "resolve",
+            "connect",
+            "timed out",
+            "timeout",
+            "network",
+            "unreachable",
+        ]
+        .iter()
+        .any(|w| t.contains(w))
+    {
+        "rustup couldn't reach the internet. Check your connection and try Check Rust again".into()
+    } else if t.contains("permission denied") {
+        "rustup can't write to its own folder (permission denied). Check who owns ~/.rustup".into()
+    } else if t.contains("no toolchain") || t.contains("not installed") {
+        "rustup has no stable Rust installed. Update Rust sets it up".into()
+    } else {
+        "rustup gave an error it doesn't usually give. Run \"rustup check\" in a terminal to see it"
+            .into()
     }
 }
 
@@ -196,6 +218,15 @@ mod tests {
                 newest: "1.101.0".into()
             })
         );
+    }
+
+    #[test]
+    fn rustups_errors_are_put_plainly() {
+        let raw = "error: could not download file from 'https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256' to '/home/u/.rustup/tmp/x': error sending request";
+        let said = plain_reason(raw);
+        assert!(said.contains("internet"), "{said}");
+        assert!(!said.contains("static.rust-lang.org") && !said.contains("/home/"));
+        assert!(plain_reason("error: weird new thing").contains("rustup check"));
     }
 
     #[test]

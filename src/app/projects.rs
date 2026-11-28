@@ -22,6 +22,32 @@ impl App {
                 }
             });
         });
+        // GitHub's build of the last push, while it runs.
+        if let Some(w) = self.build.clone().filter(|w| {
+            !w.dismissed && matches!(w.status, None | Some(crate::github::Build::Running { .. }))
+        }) {
+            let left = self.build_countdown();
+            let mut show = false;
+            ui::card_active(ui, true, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(ui::icon::TIMER).size(18.0).color(ACCENT()));
+                    ui.label(ui::semibold(
+                        match &left {
+                            Some(l) => format!("GitHub is building {} · {l} left, about", w.slug),
+                            None => format!("GitHub is building {}", w.slug),
+                        },
+                        14.0,
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        show |= ui.button("Show").clicked();
+                    });
+                });
+            });
+            if show {
+                self.tab = Tab::Stage;
+            }
+            ui.add_space(4.0);
+        }
         let today = self.history.today();
         if !today.is_empty() {
             ui::card(ui, |ui| {

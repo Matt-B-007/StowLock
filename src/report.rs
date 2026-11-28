@@ -556,7 +556,7 @@ pub fn project_fix_prompt(summary: &str, output: &[String]) -> String {
     } else if machine {
         "Some of my project's tests fail only on my own computer, not on GitHub's clean machine. The output shows they depend on things on my computer (a running copy of the app, my home folder or desktop settings).\n"
     } else {
-        "My project's tests failed when StowLock checked it before pushing to GitHub.\n"
+        "My project's checks failed when StowLock ran them before pushing to GitHub.\n"
     });
     if !summary.trim().is_empty() {
         p.push_str(&format!("Result: {}\n", summary.trim()));
@@ -1159,7 +1159,7 @@ mod tests {
         assert!(!text.contains("[tests]   \n"));
         // The AI prompt is about the project.
         assert!(text.contains("AI fix prompt (for your project)"));
-        assert!(text.contains("My project's tests failed"));
+        assert!(text.contains("My project's checks failed"));
         assert!(
             !text.contains("Find the cause in the StowLock source"),
             "{text}"

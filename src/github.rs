@@ -24,6 +24,111 @@ pub struct Account {
     pub secure: bool,
 }
 
+/// One job of a GitHub build, as far as it has got.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct JobProgress {
+    pub name: String,
+    /// "queued", "in_progress" or "completed".
+    pub status: String,
+    /// "success", "failure", "skipped"… once completed.
+    pub conclusion: String,
+    /// Steps finished, and how many there are.
+    pub done: usize,
+    pub steps: usize,
+    /// The step it's on.
+    pub current: String,
+}
+
+/// GitHub's build of a commit, for the countdown.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BuildProgress {
+    /// When the build started (seconds since 1970).
+    pub started: Option<i64>,
+    /// How long this project's recent successful builds took (the median).
+    pub typical_secs: Option<u64>,
+    pub jobs: Vec<JobProgress>,
+}
+
+impl BuildProgress {
+    /// Seconds left, roughly: the usual length minus the time so far (never
+    /// below zero). None without a history to go by.
+    pub fn secs_left(&self, now: i64) -> Option<u64> {
+        let (start, typical) = (self.started?, self.typical_secs?);
+        Some(typical.saturating_sub(now.saturating_sub(start).max(0) as u64))
+    }
+
+    /// How far along, 0 to 1, by time (or by steps without a history).
+    pub fn fraction(&self, now: i64) -> f32 {
+        if let (Some(start), Some(typical)) = (self.started, self.typical_secs) {
+            if typical > 0 {
+                return ((now - start).max(0) as f32 / typical as f32).clamp(0.0, 0.99);
+            }
+        }
+        let (d, t) = self
+            .jobs
+            .iter()
+            .fold((0, 0), |(d, t), j| (d + j.done, t + j.steps.max(1)));
+        if t == 0 {
+            0.0
+        } else {
+            (d as f32 / t as f32).clamp(0.0, 0.99)
+        }
+    }
+}
+
+/// Parse GitHub's time ("2026-11-27T17:42:10Z") to seconds since 1970.
+pub fn parse_time(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
+/// The jobs of `gh run view --json jobs`.
+pub fn parse_jobs(json: &str) -> Vec<JobProgress> {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let mut out = Vec::new();
+    for j in v["jobs"].as_array().into_iter().flatten() {
+        let steps = j["steps"].as_array().cloned().unwrap_or_default();
+        let done = steps
+            .iter()
+            .filter(|s| s["status"].as_str() == Some("completed"))
+            .count();
+        let current = steps
+            .iter()
+            .find(|s| s["status"].as_str() == Some("in_progress"))
+            .and_then(|s| s["name"].as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(JobProgress {
+            name: j["name"].as_str().unwrap_or("").to_string(),
+            status: j["status"].as_str().unwrap_or("").to_string(),
+            conclusion: j["conclusion"].as_str().unwrap_or("").to_string(),
+            done,
+            steps: steps.len(),
+            current,
+        });
+    }
+    out
+}
+
+/// The median length in seconds of finished runs (`createdAt`, `updatedAt`).
+pub fn typical_secs(runs_json: &str) -> Option<u64> {
+    let runs: Vec<serde_json::Value> = serde_json::from_str(runs_json).unwrap_or_default();
+    let mut d: Vec<u64> = runs
+        .iter()
+        .filter_map(|r| {
+            let a = parse_time(r["createdAt"].as_str()?)?;
+            let b = parse_time(r["updatedAt"].as_str()?)?;
+            (b > a).then_some((b - a) as u64)
+        })
+        .collect();
+    if d.is_empty() {
+        return None;
+    }
+    d.sort();
+    Some(d[d.len() / 2])
+}
+
 /// How GitHub's build (Actions) for a pushed commit is going.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Build {
@@ -162,6 +267,19 @@ pub trait GitHubApi: Send + Sync {
     fn build_status(&self, owner: &str, slug: &str, commit: &str) -> Res<Build>;
     /// Re-run only the failed jobs of a run (its web address, from Build::Failed).
     fn rerun_failed(&self, owner: &str, slug: &str, run_url: &str) -> Res<()>;
+    /// How far GitHub's build of a commit has got: each job's step, and how
+    /// long the same workflows usually take (for the countdown). The usual
+    /// time doesn't change while a build runs: pass it back in as `typical`
+    /// once it's known, and the history isn't fetched again.
+    fn build_progress(
+        &self,
+        _owner: &str,
+        _slug: &str,
+        _commit: &str,
+        _typical: Option<u64>,
+    ) -> Res<BuildProgress> {
+        Ok(BuildProgress::default())
+    }
 
     fn repo_url(&self, owner: &str, slug: &str) -> String {
         format!("https://github.com/{owner}/{slug}")
@@ -463,6 +581,79 @@ impl GitHubApi for RealGh {
         }
     }
 
+    fn build_progress(
+        &self,
+        owner: &str,
+        slug: &str,
+        commit: &str,
+        known_typical: Option<u64>,
+    ) -> Res<BuildProgress> {
+        let repo = format!("{owner}/{slug}");
+        let o = gh(&[
+            "run",
+            "list",
+            "-R",
+            &repo,
+            "--commit",
+            commit,
+            "--limit",
+            "20",
+            "--json",
+            "databaseId,status,createdAt,workflowName",
+        ]);
+        if !o.ok() {
+            return Err(o.combined());
+        }
+        let runs: Vec<serde_json::Value> = serde_json::from_str(&o.stdout).unwrap_or_default();
+        let mut p = BuildProgress::default();
+        let mut typical = Vec::new();
+        for r in &runs {
+            if let Some(t) = r["createdAt"].as_str().and_then(parse_time) {
+                p.started = Some(p.started.map_or(t, |s: i64| s.min(t)));
+            }
+            if let Some(id) = r["databaseId"].as_u64() {
+                let jobs = gh(&[
+                    "run",
+                    "view",
+                    &id.to_string(),
+                    "-R",
+                    &repo,
+                    "--json",
+                    "jobs",
+                ]);
+                if jobs.ok() {
+                    p.jobs.extend(parse_jobs(&jobs.stdout));
+                }
+            }
+            // How long this workflow usually takes, from its last successful runs.
+            if let Some(name) = r["workflowName"]
+                .as_str()
+                .filter(|_| known_typical.is_none())
+            {
+                let past = gh(&[
+                    "run",
+                    "list",
+                    "-R",
+                    &repo,
+                    "--workflow",
+                    name,
+                    "--status",
+                    "success",
+                    "--limit",
+                    "5",
+                    "--json",
+                    "createdAt,updatedAt",
+                ]);
+                if let Some(t) = past.ok().then(|| typical_secs(&past.stdout)).flatten() {
+                    typical.push(t);
+                }
+            }
+        }
+        // Workflows run side by side: the longest one sets the time.
+        p.typical_secs = known_typical.or(typical.into_iter().max());
+        Ok(p)
+    }
+
     fn build_status(&self, owner: &str, slug: &str, commit: &str) -> Res<Build> {
         let repo = format!("{owner}/{slug}");
         let o = gh(&[
@@ -669,6 +860,26 @@ impl GitHubApi for FakeGh {
         }
     }
 
+    /// Tests set the progress in `<root>/progress.json` as
+    /// {"started":<secs>,"typical":<secs>,"jobs":<gh run view --json jobs>}.
+    fn build_progress(
+        &self,
+        _owner: &str,
+        _slug: &str,
+        _commit: &str,
+        known_typical: Option<u64>,
+    ) -> Res<BuildProgress> {
+        let Ok(t) = std::fs::read_to_string(self.root.join("progress.json")) else {
+            return Ok(BuildProgress::default());
+        };
+        let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+        Ok(BuildProgress {
+            started: v["started"].as_i64(),
+            typical_secs: known_typical.or(v["typical"].as_u64()),
+            jobs: parse_jobs(&v["jobs"].to_string()),
+        })
+    }
+
     /// Tests set the build result in `<root>/build.json` as
     /// {"state":"passed"|"running"|"failed","step":"…","log":"…"}.
     fn build_status(&self, _owner: &str, _slug: &str, _commit: &str) -> Res<Build> {
@@ -693,6 +904,35 @@ impl GitHubApi for FakeGh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_countdown_comes_from_past_builds_and_the_current_steps() {
+        let past = r#"[{"createdAt":"2026-11-27T10:00:00Z","updatedAt":"2026-11-27T10:09:00Z"},
+            {"createdAt":"2026-11-26T10:00:00Z","updatedAt":"2026-11-26T10:11:00Z"},
+            {"createdAt":"2026-11-25T10:00:00Z","updatedAt":"2026-11-25T10:10:00Z"}]"#;
+        assert_eq!(typical_secs(past), Some(600), "the median, 10 minutes");
+        assert_eq!(typical_secs("[]"), None);
+        let jobs = r#"{"jobs":[{"name":"Tests (Arch)","status":"in_progress","conclusion":"","steps":[
+            {"name":"Set up","status":"completed"},{"name":"cargo test","status":"in_progress"},{"name":"Build","status":"queued"}]}]}"#;
+        let j = parse_jobs(jobs);
+        assert_eq!(j[0].done, 1);
+        assert_eq!(j[0].steps, 3);
+        assert_eq!(j[0].current, "cargo test");
+        let start = parse_time("2026-11-27T17:42:00Z").unwrap();
+        let p = BuildProgress {
+            started: Some(start),
+            typical_secs: Some(600),
+            jobs: j,
+        };
+        assert_eq!(p.secs_left(start + 372), Some(228));
+        assert_eq!(p.secs_left(start + 900), Some(0), "never below zero");
+        assert!((p.fraction(start + 300) - 0.5).abs() < 0.01);
+        let no_history = BuildProgress {
+            typical_secs: None,
+            ..p
+        };
+        assert_eq!(no_history.secs_left(start), None);
+    }
 
     #[test]
     fn parses_new_and_old_auth_status() {

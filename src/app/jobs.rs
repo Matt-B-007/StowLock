@@ -158,6 +158,19 @@ impl App {
             self.toast("That isn't a .zip file.");
             return;
         }
+        // A missing, damaged or empty zip is said now, not after staging.
+        if let Some(problem) = crate::zipinfo::problem(&zip) {
+            self.log.error("intake", &problem);
+            self.error = Some((
+                crate::errors::Friendly {
+                    message: problem,
+                    action: None,
+                },
+                format!("File: {}", util::tilde(&zip)),
+            ));
+            self.tab = Tab::Stage;
+            return;
+        }
         let name = zip
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -375,6 +388,10 @@ impl App {
         self.session.checks = None;
         self.session.outcome = None;
         self.session.confirm = false;
+        self.session.jobs = None;
+        self.session.job_memo.clear();
+        self.session.rechecking.clear();
+        self.session.job_clock = None;
         self.log.begin_run(&format!("Stage {}", self.session.slug));
         let tx = self.tx.clone();
         let ectx = self.egui_ctx.clone();
@@ -402,6 +419,13 @@ impl App {
         };
         let slug = self.session.slug.clone();
         self.session.checks = None;
+        // The workflow may have changed (a fixed zip, or an edit by hand).
+        self.session.jobs = None;
+        self.session.job_clock = None;
+        self.session.rechecking = jobs.clone();
+        if jobs.is_empty() {
+            self.session.job_memo.clear();
+        }
         let label = if jobs.is_empty() {
             "Checking".to_string()
         } else {
@@ -490,6 +514,13 @@ impl App {
     }
 
     pub(super) fn run_selftest(&mut self) {
+        if self.busy.is_some() {
+            self.toast("Please wait for the current step to finish.");
+            return;
+        }
+        // Its results are on Health, wherever it was started from.
+        self.tab = Tab::Health;
+        self.scroll_top = true;
         let paths = self.paths.clone();
         let online = self.selftest_online;
         self.spawn_job("Running self-test", move |_| {
@@ -660,6 +691,7 @@ impl App {
             status: None,
             local_passed,
             dismissed: false,
+            progress: None,
         });
         let gh = self.gh.clone();
         let tx = self.tx.clone();
@@ -668,6 +700,8 @@ impl App {
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
             std::thread::sleep(std::time::Duration::from_secs(first));
+            // How long these workflows usually take: fetched once per build.
+            let mut typical: Option<u64> = None;
             loop {
                 let r = gh.build_status(&owner, &slug, &commit);
                 let done = match &r {
@@ -677,6 +711,12 @@ impl App {
                     Ok(crate::github::Build::Running { .. }) => false,
                     Err(_) => start.elapsed().as_secs() > 300,
                 };
+                if matches!(r, Ok(crate::github::Build::Running { .. })) {
+                    if let Ok(p) = gh.build_progress(&owner, &slug, &commit, typical) {
+                        typical = typical.or(p.typical_secs);
+                        Self::send(&tx, &ctx, Msg::BuildProgress(id, p));
+                    }
+                }
                 let quiet_none = matches!(r, Ok(crate::github::Build::None)) && !done;
                 if !quiet_none {
                     Self::send(&tx, &ctx, Msg::Build(id, r));

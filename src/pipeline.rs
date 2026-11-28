@@ -645,7 +645,20 @@ pub fn run_checks_of(
             offline: ctx.config.offline_checks,
             only_jobs: only_jobs.to_vec(),
         };
+        let before = git::Snapshot::take(dir);
         let r = preflight::run_tests(dir, stack, &env);
+        if let Some(before) = before {
+            let undone = before.restore();
+            if !undone.is_empty() {
+                ctx.log.info(
+                    "tests",
+                    &format!(
+                        "Files the checks wrote were put back, so only the zip's files are pushed: {}",
+                        undone.join(", ")
+                    ),
+                );
+            }
+        }
         let status = match r.status {
             preflight::TestStatus::Passed => StepStatus::Passed,
             preflight::TestStatus::Skipped => StepStatus::Skipped,
@@ -721,10 +734,10 @@ pub fn push_blockers(
                 && ctx.config.run_tests_before_push
                 && !override_tests
             {
-                v.push("Tests failed. See \"What to do next\" above".into());
+                v.push("The checks failed. See \"What to do next\" above".into());
             }
             if c.tests.status == preflight::TestStatus::Cancelled && !override_tests {
-                v.push("Tests were cancelled".into());
+                v.push("The checks were stopped: Re-check to run them".into());
             }
             if c.partial && !override_tests {
                 v.push("Only some jobs were re-checked: run the full check before pushing".into());

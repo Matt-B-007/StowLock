@@ -31,7 +31,12 @@ Built for CachyOS and other Arch-based distributions; it runs on any x86_64 Linu
 - **Keeps Downloads empty.** After a successful push the zip moves to `~/GitHub_Projects/_archive/<project>/`.
 - **Never force-pushes**, never overwrites unsaved local work, and stops if GitHub has changes you don't.
 - **If a check fails, nothing is lost.** Load a fixed zip and the failed attempt is set aside (a git stash, or a folder for a new repo). **Projects → Saved earlier attempts** lists them with Restore and Delete.
-- **Sidebar screens:** Stage, Projects, History, Health, Bug report and Settings, in a light or dark theme that follows your desktop.
+- **Checks run in a sandbox** (bubblewrap): a project's scripts and tests see the project, the build tools and a fresh home folder, not your files, keys or running apps. They can run with only the fonts GitHub's machine has, and offline, so "passes here, fails on GitHub" shows up before you push.
+- **What a check writes isn't pushed.** A `Cargo.lock` or `__pycache__` made while testing is put back afterwards: what goes to GitHub is what was in the zip.
+- **A review page before every push:** where it goes, the version, the files that changed and the release notes, with one button that says exactly what it will do.
+- **A countdown for GitHub's build**, with one row per job and the step it's on.
+- **Sidebar screens:** Stage, Projects, History and Health, with Settings (help and bug reports included) at the bottom, in a light or dark theme that follows your desktop.
+- **Find anything with Ctrl+K**, keyboard shortcuts on F1, and a short tour the first time it opens.
 - A **History** of every push, a **Health** view and a built-in **self-test**.
 - **No terminal needed:** installs git and GitHub's `gh` tool through your desktop's password dialog and signs you in with a one-time code in your browser.
 
@@ -62,7 +67,7 @@ Options go after `sh -s --`, for example `… | sh -s -- --stable --no-launch`:
 
 ```bash
 paru -S stowlock-beta-bin     # betas, while StowLock is in beta
-paru -S stowlock-bin          # full releases, once 0.1.0 is out
+paru -S stowlock-bin          # full releases, once the first one is out
 ```
 
 (`yay` works the same way.) Updates then come with your normal system updates, and `sudo pacman -R stowlock-beta-bin` removes it.

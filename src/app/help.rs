@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Help: the Help menu, keyboard shortcuts, the command palette (Ctrl+K) and
+//! Help: keyboard shortcuts, the command palette (Ctrl+K) and
 //! the tour.
 use super::*;
 
@@ -34,7 +34,7 @@ pub(super) const COMMANDS: [(&str, &str, Cmd); 12] = [
 pub(super) const TOUR: [(&str, &str); 6] = [
     (
         "Welcome to StowLock",
-        "StowLock turns a project zip into a tested GitHub release. This short tour shows where things are. You can take it again any time from Help.",
+        "StowLock turns a project zip into a tested GitHub release. This short tour shows where things are. You can take it again any time from Settings › Help.",
     ),
     (
         "Stage",
@@ -49,8 +49,8 @@ pub(super) const TOUR: [(&str, &str); 6] = [
         "History lists every push and archive. Health shows what's working, the tools you have, and anything that needs fixing.",
     ),
     (
-        "Bug reports",
-        "If something goes wrong, the Bug report screen gathers what's needed with your name, folders and other private things hidden. Save or copy it.",
+        "Settings and help",
+        "Settings (bottom of the sidebar) has Help: the shortcuts, this tour, and bug reports, which hide your name, folders and other private things before you save or copy them.",
     ),
     (
         "Shortcuts",
@@ -144,6 +144,9 @@ impl App {
                 self.palette = None;
             } else if self.show_shortcuts {
                 self.show_shortcuts = false;
+            } else if self.show_uninstall {
+                // Nothing has been removed until its button is pressed.
+                self.show_uninstall = false;
             } else if self.tour_step.is_some() {
                 self.end_tour();
             }
@@ -162,37 +165,6 @@ impl App {
         }
     }
 
-    /// The Help menu at the bottom of the sidebar.
-    pub(super) fn help_menu(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let resp = ui::nav_item(ui, ui::icon::CIRCLE_HELP, "Help", false, None, compact)
-            .on_hover_text("Shortcuts, the tour, bug reports and about");
-        let mut pick = None;
-        egui::Popup::menu(&resp).show(|ui| {
-            ui.set_min_width(220.0);
-            if ui.button("Find a command…  Ctrl+K").clicked() {
-                self.palette = Some(Palette::default());
-            }
-            if ui.button("Keyboard shortcuts  F1").clicked() {
-                pick = Some(Cmd::Shortcuts);
-            }
-            if ui.button("Take the tour").clicked() {
-                pick = Some(Cmd::Tour);
-            }
-            ui.separator();
-            if ui.button("Write a bug report").clicked() {
-                pick = Some(Cmd::Go(Tab::Report));
-            }
-            if ui.button("Check for updates").clicked() {
-                pick = Some(Cmd::CheckUpdates);
-            }
-            ui.separator();
-            ui.label(ui::muted(format!("StowLock {APP_VERSION} · GPL-3.0-or-later")).size(12.0));
-        });
-        if let Some(c) = pick {
-            self.run_cmd(c);
-        }
-    }
-
     /// The palette, the shortcuts list and the tour.
     pub(super) fn help_windows(&mut self, ctx: &egui::Context) {
         if self.palette.is_some() {
@@ -200,24 +172,35 @@ impl App {
         }
         if self.show_shortcuts {
             let mut open = true;
+            // Sized to its rows; scrolls when the window is too short for them.
+            let room = (ctx.content_rect().height() - 150.0).max(160.0);
             ui_window(ctx, "Keyboard shortcuts", 420.0)
                 .open(&mut open)
+                .resizable(false)
+                .vscroll(false)
                 .show(ctx, |ui| {
-                    egui::Grid::new("shortcuts")
-                        .num_columns(2)
-                        .spacing([24.0, 8.0])
+                    egui::ScrollArea::vertical()
+                        .max_height(room)
+                        .min_scrolled_height(room)
                         .show(ui, |ui| {
-                            ui.label(ui::mono("Ctrl+K").color(ACCENT()));
-                            ui.label("Find any command");
-                            ui.end_row();
-                            for (name, keys, _) in COMMANDS.iter().filter(|c| !c.1.is_empty()) {
-                                ui.label(ui::mono(*keys).color(ACCENT()));
-                                ui.label(*name);
-                                ui.end_row();
-                            }
-                            ui.label(ui::mono("Esc").color(ACCENT()));
-                            ui.label("Close this, the palette or the tour");
-                            ui.end_row();
+                            egui::Grid::new("shortcuts")
+                                .num_columns(2)
+                                .spacing([24.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label(ui::mono("Ctrl+K").color(ACCENT()));
+                                    ui.label("Find any command");
+                                    ui.end_row();
+                                    for (name, keys, _) in
+                                        COMMANDS.iter().filter(|c| !c.1.is_empty())
+                                    {
+                                        ui.label(ui::mono(*keys).color(ACCENT()));
+                                        ui.label(*name);
+                                        ui.end_row();
+                                    }
+                                    ui.label(ui::mono("Esc").color(ACCENT()));
+                                    ui.label("Close this, the palette or the tour");
+                                    ui.end_row();
+                                });
                         });
                 });
             self.show_shortcuts &= open;
@@ -226,12 +209,26 @@ impl App {
             let (title, body) = TOUR[step.min(TOUR.len() - 1)];
             let mut open = true;
             let mut next = None;
-            ui_window(ctx, "Tour", 440.0)
+            // One size for every card, in the bottom corner so it doesn't
+            // cover what it's describing.
+            let lift = if self.tab == Tab::Stage { 96.0 } else { 24.0 };
+            ui_window(ctx, "Tour", 400.0)
                 .open(&mut open)
+                .resizable(false)
+                .vscroll(false)
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-24.0, -lift])
                 .show(ctx, |ui| {
+                    ui.set_width(400.0_f32.min(ctx.content_rect().width() - 80.0));
                     ui.label(ui::muted(format!("{} of {}", step + 1, TOUR.len())).size(12.0));
                     ui.label(ui::semibold(title, 17.0));
-                    ui.add(egui::Label::new(body).wrap());
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 96.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_height(96.0);
+                            ui.add(egui::Label::new(body).wrap());
+                        },
+                    );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let last = step + 1 >= TOUR.len();
@@ -253,7 +250,7 @@ impl App {
                     self.tab = match s {
                         2 => Tab::Projects,
                         3 => Tab::Health,
-                        4 => Tab::Report,
+                        4 => Tab::Settings,
                         _ => Tab::Stage,
                     };
                 }
@@ -285,37 +282,44 @@ impl App {
         }
         let mut run = enter.then(|| found.get(p.selected).map(|f| f.2)).flatten();
         let mut close = false;
-        let modal = egui::Modal::new(egui::Id::unique("command_palette")).show(ctx, |ui| {
-            ui.set_width(460.0_f32.min(ctx.content_rect().width() - 80.0));
-            let edit = ui::named(
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.query)
-                        .hint_text("Type a command…")
-                        .desired_width(f32::INFINITY),
-                ),
-                "Find a command",
-            );
-            edit.request_focus();
-            ui.add_space(4.0);
-            if found.is_empty() {
-                ui.label(ui::muted("Nothing matches."));
-            }
-            for (i, (name, keys, cmd)) in found.iter().enumerate() {
-                let on = i == p.selected;
-                let r = ui.horizontal(|ui| {
-                    let r = ui.selectable_label(on, *name);
-                    if !keys.is_empty() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(ui::mono(*keys).color(MUTED()).size(12.0));
-                        });
-                    }
-                    r
-                });
-                if r.inner.clicked() {
-                    run = Some(*cmd);
+        // Pinned near the top, so it doesn't move as the list gets shorter.
+        let id = egui::Id::unique("command_palette");
+        let modal = egui::Modal::new(id)
+            .area(egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, [0.0, 96.0]))
+            .show(ctx, |ui| {
+                ui.set_width(460.0_f32.min(ctx.content_rect().width() - 80.0));
+                let edit = ui::named(
+                    ui.add(
+                        egui::TextEdit::singleline(&mut p.query)
+                            .hint_text("Type a command…")
+                            .desired_width(f32::INFINITY),
+                    ),
+                    "Find a command",
+                );
+                edit.request_focus();
+                ui.add_space(4.0);
+                if found.is_empty() {
+                    ui.label(ui::muted("Nothing matches."));
                 }
-            }
-        });
+                for (i, (name, keys, cmd)) in found.iter().enumerate() {
+                    let on = i == p.selected;
+                    let r = ui.horizontal(|ui| {
+                        let r = ui.selectable_label(on, *name);
+                        if !keys.is_empty() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(ui::mono(*keys).color(MUTED()).size(12.0));
+                                },
+                            );
+                        }
+                        r
+                    });
+                    if r.inner.clicked() {
+                        run = Some(*cmd);
+                    }
+                }
+            });
         if modal.should_close() {
             close = true;
         }
